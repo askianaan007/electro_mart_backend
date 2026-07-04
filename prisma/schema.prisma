@@ -1,0 +1,299 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  DEALER
+}
+
+enum AccountStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum OrderStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  PACKED
+  DELIVERED
+  COMPLETED
+}
+
+enum PaymentStatus {
+  PAID
+  PENDING
+  OVERDUE
+  PARTIAL
+}
+
+enum PaymentMode {
+  CASH
+  CHEQUE
+  BANK_TRANSFER
+}
+
+enum InventoryLogType {
+  PURCHASE
+  SALE
+  ADJUSTMENT
+  RESERVE
+  RELEASE
+}
+
+model Admin {
+  id                String    @id @default(uuid())
+  email             String    @unique
+  password          String
+  name              String
+  role              Role      @default(ADMIN)
+  resetToken        String?   @unique
+  resetTokenExpiry  DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  purchases      Purchase[]
+  activityLogs   ActivityLog[]
+  approvedOrders Order[]       @relation("OrderApprovedBy")
+}
+
+model Dealer {
+  id                 String        @id @default(uuid())
+  businessName       String
+  ownerName          String
+  phone              String
+  email              String?       @unique
+  address            String?
+  district           String?
+  username           String        @unique
+  password           String
+  creditLimit        Decimal       @default(0)
+  outstandingBalance Decimal       @default(0)
+  status             AccountStatus @default(ACTIVE)
+  resetToken         String?       @unique
+  resetTokenExpiry   DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  orders   Order[]
+  invoices Invoice[]
+  payments Payment[]
+
+  @@index([status])
+}
+
+model Product {
+  id             String        @id @default(uuid())
+  productCode    String        @unique
+  sku            String?       @unique
+  barcode        String?       @unique
+  name           String
+  brand          String?
+  category       String?
+  model          String?
+  description    String?
+  imageUrl       String?
+  costPrice      Decimal
+  wholesalePrice Decimal
+  sellingPrice   Decimal
+  currentStock   Int           @default(0)
+  minimumStock   Int           @default(0)
+  warranty       String?
+  status         AccountStatus @default(ACTIVE)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  orderItems    OrderItem[]
+  purchaseItems PurchaseItem[]
+  inventoryLogs InventoryLog[]
+
+  @@index([category])
+  @@index([status])
+}
+
+model Supplier {
+  id      String  @id @default(uuid())
+  name    String
+  contact String?
+  phone   String?
+  email   String?
+  address String?
+
+  purchases        Purchase[]
+  supplierPayments SupplierPayment[]
+}
+
+model Purchase {
+  id            String   @id @default(uuid())
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id])
+  invoiceNumber String
+  purchaseDate  DateTime
+  totalValue    Decimal
+  adminId       String
+  admin         Admin    @relation(fields: [adminId], references: [id])
+  createdAt     DateTime @default(now())
+
+  items PurchaseItem[]
+
+  @@index([supplierId])
+}
+
+model PurchaseItem {
+  id         String   @id @default(uuid())
+  purchaseId String
+  purchase   Purchase @relation(fields: [purchaseId], references: [id])
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  quantity   Int
+  unitCost   Decimal
+  lineTotal  Decimal
+
+  @@index([purchaseId])
+  @@index([productId])
+}
+
+model InventoryLog {
+  id           String           @id @default(uuid())
+  productId    String
+  product      Product          @relation(fields: [productId], references: [id])
+  type         InventoryLogType
+  quantityIn   Int              @default(0)
+  quantityOut  Int              @default(0)
+  balanceAfter Int
+  reference    String?
+  createdAt    DateTime         @default(now())
+
+  @@index([productId])
+  @@index([type])
+}
+
+model Order {
+  id           String      @id @default(uuid())
+  orderNumber  String      @unique
+  dealerId     String
+  dealer       Dealer      @relation(fields: [dealerId], references: [id])
+  status       OrderStatus @default(PENDING_APPROVAL)
+  subtotal     Decimal
+  discount     Decimal     @default(0)
+  totalAmount  Decimal
+  rejectReason String?
+
+  approvedByAdminId String?
+  approvedByAdmin   Admin?    @relation("OrderApprovedBy", fields: [approvedByAdminId], references: [id])
+  approvedAt        DateTime?
+  rejectedAt        DateTime?
+  packedAt          DateTime?
+  deliveredAt       DateTime?
+  completedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items   OrderItem[]
+  invoice Invoice?
+
+  @@index([dealerId])
+  @@index([status])
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id])
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Decimal
+  lineTotal Decimal
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+model Invoice {
+  id            String        @id @default(uuid())
+  invoiceNumber String        @unique
+  orderId       String        @unique
+  order         Order         @relation(fields: [orderId], references: [id])
+  dealerId      String
+  dealer        Dealer        @relation(fields: [dealerId], references: [id])
+  subtotal      Decimal
+  discountTotal Decimal       @default(0)
+  grandTotal    Decimal
+  paymentStatus PaymentStatus @default(PENDING)
+  dueDate       DateTime?
+  createdAt     DateTime      @default(now())
+
+  payments Payment[]
+
+  @@index([dealerId])
+  @@index([paymentStatus])
+}
+
+model Payment {
+  id          String      @id @default(uuid())
+  invoiceId   String
+  invoice     Invoice     @relation(fields: [invoiceId], references: [id])
+  dealerId    String
+  dealer      Dealer      @relation(fields: [dealerId], references: [id])
+  amount      Decimal
+  mode        PaymentMode
+  reference   String?
+  paymentDate DateTime
+  createdAt   DateTime    @default(now())
+
+  @@index([invoiceId])
+  @@index([dealerId])
+}
+
+model SupplierPayment {
+  id          String      @id @default(uuid())
+  supplierId  String
+  supplier    Supplier    @relation(fields: [supplierId], references: [id])
+  amount      Decimal
+  mode        PaymentMode
+  reference   String?
+  paymentDate DateTime
+  remarks     String?
+  createdAt   DateTime    @default(now())
+
+  @@index([supplierId])
+}
+
+model ActivityLog {
+  id        String   @id @default(uuid())
+  adminId   String
+  admin     Admin    @relation(fields: [adminId], references: [id])
+  action    String
+  targetId  String?
+  details   String?
+  createdAt DateTime @default(now())
+
+  @@index([adminId])
+  @@index([targetId])
+}
+
+model Counter {
+  key   String @id
+  value Int    @default(0)
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  role      Role
+  userId    String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
