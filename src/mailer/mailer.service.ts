@@ -69,15 +69,11 @@ export class MailerService {
     });
   }
 
-  notifyAdminLowStock(
-    adminEmail: string,
-    productName: string,
-    currentStock: number,
-  ): Promise<void> {
+  notifyAdminOutOfStock(adminEmail: string, productName: string): Promise<void> {
     return this.send({
       to: adminEmail,
-      subject: `Low stock alert — ${productName}`,
-      html: `<p><strong>${productName}</strong> is running low. Current stock: ${currentStock} units.</p>`,
+      subject: `Out of stock — ${productName}`,
+      html: `<p><strong>${productName}</strong> is now out of stock.</p>`,
     });
   }
 

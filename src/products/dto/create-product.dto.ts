@@ -63,22 +63,11 @@ export class CreateProductDto {
   @Min(0)
   wholesalePrice: number;
 
-  @ApiProperty()
-  @IsNumber()
-  @Min(0)
-  sellingPrice: number;
-
   @ApiPropertyOptional({ default: 0 })
   @IsOptional()
   @IsInt()
   @Min(0)
   currentStock?: number;
-
-  @ApiPropertyOptional({ default: 0 })
-  @IsOptional()
-  @IsInt()
-  @Min(0)
-  minimumStock?: number;
 
   @ApiPropertyOptional()
   @IsOptional()

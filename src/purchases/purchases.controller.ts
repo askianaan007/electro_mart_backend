@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Post,
@@ -41,5 +42,14 @@ export class PurchasesController {
   @ApiOperation({ summary: 'Get purchase details' })
   findOne(@Param('id') id: string) {
     return this.purchasesService.findOne(id);
+  }
+
+  @Delete(':id')
+  @ApiOperation({
+    summary:
+      'Delete a purchase, reversing its stock movements (and any returns against it)',
+  })
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.purchasesService.remove(id, adminId);
   }
 }

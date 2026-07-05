@@ -82,7 +82,6 @@ export class InventoryService {
           productCode: true,
           name: true,
           currentStock: true,
-          minimumStock: true,
           updatedAt: true,
         },
         orderBy: { name: 'asc' },
@@ -94,12 +93,7 @@ export class InventoryService {
 
     const data = products.map((product) => ({
       ...product,
-      status:
-        product.currentStock <= 0
-          ? 'OUT_OF_STOCK'
-          : product.currentStock <= product.minimumStock
-            ? 'LOW_STOCK'
-            : 'IN_STOCK',
+      status: product.currentStock <= 0 ? 'OUT_OF_STOCK' : 'IN_STOCK',
     }));
 
     return paginate(data, total, page, limit);

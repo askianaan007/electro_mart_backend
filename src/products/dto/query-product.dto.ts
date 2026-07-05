@@ -15,12 +15,9 @@ export class QueryProductDto extends PaginationQueryDto {
   @IsEnum(AccountStatus)
   status?: AccountStatus;
 
-  @ApiPropertyOptional({
-    description:
-      'Only return products at or below their minimum stock threshold',
-  })
+  @ApiPropertyOptional({ description: 'Only return products with zero stock' })
   @IsOptional()
   @Type(() => Boolean)
   @IsBoolean()
-  lowStockOnly?: boolean;
+  outOfStockOnly?: boolean;
 }

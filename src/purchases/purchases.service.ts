@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { InventoryLogType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { paginate } from '../common/utils/paginate';
@@ -12,6 +13,7 @@ export class PurchasesService {
   constructor(
     private prisma: PrismaService,
     private inventoryService: InventoryService,
+    private activityLogService: ActivityLogService,
   ) {}
 
   async create(dto: CreatePurchaseDto, adminId: string) {
@@ -81,5 +83,62 @@ export class PurchasesService {
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
     return purchase;
+  }
+
+  /**
+   * Deletes a purchase and unwinds everything it caused: any purchase
+   * returns recorded against it (restoring the stock that had gone back to
+   * the supplier), then the purchase's own stock increase. Each reversal
+   * goes through recordMovement, so if stock has since been sold below what
+   * the purchase brought in, this fails loudly instead of driving stock
+   * negative.
+   */
+  async remove(id: string, adminId: string) {
+    const purchase = await this.prisma.purchase.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        purchaseReturns: { include: { items: true } },
+      },
+    });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+
+    return this.prisma.$transaction(async (tx) => {
+      for (const purchaseReturn of purchase.purchaseReturns) {
+        for (const item of purchaseReturn.items) {
+          await this.inventoryService.recordMovement(tx, {
+            productId: item.productId,
+            type: InventoryLogType.ADJUSTMENT,
+            quantityIn: item.quantity,
+            reference: `Reversal of deleted return ${purchaseReturn.returnNumber}`,
+          });
+        }
+        await tx.purchaseReturnItem.deleteMany({
+          where: { purchaseReturnId: purchaseReturn.id },
+        });
+        await tx.purchaseReturn.delete({ where: { id: purchaseReturn.id } });
+      }
+
+      for (const item of purchase.items) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityOut: item.quantity,
+          reference: `Reversal of deleted purchase ${purchase.invoiceNumber}`,
+        });
+      }
+
+      await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
+      await tx.purchase.delete({ where: { id } });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'DELETED_PURCHASE',
+        targetId: id,
+        details: `Deleted purchase ${purchase.invoiceNumber} (${purchase.items.length} item(s)) and reversed its stock movements${purchase.purchaseReturns.length ? `, including ${purchase.purchaseReturns.length} return(s)` : ''}`,
+      });
+
+      return { message: 'Purchase deleted and stock reversed' };
+    }, TRANSACTION_OPTIONS);
   }
 }

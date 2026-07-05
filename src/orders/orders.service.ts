@@ -270,17 +270,13 @@ export class OrdersService {
       const product = await this.prisma.product.findUnique({
         where: { id: item.productId },
       });
-      if (product && product.currentStock <= product.minimumStock) {
+      if (product && product.currentStock <= 0) {
         const admins = await this.prisma.admin.findMany({
           select: { email: true },
         });
         await Promise.all(
           admins.map((a) =>
-            this.mailer.notifyAdminLowStock(
-              a.email,
-              product.name,
-              product.currentStock,
-            ),
+            this.mailer.notifyAdminOutOfStock(a.email, product.name),
           ),
         );
       }

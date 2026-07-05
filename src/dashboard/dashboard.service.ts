@@ -1,6 +1,14 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { CreditsService } from '../credits/credits.service';
+
+// Liquid Cash tracks actual bank balance: cash/bank-transfer settlements
+// leave the account immediately, but a cheque doesn't until it actually
+// clears — while PENDING (or if it later bounces) the money hasn't left.
+const BANK_CASH_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
+  OR: [{ mode: { not: 'CHEQUE' } }, { mode: 'CHEQUE', chequeStatus: 'CLEARED' }],
+};
 
 const FULFILLMENT_STATUSES: OrderStatus[] = [
   OrderStatus.APPROVED,
@@ -9,9 +17,154 @@ const FULFILLMENT_STATUSES: OrderStatus[] = [
   OrderStatus.COMPLETED,
 ];
 
+function pctChange(curr: number, prev: number): number {
+  if (prev === 0) return curr === 0 ? 0 : 100;
+  return ((curr - prev) / prev) * 100;
+}
+
+function toNumber(value: Prisma.Decimal | null | undefined): number {
+  return value ? Number(value) : 0;
+}
+
 @Injectable()
 export class DashboardService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private creditsService: CreditsService,
+  ) {}
+
+  private async computeMonthlyFinancials(rangeStart: Date, rangeEnd: Date) {
+    const [
+      netSalesAgg,
+      salesReturnAgg,
+      netPurchaseAgg,
+      expensesAgg,
+      duePaymentsAgg,
+      supplierPaymentsAgg,
+    ] = await Promise.all([
+      this.prisma.order.aggregate({
+        where: {
+          status: OrderStatus.COMPLETED,
+          completedAt: { gte: rangeStart, lt: rangeEnd },
+        },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.salesReturn.aggregate({
+        where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.purchase.aggregate({
+        where: { purchaseDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { totalValue: true },
+      }),
+      this.prisma.expense.aggregate({
+        where: { expenseDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { amount: true },
+      }),
+      this.prisma.payment.aggregate({
+        where: { paymentDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { amount: true },
+      }),
+      this.prisma.supplierPayment.aggregate({
+        where: {
+          paymentDate: { gte: rangeStart, lt: rangeEnd },
+          ...BANK_CASH_PAYMENT_FILTER,
+        },
+        _sum: { amount: true },
+      }),
+    ]);
+
+    const netSales = toNumber(netSalesAgg._sum.totalAmount);
+    const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
+    const netPurchase = toNumber(netPurchaseAgg._sum.totalValue);
+    const totalExpenses = toNumber(expensesAgg._sum.amount);
+    const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
+    const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
+
+    const netCashFlow = invoiceDuePayments - supplierPayments - totalExpenses;
+    const profit = netSales - netPurchase - totalExpenses;
+
+    return {
+      netSales,
+      totalSalesReturn,
+      netPurchase,
+      totalExpenses,
+      invoiceDuePayments,
+      netCashFlow,
+      profit,
+    };
+  }
+
+  /**
+   * All-time cash-on-hand: investor contributions/withdrawals plus dealer
+   * payments collected, minus supplier payments and expenses actually paid
+   * out. Supplier payments only count once a cheque has actually cleared
+   * (see BANK_CASH_PAYMENT_FILTER) — a pending cheque hasn't left the bank
+   * yet. Deliberately excludes ProfitEntry — profit there is derived from
+   * sales already reflected in collected Payments, so adding it again would
+   * double-count the same cash.
+   */
+  private async computeLiquidCash() {
+    const [investmentAgg, paymentAgg, supplierPaymentAgg, expenseAgg] =
+      await Promise.all([
+        this.prisma.investment.aggregate({ _sum: { amount: true } }),
+        this.prisma.payment.aggregate({ _sum: { amount: true } }),
+        this.prisma.supplierPayment.aggregate({
+          where: BANK_CASH_PAYMENT_FILTER,
+          _sum: { amount: true },
+        }),
+        this.prisma.expense.aggregate({ _sum: { amount: true } }),
+      ]);
+
+    const totalInvestments = toNumber(investmentAgg._sum.amount);
+    const totalCollected = toNumber(paymentAgg._sum.amount);
+    const totalPaidToSuppliers = toNumber(supplierPaymentAgg._sum.amount);
+    const totalExpensesPaid = toNumber(expenseAgg._sum.amount);
+
+    return (
+      totalInvestments + totalCollected - totalPaidToSuppliers - totalExpensesPaid
+    );
+  }
+
+  private async getMonthlyKpis() {
+    const now = new Date();
+    const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
+    const [current, previous] = await Promise.all([
+      this.computeMonthlyFinancials(startOfThisMonth, startOfNextMonth),
+      this.computeMonthlyFinancials(startOfLastMonth, startOfThisMonth),
+    ]);
+
+    return {
+      netSales: current.netSales,
+      netSalesChangePct: pctChange(current.netSales, previous.netSales),
+      totalSalesReturn: current.totalSalesReturn,
+      totalSalesReturnChangePct: pctChange(
+        current.totalSalesReturn,
+        previous.totalSalesReturn,
+      ),
+      netPurchase: current.netPurchase,
+      netPurchaseChangePct: pctChange(
+        current.netPurchase,
+        previous.netPurchase,
+      ),
+      netCashFlow: current.netCashFlow,
+      profit: current.profit,
+      profitChangePct: pctChange(current.profit, previous.profit),
+      totalExpenses: current.totalExpenses,
+      totalExpensesChangePct: pctChange(
+        current.totalExpenses,
+        previous.totalExpenses,
+      ),
+      invoiceDuePayments: current.invoiceDuePayments,
+      invoiceDuePaymentsChangePct: pctChange(
+        current.invoiceDuePayments,
+        previous.invoiceDuePayments,
+      ),
+    };
+  }
 
   async getAdminSummary() {
     const startOfToday = new Date();
@@ -26,11 +179,14 @@ export class DashboardService {
       todaysSalesAgg,
       todaysOrders,
       pendingApprovals,
-      lowStockRows,
+      outOfStockItems,
       outstandingAgg,
       recentOrders,
       monthlyRevenue,
       topProductsGrouped,
+      monthlyKpis,
+      liquidCash,
+      creditsSummary,
     ] = await Promise.all([
       this.prisma.order.aggregate({
         where: {
@@ -43,9 +199,7 @@ export class DashboardService {
       this.prisma.order.count({
         where: { status: OrderStatus.PENDING_APPROVAL },
       }),
-      this.prisma.$queryRaw<{ count: bigint }[]>`
-        SELECT COUNT(*) as count FROM "Product" WHERE "currentStock" <= "minimumStock"
-      `,
+      this.prisma.product.count({ where: { currentStock: { lte: 0 } } }),
       this.prisma.dealer.aggregate({ _sum: { outstandingBalance: true } }),
       this.prisma.order.findMany({
         take: 10,
@@ -65,6 +219,9 @@ export class DashboardService {
         orderBy: { _sum: { quantity: 'desc' } },
         take: 5,
       }),
+      this.getMonthlyKpis(),
+      this.computeLiquidCash(),
+      this.creditsService.getSummary(),
     ]);
 
     const topProducts = await Promise.all(
@@ -81,11 +238,15 @@ export class DashboardService {
       todaysSales: todaysSalesAgg._sum.totalAmount ?? 0,
       todaysOrders,
       pendingApprovals,
-      lowStockItems: Number(lowStockRows[0]?.count ?? 0),
+      outOfStockItems,
       outstandingPayments: outstandingAgg._sum.outstandingBalance ?? 0,
       recentOrders,
       monthlyRevenue,
       topProducts,
+      ...monthlyKpis,
+      invoiceDue: outstandingAgg._sum.outstandingBalance ?? 0,
+      liquidCash,
+      creditBalance: creditsSummary.totals.totalCreditBalance,
     };
   }
 

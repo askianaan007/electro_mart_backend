@@ -406,9 +406,7 @@ async function main() {
         category: 'Television',
         costPrice: def.costPrice,
         wholesalePrice: def.price,
-        sellingPrice: def.price,
         currentStock: 0,
-        minimumStock: 2,
       },
     });
     productByCode.set(code, { id: product.id });

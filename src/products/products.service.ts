@@ -11,12 +11,10 @@ import { QueryProductDto } from './dto/query-product.dto';
 import { paginate } from '../common/utils/paginate';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 
-function withLowStockFlag<
-  T extends { currentStock: number; minimumStock: number },
->(product: T) {
+function withStockFlag<T extends { currentStock: number }>(product: T) {
   return {
     ...product,
-    isLowStock: product.currentStock <= product.minimumStock,
+    isOutOfStock: product.currentStock <= 0,
   };
 }
 
@@ -49,28 +47,19 @@ export class ProductsService {
       data: {
         ...dto,
         currentStock: dto.currentStock ?? 0,
-        minimumStock: dto.minimumStock ?? 0,
       },
     });
-    return withLowStockFlag(product);
+    return withStockFlag(product);
   }
 
   async findAll(query: QueryProductDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
-    let lowStockIds: string[] | undefined;
-    if (query.lowStockOnly) {
-      const rows = await this.prisma.$queryRaw<{ id: string }[]>`
-        SELECT id FROM "Product" WHERE "currentStock" <= "minimumStock"
-      `;
-      lowStockIds = rows.map((r) => r.id);
-    }
-
     const where: Prisma.ProductWhereInput = {
       category: query.category,
       status: query.status,
-      ...(lowStockIds && { id: { in: lowStockIds } }),
+      ...(query.outOfStockOnly && { currentStock: { lte: 0 } }),
       ...(query.search && {
         OR: [
           { name: { contains: query.search, mode: 'insensitive' } },
@@ -91,13 +80,13 @@ export class ProductsService {
       this.prisma.product.count({ where }),
     ]);
 
-    return paginate(data.map(withLowStockFlag), total, page, limit);
+    return paginate(data.map(withStockFlag), total, page, limit);
   }
 
   async findOne(id: string) {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) throw new NotFoundException('Product not found');
-    return withLowStockFlag(product);
+    return withStockFlag(product);
   }
 
   async update(id: string, dto: UpdateProductDto) {
@@ -107,7 +96,7 @@ export class ProductsService {
       where: { id },
       data: dto,
     });
-    return withLowStockFlag(product);
+    return withStockFlag(product);
   }
 
   async setStatus(id: string, status: 'ACTIVE' | 'INACTIVE') {
@@ -116,7 +105,7 @@ export class ProductsService {
       where: { id },
       data: { status },
     });
-    return withLowStockFlag(product);
+    return withStockFlag(product);
   }
 
   async remove(id: string) {

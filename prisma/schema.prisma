@@ -49,16 +49,22 @@ enum InventoryLogType {
   RELEASE
 }
 
+enum ChequeStatus {
+  PENDING
+  CLEARED
+  RETURNED
+}
+
 model Admin {
-  id                String    @id @default(uuid())
-  email             String    @unique
-  password          String
-  name              String
-  role              Role      @default(ADMIN)
-  resetToken        String?   @unique
-  resetTokenExpiry  DateTime?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id               String    @id @default(uuid())
+  email            String    @unique
+  password         String
+  name             String
+  role             Role      @default(ADMIN)
+  resetToken       String?   @unique
+  resetTokenExpiry DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   purchases      Purchase[]
   activityLogs   ActivityLog[]
@@ -83,11 +89,18 @@ model Dealer {
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 
-  orders   Order[]
-  invoices Invoice[]
-  payments Payment[]
+  orders       Order[]
+  invoices     Invoice[]
+  payments     Payment[]
+  salesReturns SalesReturn[]
 
   @@index([status])
+}
+
+model Category {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
 }
 
 model Product {
@@ -103,17 +116,17 @@ model Product {
   imageUrl       String?
   costPrice      Decimal
   wholesalePrice Decimal
-  sellingPrice   Decimal
   currentStock   Int           @default(0)
-  minimumStock   Int           @default(0)
   warranty       String?
   status         AccountStatus @default(ACTIVE)
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
-  orderItems    OrderItem[]
-  purchaseItems PurchaseItem[]
-  inventoryLogs InventoryLog[]
+  orderItems          OrderItem[]
+  purchaseItems       PurchaseItem[]
+  inventoryLogs       InventoryLog[]
+  salesReturnItems    SalesReturnItem[]
+  purchaseReturnItems PurchaseReturnItem[]
 
   @@index([category])
   @@index([status])
@@ -129,6 +142,7 @@ model Supplier {
 
   purchases        Purchase[]
   supplierPayments SupplierPayment[]
+  purchaseReturns  PurchaseReturn[]
 }
 
 model Purchase {
@@ -142,9 +156,41 @@ model Purchase {
   admin         Admin    @relation(fields: [adminId], references: [id])
   createdAt     DateTime @default(now())
 
-  items PurchaseItem[]
+  items           PurchaseItem[]
+  purchaseReturns PurchaseReturn[]
 
   @@index([supplierId])
+}
+
+model PurchaseReturn {
+  id           String               @id @default(uuid())
+  returnNumber String               @unique
+  purchaseId   String
+  purchase     Purchase             @relation(fields: [purchaseId], references: [id])
+  supplierId   String
+  supplier     Supplier             @relation(fields: [supplierId], references: [id])
+  reason       String
+  totalAmount  Decimal
+  returnDate   DateTime
+  createdAt    DateTime             @default(now())
+  items        PurchaseReturnItem[]
+
+  @@index([purchaseId])
+  @@index([supplierId])
+}
+
+model PurchaseReturnItem {
+  id               String         @id @default(uuid())
+  purchaseReturnId String
+  purchaseReturn   PurchaseReturn @relation(fields: [purchaseReturnId], references: [id])
+  productId        String
+  product          Product        @relation(fields: [productId], references: [id])
+  quantity         Int
+  unitCost         Decimal
+  lineTotal        Decimal
+
+  @@index([purchaseReturnId])
+  @@index([productId])
 }
 
 model PurchaseItem {
@@ -198,8 +244,9 @@ model Order {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  items   OrderItem[]
-  invoice Invoice?
+  items        OrderItem[]
+  invoice      Invoice?
+  salesReturns SalesReturn[]
 
   @@index([dealerId])
   @@index([status])
@@ -256,17 +303,94 @@ model Payment {
 }
 
 model SupplierPayment {
-  id          String      @id @default(uuid())
-  supplierId  String
-  supplier    Supplier    @relation(fields: [supplierId], references: [id])
-  amount      Decimal
-  mode        PaymentMode
-  reference   String?
-  paymentDate DateTime
-  remarks     String?
-  createdAt   DateTime    @default(now())
+  id                String        @id @default(uuid())
+  supplierId        String
+  supplier          Supplier      @relation(fields: [supplierId], references: [id])
+  amount            Decimal
+  mode              PaymentMode
+  reference         String?
+  paymentDate       DateTime
+  chequeStatus      ChequeStatus?
+  chequeDepositDate DateTime?
+  remarks           String?
+  createdAt         DateTime      @default(now())
 
   @@index([supplierId])
+}
+
+model Investor {
+  id                    String   @id @default(uuid())
+  name                  String
+  phone                 String?
+  email                 String?
+  profitSharePercentage Decimal  @default(0)
+  createdAt             DateTime @default(now())
+
+  investments Investment[]
+}
+
+model Investment {
+  id             String      @id @default(uuid())
+  investorId     String
+  investor       Investor    @relation(fields: [investorId], references: [id])
+  amount         Decimal
+  mode           PaymentMode
+  investmentDate DateTime
+  reason         String
+  remarks        String?
+  createdAt      DateTime    @default(now())
+
+  @@index([investorId])
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  description String
+  amount      Decimal
+  expenseDate DateTime
+  remarks     String?
+  createdAt   DateTime @default(now())
+}
+
+model ProfitEntry {
+  id          String   @id @default(uuid())
+  periodStart DateTime
+  periodEnd   DateTime
+  amount      Decimal
+  remarks     String?
+  createdAt   DateTime @default(now())
+}
+
+model SalesReturn {
+  id           String   @id @default(uuid())
+  returnNumber String   @unique
+  orderId      String
+  order        Order    @relation(fields: [orderId], references: [id])
+  dealerId     String
+  dealer       Dealer   @relation(fields: [dealerId], references: [id])
+  reason       String
+  totalAmount  Decimal
+  returnDate   DateTime
+  createdAt    DateTime @default(now())
+
+  items SalesReturnItem[]
+
+  @@index([orderId])
+  @@index([dealerId])
+}
+
+model SalesReturnItem {
+  id            String      @id @default(uuid())
+  salesReturnId String
+  salesReturn   SalesReturn @relation(fields: [salesReturnId], references: [id])
+  productId     String
+  product       Product     @relation(fields: [productId], references: [id])
+  quantity      Int
+  unitPrice     Decimal
+  lineTotal     Decimal
+
+  @@index([salesReturnId])
+  @@index([productId])
 }
 
 model ActivityLog {
