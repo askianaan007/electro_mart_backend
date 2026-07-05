@@ -10,7 +10,8 @@ export class QueryInvestmentDto extends PaginationQueryDto {
 
   @ApiPropertyOptional({
     enum: ['DEPOSIT', 'WITHDRAWAL'],
-    description: 'Filter by whether the amount is a contribution (positive) or a withdrawal (negative)',
+    description:
+      'Filter by whether the amount is a contribution (positive) or a withdrawal (negative)',
   })
   @IsOptional()
   @IsIn(['DEPOSIT', 'WITHDRAWAL'])

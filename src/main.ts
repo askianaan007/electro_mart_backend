@@ -1,13 +1,26 @@
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  const logger = new Logger('Bootstrap');
 
-  app.enableCors();
+  app.use(helmet());
+
+  const corsOrigin = process.env.CORS_ORIGIN;
+  if (corsOrigin) {
+    app.enableCors({ origin: corsOrigin.split(',').map((o) => o.trim()) });
+  } else {
+    logger.warn(
+      'CORS_ORIGIN is not set — allowing all origins. Set CORS_ORIGIN (comma-separated) in production.',
+    );
+    app.enableCors();
+  }
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -36,7 +49,9 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('api/docs', app, document);
 
-  await app.listen(process.env.PORT ?? 3000);
+  const port = process.env.PORT ?? 3000;
+  await app.listen(port);
+  logger.log(`Application listening on port ${port}`);
 }
 
 void bootstrap();

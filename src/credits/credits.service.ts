@@ -117,23 +117,22 @@ export class CreditsService {
     });
     if (!supplier) throw new NotFoundException('Supplier not found');
 
-    const [balances, purchases, purchaseReturns, payments] =
-      await Promise.all([
-        this.computeCreditBalance(supplierId),
-        this.prisma.purchase.findMany({
-          where: { supplierId },
-          include: { items: true },
-          orderBy: { purchaseDate: 'desc' },
-        }),
-        this.prisma.purchaseReturn.findMany({
-          where: { supplierId },
-          orderBy: { returnDate: 'desc' },
-        }),
-        this.prisma.supplierPayment.findMany({
-          where: { supplierId },
-          orderBy: { paymentDate: 'desc' },
-        }),
-      ]);
+    const [balances, purchases, purchaseReturns, payments] = await Promise.all([
+      this.computeCreditBalance(supplierId),
+      this.prisma.purchase.findMany({
+        where: { supplierId },
+        include: { items: true },
+        orderBy: { purchaseDate: 'desc' },
+      }),
+      this.prisma.purchaseReturn.findMany({
+        where: { supplierId },
+        orderBy: { returnDate: 'desc' },
+      }),
+      this.prisma.supplierPayment.findMany({
+        where: { supplierId },
+        orderBy: { paymentDate: 'desc' },
+      }),
+    ]);
 
     return {
       supplier,
@@ -176,7 +175,8 @@ export class CreditsService {
           mode: dto.mode,
           reference: dto.reference,
           paymentDate: new Date(dto.paymentDate),
-          chequeStatus: dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
+          chequeStatus:
+            dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
           chequeDepositDate:
             dto.mode === 'CHEQUE' && dto.chequeDepositDate
               ? new Date(dto.chequeDepositDate)

@@ -42,7 +42,8 @@ export class CreditsController {
 
   @Post(':supplierId/settlements')
   @ApiOperation({
-    summary: 'Record a cash or cheque settlement against a supplier credit balance',
+    summary:
+      'Record a cash or cheque settlement against a supplier credit balance',
   })
   createSettlement(
     @Param('supplierId') supplierId: string,

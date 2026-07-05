@@ -51,7 +51,10 @@ export class CreateDealerDto {
   @MinLength(6)
   password?: string;
 
-  @ApiPropertyOptional({ default: 0, description: 'Ignored when unlimitedCredit is true' })
+  @ApiPropertyOptional({
+    default: 0,
+    description: 'Ignored when unlimitedCredit is true',
+  })
   @IsOptional()
   @IsNumber()
   @Min(0)
@@ -59,7 +62,8 @@ export class CreateDealerDto {
 
   @ApiPropertyOptional({
     default: false,
-    description: 'When true, this dealer can place orders regardless of creditLimit',
+    description:
+      'When true, this dealer can place orders regardless of creditLimit',
   })
   @IsOptional()
   @IsBoolean()

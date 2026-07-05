@@ -29,7 +29,8 @@ export class CreateSettlementDto {
   paymentDate: string;
 
   @ApiPropertyOptional({
-    description: 'Required when mode is CHEQUE: the date the cheque is/was deposited',
+    description:
+      'Required when mode is CHEQUE: the date the cheque is/was deposited',
   })
   @IsOptional()
   @IsDateString()

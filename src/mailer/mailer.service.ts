@@ -69,7 +69,10 @@ export class MailerService {
     });
   }
 
-  notifyAdminOutOfStock(adminEmail: string, productName: string): Promise<void> {
+  notifyAdminOutOfStock(
+    adminEmail: string,
+    productName: string,
+  ): Promise<void> {
     return this.send({
       to: adminEmail,
       subject: `Out of stock — ${productName}`,
@@ -84,7 +87,9 @@ export class MailerService {
     grandTotal?: string,
     discountDescription?: string,
   ): Promise<void> {
-    const discountLine = discountDescription ? ` ${discountDescription} was applied.` : '';
+    const discountLine = discountDescription
+      ? ` ${discountDescription} was applied.`
+      : '';
     const totalLine = grandTotal
       ? ` Final total: <strong>${grandTotal}</strong>.${discountLine}`
       : '';

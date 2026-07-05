@@ -26,7 +26,8 @@ export class SalesAnalysisController {
 
   @Get()
   @ApiOperation({
-    summary: 'Per-order sales analysis: selling price, buying price, and profit for each delivered/completed order',
+    summary:
+      'Per-order sales analysis: selling price, buying price, and profit for each delivered/completed order',
   })
   findAll(@Query() query: QuerySalesAnalysisDto) {
     return this.salesAnalysisService.findAll(query);

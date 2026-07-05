@@ -8,7 +8,10 @@ import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 // leave the account immediately, but a cheque doesn't until it actually
 // clears — while PENDING (or if it later bounces) the money hasn't left.
 const BANK_CASH_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
-  OR: [{ mode: { not: 'CHEQUE' } }, { mode: 'CHEQUE', chequeStatus: 'CLEARED' }],
+  OR: [
+    { mode: { not: 'CHEQUE' } },
+    { mode: 'CHEQUE', chequeStatus: 'CLEARED' },
+  ],
 };
 
 const FULFILLMENT_STATUSES: OrderStatus[] = [
@@ -116,7 +119,10 @@ export class DashboardService {
     const totalExpensesPaid = toNumber(expenseAgg._sum.amount);
 
     return (
-      totalInvestments + totalCollected - totalPaidToSuppliers - totalExpensesPaid
+      totalInvestments +
+      totalCollected -
+      totalPaidToSuppliers -
+      totalExpensesPaid
     );
   }
 
@@ -218,15 +224,17 @@ export class DashboardService {
       this.creditsService.getSummary(),
     ]);
 
-    const topProducts = await Promise.all(
-      topProductsGrouped.map(async (row) => {
-        const product = await this.prisma.product.findUnique({
-          where: { id: row.productId },
-          select: { id: true, name: true, productCode: true },
-        });
-        return { product, quantitySold: row._sum.quantity ?? 0 };
-      }),
+    const topProductRecords = await this.prisma.product.findMany({
+      where: { id: { in: topProductsGrouped.map((row) => row.productId) } },
+      select: { id: true, name: true, productCode: true },
+    });
+    const topProductById = new Map(
+      topProductRecords.map((product) => [product.id, product]),
     );
+    const topProducts = topProductsGrouped.map((row) => ({
+      product: topProductById.get(row.productId) ?? null,
+      quantitySold: row._sum.quantity ?? 0,
+    }));
 
     return {
       todaysSales: todaysSalesAgg._sum.totalAmount ?? 0,

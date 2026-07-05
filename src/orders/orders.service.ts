@@ -216,7 +216,10 @@ export class OrdersService {
       throw new BadRequestException('Only pending orders can be approved');
     }
 
-    if (dto?.discountPercentage !== undefined && dto?.discountAmount !== undefined) {
+    if (
+      dto?.discountPercentage !== undefined &&
+      dto?.discountAmount !== undefined
+    ) {
       throw new BadRequestException(
         'Provide either a discount percentage or a fixed discount amount, not both',
       );
@@ -239,7 +242,9 @@ export class OrdersService {
       }
     } else if (dto?.discountPercentage !== undefined) {
       if (dto.discountPercentage < 0 || dto.discountPercentage > 100) {
-        throw new BadRequestException('Discount percentage must be between 0 and 100');
+        throw new BadRequestException(
+          'Discount percentage must be between 0 and 100',
+        );
       }
       discountTotal = order.subtotal.mul(dto.discountPercentage).div(100);
       if (dto.discountPercentage > 0) {
@@ -308,20 +313,23 @@ export class OrdersService {
       );
     }
 
-    for (const item of order.items) {
-      const product = await this.prisma.product.findUnique({
-        where: { id: item.productId },
+    const productsAfterReserve = await this.prisma.product.findMany({
+      where: { id: { in: order.items.map((item) => item.productId) } },
+    });
+    const outOfStockProducts = productsAfterReserve.filter(
+      (product) => product.currentStock <= 0,
+    );
+    if (outOfStockProducts.length > 0) {
+      const admins = await this.prisma.admin.findMany({
+        select: { email: true },
       });
-      if (product && product.currentStock <= 0) {
-        const admins = await this.prisma.admin.findMany({
-          select: { email: true },
-        });
-        await Promise.all(
+      await Promise.all(
+        outOfStockProducts.flatMap((product) =>
           admins.map((a) =>
             this.mailer.notifyAdminOutOfStock(a.email, product.name),
           ),
-        );
-      }
+        ),
+      );
     }
 
     return updated;

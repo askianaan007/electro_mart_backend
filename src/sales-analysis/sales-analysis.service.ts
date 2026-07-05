@@ -12,7 +12,9 @@ const ORDER_INCLUDE = {
   invoice: { select: { invoiceNumber: true } },
 } satisfies Prisma.OrderInclude;
 
-type OrderWithRelations = Prisma.OrderGetPayload<{ include: typeof ORDER_INCLUDE }>;
+type OrderWithRelations = Prisma.OrderGetPayload<{
+  include: typeof ORDER_INCLUDE;
+}>;
 
 type RangeFilter = { dateFrom?: string; dateTo?: string; dealerId?: string };
 
@@ -69,7 +71,12 @@ export class SalesAnalysisService {
       this.prisma.order.count({ where }),
     ]);
 
-    return paginate(orders.map((o) => this.toRow(o)), total, page, limit);
+    return paginate(
+      orders.map((o) => this.toRow(o)),
+      total,
+      page,
+      limit,
+    );
   }
 
   async getSummary(query: RangeFilter) {
