@@ -12,6 +12,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { OrdersService } from './orders.service';
 import { CreateOrderDto } from './dto/create-order.dto';
+import { ApproveOrderDto } from './dto/approve-order.dto';
 import { QueryOrderDto } from './dto/query-order.dto';
 import { RejectOrderDto } from './dto/reject-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
@@ -59,8 +60,12 @@ export class OrdersController {
     summary:
       'Approve a pending order — reserves stock and generates an invoice',
   })
-  approve(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
-    return this.ordersService.approve(id, adminId);
+  approve(
+    @Param('id') id: string,
+    @CurrentUser('sub') adminId: string,
+    @Body() dto?: ApproveOrderDto,
+  ) {
+    return this.ordersService.approve(id, adminId, dto);
   }
 
   @Patch(':id/reject')

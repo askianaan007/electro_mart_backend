@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreditsService } from '../credits/credits.service';
+import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 
 // Liquid Cash tracks actual bank balance: cash/bank-transfer settlements
 // leave the account immediately, but a cheque doesn't until it actually
@@ -31,23 +32,22 @@ export class DashboardService {
   constructor(
     private prisma: PrismaService,
     private creditsService: CreditsService,
+    private salesAnalysisService: SalesAnalysisService,
   ) {}
 
   private async computeMonthlyFinancials(rangeStart: Date, rangeEnd: Date) {
     const [
-      netSalesAgg,
+      salesAnalysis,
       salesReturnAgg,
       netPurchaseAgg,
-      expensesAgg,
       duePaymentsAgg,
       supplierPaymentsAgg,
     ] = await Promise.all([
-      this.prisma.order.aggregate({
-        where: {
-          status: OrderStatus.COMPLETED,
-          completedAt: { gte: rangeStart, lt: rangeEnd },
-        },
-        _sum: { totalAmount: true },
+      // Single source of truth for Net Sales/Profit: cost-of-goods-sold based
+      // on completed orders in this range, shared with the Sales Analysis page.
+      this.salesAnalysisService.getSummary({
+        dateFrom: rangeStart.toISOString(),
+        dateTo: rangeEnd.toISOString(),
       }),
       this.prisma.salesReturn.aggregate({
         where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
@@ -56,10 +56,6 @@ export class DashboardService {
       this.prisma.purchase.aggregate({
         where: { purchaseDate: { gte: rangeStart, lt: rangeEnd } },
         _sum: { totalValue: true },
-      }),
-      this.prisma.expense.aggregate({
-        where: { expenseDate: { gte: rangeStart, lt: rangeEnd } },
-        _sum: { amount: true },
       }),
       this.prisma.payment.aggregate({
         where: { paymentDate: { gte: rangeStart, lt: rangeEnd } },
@@ -74,15 +70,15 @@ export class DashboardService {
       }),
     ]);
 
-    const netSales = toNumber(netSalesAgg._sum.totalAmount);
+    const netSales = toNumber(salesAnalysis.totalSales);
     const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
     const netPurchase = toNumber(netPurchaseAgg._sum.totalValue);
-    const totalExpenses = toNumber(expensesAgg._sum.amount);
+    const totalExpenses = toNumber(salesAnalysis.totalExpenses);
     const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
     const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
 
     const netCashFlow = invoiceDuePayments - supplierPayments - totalExpenses;
-    const profit = netSales - netPurchase - totalExpenses;
+    const profit = toNumber(salesAnalysis.netProfit);
 
     return {
       netSales,
@@ -100,9 +96,7 @@ export class DashboardService {
    * payments collected, minus supplier payments and expenses actually paid
    * out. Supplier payments only count once a cheque has actually cleared
    * (see BANK_CASH_PAYMENT_FILTER) — a pending cheque hasn't left the bank
-   * yet. Deliberately excludes ProfitEntry — profit there is derived from
-   * sales already reflected in collected Payments, so adding it again would
-   * double-count the same cash.
+   * yet.
    */
   private async computeLiquidCash() {
     const [investmentAgg, paymentAgg, supplierPaymentAgg, expenseAgg] =
@@ -275,6 +269,7 @@ export class DashboardService {
     return {
       outstandingBalance: dealer.outstandingBalance,
       creditLimit: dealer.creditLimit,
+      unlimitedCredit: dealer.unlimitedCredit,
       creditRemaining: dealer.creditLimit.sub(dealer.outstandingBalance),
       pendingOrders,
       recentOrders,

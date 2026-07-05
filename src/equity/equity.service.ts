@@ -1,25 +1,33 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 
 @Injectable()
 export class EquityService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private salesAnalysisService: SalesAnalysisService,
+  ) {}
 
   async getSummary() {
-    const [investors, investmentTotals, profitAgg, expenseAgg] =
+    const [investors, investmentTotals, salesAnalysis, expenseAgg] =
       await Promise.all([
         this.prisma.investor.findMany({ orderBy: { name: 'asc' } }),
         this.prisma.investment.groupBy({
           by: ['investorId'],
           _sum: { amount: true },
         }),
-        this.prisma.profitEntry.aggregate({ _sum: { amount: true } }),
+        // Gross profit computed live from every completed sale — no manual
+        // entry needed. Expenses are still deducted per investor below, so
+        // this intentionally uses gross (not net-of-expenses) profit to
+        // avoid double-subtracting expenses.
+        this.salesAnalysisService.getSummary({}),
         this.prisma.expense.aggregate({ _sum: { amount: true } }),
       ]);
 
     const investorCount = investors.length;
-    const totalProfit = profitAgg._sum.amount ?? new Prisma.Decimal(0);
+    const totalProfit = new Prisma.Decimal(salesAnalysis.totalProfit);
     const totalExpenses = expenseAgg._sum.amount ?? new Prisma.Decimal(0);
 
     const investmentByInvestor = new Map(

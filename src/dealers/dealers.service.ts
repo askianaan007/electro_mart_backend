@@ -46,6 +46,7 @@ export class DealersService {
         username: dto.username,
         password: hashed,
         creditLimit: dto.creditLimit ?? 0,
+        unlimitedCredit: dto.unlimitedCredit ?? false,
         status: dto.status ?? AccountStatus.ACTIVE,
       },
       omit: { password: true },
@@ -142,6 +143,7 @@ export class DealersService {
       district: dto.district,
       username: dto.username,
       creditLimit: dto.creditLimit,
+      unlimitedCredit: dto.unlimitedCredit,
       status: dto.status,
     };
 

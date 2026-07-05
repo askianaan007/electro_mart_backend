@@ -81,11 +81,17 @@ export class MailerService {
     dealerEmail: string,
     orderNumber: string,
     invoiceNumber: string,
+    grandTotal?: string,
+    discountDescription?: string,
   ): Promise<void> {
+    const discountLine = discountDescription ? ` ${discountDescription} was applied.` : '';
+    const totalLine = grandTotal
+      ? ` Final total: <strong>${grandTotal}</strong>.${discountLine}`
+      : '';
     return this.send({
       to: dealerEmail,
       subject: `Order ${orderNumber} approved`,
-      html: `<p>Your order <strong>${orderNumber}</strong> has been approved. Invoice <strong>${invoiceNumber}</strong> is ready.</p>`,
+      html: `<p>Your order <strong>${orderNumber}</strong> has been approved. Invoice <strong>${invoiceNumber}</strong> is ready.${totalLine}</p>`,
     });
   }
 

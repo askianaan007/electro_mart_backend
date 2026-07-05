@@ -35,6 +35,8 @@ export class InvestmentsService {
 
     const where: Prisma.InvestmentWhereInput = {
       investorId: query.investorId,
+      ...(query.type === 'DEPOSIT' && { amount: { gt: 0 } }),
+      ...(query.type === 'WITHDRAWAL' && { amount: { lt: 0 } }),
       ...(query.search && {
         reason: { contains: query.search, mode: 'insensitive' },
       }),

@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AccountStatus } from '@prisma/client';
 import {
+  IsBoolean,
   IsEmail,
   IsEnum,
   IsNumber,
@@ -50,11 +51,19 @@ export class CreateDealerDto {
   @MinLength(6)
   password?: string;
 
-  @ApiPropertyOptional({ default: 0 })
+  @ApiPropertyOptional({ default: 0, description: 'Ignored when unlimitedCredit is true' })
   @IsOptional()
   @IsNumber()
   @Min(0)
   creditLimit?: number;
+
+  @ApiPropertyOptional({
+    default: false,
+    description: 'When true, this dealer can place orders regardless of creditLimit',
+  })
+  @IsOptional()
+  @IsBoolean()
+  unlimitedCredit?: boolean;
 
   @ApiPropertyOptional({ enum: AccountStatus, default: AccountStatus.ACTIVE })
   @IsOptional()

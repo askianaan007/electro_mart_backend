@@ -82,6 +82,7 @@ model Dealer {
   username           String        @unique
   password           String
   creditLimit        Decimal       @default(0)
+  unlimitedCredit    Boolean       @default(false)
   outstandingBalance Decimal       @default(0)
   status             AccountStatus @default(ACTIVE)
   resetToken         String?       @unique
@@ -348,15 +349,6 @@ model Expense {
   description String
   amount      Decimal
   expenseDate DateTime
-  remarks     String?
-  createdAt   DateTime @default(now())
-}
-
-model ProfitEntry {
-  id          String   @id @default(uuid())
-  periodStart DateTime
-  periodEnd   DateTime
-  amount      Decimal
   remarks     String?
   createdAt   DateTime @default(now())
 }

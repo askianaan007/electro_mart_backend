@@ -19,11 +19,11 @@ import { DashboardModule } from './dashboard/dashboard.module';
 import { InvestorsModule } from './investors/investors.module';
 import { InvestmentsModule } from './investments/investments.module';
 import { ExpensesModule } from './expenses/expenses.module';
-import { ProfitEntriesModule } from './profit-entries/profit-entries.module';
 import { EquityModule } from './equity/equity.module';
 import { SalesReturnsModule } from './sales-returns/sales-returns.module';
 import { PurchaseReturnsModule } from './purchase-returns/purchase-returns.module';
 import { CreditsModule } from './credits/credits.module';
+import { SalesAnalysisModule } from './sales-analysis/sales-analysis.module';
 
 @Module({
   imports: [
@@ -45,11 +45,11 @@ import { CreditsModule } from './credits/credits.module';
     InvestorsModule,
     InvestmentsModule,
     ExpensesModule,
-    ProfitEntriesModule,
     EquityModule,
     SalesReturnsModule,
     PurchaseReturnsModule,
     CreditsModule,
+    SalesAnalysisModule,
   ],
   controllers: [AppController],
   providers: [AppService],
