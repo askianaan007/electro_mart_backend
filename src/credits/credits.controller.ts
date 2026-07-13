@@ -5,6 +5,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -12,6 +13,7 @@ import { Role } from '@prisma/client';
 import { CreditsService } from './credits.service';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { UpdateChequeStatusDto } from './dto/update-cheque-status.dto';
+import { QueryCreditsDto } from './dto/query-credits.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -27,8 +29,8 @@ export class CreditsController {
 
   @Get()
   @ApiOperation({ summary: 'Per-supplier credit (payable) balances' })
-  getSummary() {
-    return this.creditsService.getSummary();
+  getSummary(@Query() query: QueryCreditsDto) {
+    return this.creditsService.getSummary(query);
   }
 
   @Get(':supplierId')

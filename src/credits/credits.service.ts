@@ -7,6 +7,8 @@ import { ChequeStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
+import { QueryCreditsDto } from './dto/query-credits.dto';
+import { paginate } from '../common/utils/paginate';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -47,23 +49,32 @@ export class CreditsService {
     return { totalPurchases, totalReturns, totalSettled, creditBalance };
   }
 
-  async getSummary() {
+  async getSummary(query: QueryCreditsDto = {}) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+
     const suppliers = await this.prisma.supplier.findMany({
+      where: query.search
+        ? { name: { contains: query.search, mode: 'insensitive' } }
+        : {},
       orderBy: { name: 'asc' },
     });
+    const supplierIds = suppliers.map((s) => s.id);
 
     const [purchaseTotals, returnTotals, paymentTotals] = await Promise.all([
       this.prisma.purchase.groupBy({
         by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
         _sum: { totalValue: true },
       }),
       this.prisma.purchaseReturn.groupBy({
         by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
         _sum: { totalAmount: true },
       }),
       this.prisma.supplierPayment.groupBy({
         by: ['supplierId'],
-        where: EFFECTIVE_PAYMENT_FILTER,
+        where: { supplierId: { in: supplierIds }, ...EFFECTIVE_PAYMENT_FILTER },
         _sum: { amount: true },
       }),
     ]);
@@ -78,7 +89,7 @@ export class CreditsService {
       paymentTotals.map((r) => [r.supplierId, r._sum.amount ?? ZERO]),
     );
 
-    const entries = suppliers.map((supplier) => {
+    let entries = suppliers.map((supplier) => {
       const totalPurchases = purchaseMap.get(supplier.id) ?? ZERO;
       const totalReturns = returnMap.get(supplier.id) ?? ZERO;
       const totalSettled = paymentMap.get(supplier.id) ?? ZERO;
@@ -92,6 +103,10 @@ export class CreditsService {
         creditBalance,
       };
     });
+
+    if (query.onlyOutstanding === 'true') {
+      entries = entries.filter((e) => e.creditBalance.greaterThan(ZERO));
+    }
 
     const totals = entries.reduce(
       (acc, e) => ({
@@ -108,7 +123,15 @@ export class CreditsService {
       },
     );
 
-    return { entries, totals };
+    const start = (page - 1) * limit;
+    const { data, meta } = paginate(
+      entries.slice(start, start + limit),
+      entries.length,
+      page,
+      limit,
+    );
+
+    return { entries: data, meta, totals };
   }
 
   async getSupplierDetail(supplierId: string) {
