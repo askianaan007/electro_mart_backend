@@ -17,7 +17,7 @@ const prisma = new PrismaClient();
 const COMMIT = process.argv.includes('--commit');
 const PASSWORD_SALT_ROUNDS = 10;
 const TRANSACTION_OPTIONS = { maxWait: 10000, timeout: 20000 };
-const ADMIN_EMAIL = ' electromarttrade@gmail.com';
+const ADMIN_EMAIL = 'electromarttrade@gmail.com';
 
 type RawData = {
   purchases: [string, string | null, string, number, number, number][];
