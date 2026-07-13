@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -7,12 +8,16 @@ import { InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { UploadsService } from '../uploads/uploads.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { paginate } from '../common/utils/paginate';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+
+export const MAX_PRODUCT_IMAGES = 5;
+export const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
 
 function withStockFlag<T extends { currentStock: number }>(product: T) {
   return {
@@ -23,10 +28,15 @@ function withStockFlag<T extends { currentStock: number }>(product: T) {
 
 @Injectable()
 export class ProductsService {
+  private readonly imagesInclude = {
+    images: { orderBy: { sortOrder: 'asc' } },
+  } satisfies Prisma.ProductInclude;
+
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
     private inventoryService: InventoryService,
+    private uploadsService: UploadsService,
   ) {}
 
   private async assertCodesAreUnique(
@@ -102,6 +112,7 @@ export class ProductsService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.product.findMany({
         where,
+        include: this.imagesInclude,
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -113,7 +124,10 @@ export class ProductsService {
   }
 
   async findOne(id: string) {
-    const product = await this.prisma.product.findUnique({ where: { id } });
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      include: this.imagesInclude,
+    });
     if (!product) throw new NotFoundException('Product not found');
     return withStockFlag(product);
   }
@@ -165,8 +179,9 @@ export class ProductsService {
 
   async remove(id: string, adminId: string) {
     const product = await this.findOne(id);
+    let result: { message: string };
     try {
-      return await this.prisma.$transaction(async (tx) => {
+      result = await this.prisma.$transaction(async (tx) => {
         await tx.product.delete({ where: { id } });
 
         await this.activityLogService.log(tx, {
@@ -186,5 +201,101 @@ export class ProductsService {
       }
       throw error;
     }
+
+    await Promise.all(
+      product.images.map((image) => this.uploadsService.deleteImage(image.publicId)),
+    );
+
+    return result;
+  }
+
+  async addImages(
+    id: string,
+    files: Express.Multer.File[],
+    adminId: string,
+  ) {
+    const product = await this.prisma.product.findUnique({
+      where: { id },
+      include: this.imagesInclude,
+    });
+    if (!product) throw new NotFoundException('Product not found');
+    if (files.length === 0) {
+      throw new BadRequestException('No image files were provided');
+    }
+    if (product.images.length + files.length > MAX_PRODUCT_IMAGES) {
+      throw new BadRequestException(
+        `A product can have at most ${MAX_PRODUCT_IMAGES} images (${product.images.length} already uploaded)`,
+      );
+    }
+
+    const uploaded = await Promise.all(
+      files.map((file) =>
+        this.uploadsService.uploadImage(file.buffer, 'products'),
+      ),
+    );
+
+    const startOrder = product.images.length;
+    return this.prisma.$transaction(async (tx) => {
+      const created = await Promise.all(
+        uploaded.map((image, index) =>
+          tx.productImage.create({
+            data: {
+              productId: id,
+              url: image.url,
+              publicId: image.publicId,
+              sortOrder: startOrder + index,
+            },
+          }),
+        ),
+      );
+
+      if (!product.imageUrl) {
+        await tx.product.update({
+          where: { id },
+          data: { imageUrl: uploaded[0].url },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'ADDED_PRODUCT_IMAGES',
+        targetId: id,
+        details: `Added ${files.length} image(s) to product ${product.name}`,
+      });
+
+      return created;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  async removeImage(id: string, imageId: string, adminId: string) {
+    const image = await this.prisma.productImage.findUnique({
+      where: { id: imageId },
+    });
+    if (!image || image.productId !== id) {
+      throw new NotFoundException('Image not found');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.productImage.delete({ where: { id: imageId } });
+
+      const remaining = await tx.productImage.findFirst({
+        where: { productId: id },
+        orderBy: { sortOrder: 'asc' },
+      });
+      await tx.product.update({
+        where: { id },
+        data: { imageUrl: remaining?.url ?? null },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'REMOVED_PRODUCT_IMAGE',
+        targetId: id,
+      });
+    }, TRANSACTION_OPTIONS);
+
+    await this.uploadsService.deleteImage(image.publicId);
+
+    return { message: 'Image removed' };
   }
 }

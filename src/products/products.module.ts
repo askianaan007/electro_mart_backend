@@ -3,9 +3,10 @@ import { ProductsService } from './products.service';
 import { ProductsController } from './products.controller';
 import { ActivityLogModule } from '../activity-log/activity-log.module';
 import { InventoryModule } from '../inventory/inventory.module';
+import { UploadsModule } from '../uploads/uploads.module';
 
 @Module({
-  imports: [ActivityLogModule, InventoryModule],
+  imports: [ActivityLogModule, InventoryModule, UploadsModule],
   providers: [ProductsService],
   controllers: [ProductsController],
   exports: [ProductsService],

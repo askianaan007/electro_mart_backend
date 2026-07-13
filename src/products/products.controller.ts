@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -7,11 +8,18 @@ import {
   Post,
   Delete,
   Query,
+  UploadedFiles,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { FilesInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
-import { ProductsService } from './products.service';
+import {
+  MAX_IMAGE_SIZE_BYTES,
+  MAX_PRODUCT_IMAGES,
+  ProductsService,
+} from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
@@ -20,6 +28,13 @@ import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
+
+const IMAGE_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+]);
 
 function hideCostPriceForDealer<T extends { costPrice?: unknown }>(
   product: T,
@@ -102,5 +117,47 @@ export class ProductsController {
   })
   remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
     return this.productsService.remove(id, adminId);
+  }
+
+  @Post(':id/images')
+  @Roles(Role.ADMIN)
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: `Upload up to ${MAX_PRODUCT_IMAGES} images for a product (max 5MB each)`,
+  })
+  @UseInterceptors(
+    FilesInterceptor('images', MAX_PRODUCT_IMAGES, {
+      limits: { fileSize: MAX_IMAGE_SIZE_BYTES },
+      fileFilter: (_req, file, callback) => {
+        if (!IMAGE_MIME_TYPES.has(file.mimetype)) {
+          callback(
+            new BadRequestException(
+              'Only JPEG, PNG, WEBP, or GIF images are allowed',
+            ),
+            false,
+          );
+          return;
+        }
+        callback(null, true);
+      },
+    }),
+  )
+  addImages(
+    @Param('id') id: string,
+    @UploadedFiles() files: Array<Express.Multer.File>,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.productsService.addImages(id, files ?? [], adminId);
+  }
+
+  @Delete(':id/images/:imageId')
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: "Remove a single image from a product's gallery" })
+  removeImage(
+    @Param('id') id: string,
+    @Param('imageId') imageId: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.productsService.removeImage(id, imageId, adminId);
   }
 }

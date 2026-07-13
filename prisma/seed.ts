@@ -4,13 +4,13 @@ import * as bcrypt from 'bcrypt';
 const prisma = new PrismaClient();
 
 async function main() {
-  const email = 'admin@electromart.com';
+  const email = ' electromarttrade@gmail.com';
   const plainPassword = 'Aa@amjaskmub077';
 
   const existing = await prisma.admin.findUnique({ where: { email } });
   if (existing) {
     console.log('Admin already exists:', email);
-    
+
     return;
   }
 

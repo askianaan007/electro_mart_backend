@@ -17,11 +17,8 @@ const prisma = new PrismaClient();
 const COMMIT = process.argv.includes('--commit');
 const PASSWORD_SALT_ROUNDS = 10;
 const TRANSACTION_OPTIONS = { maxWait: 10000, timeout: 20000 };
-const ADMIN_EMAIL = 'admin@electromart.com';
+const ADMIN_EMAIL = ' electromarttrade@gmail.com';
 
-// ---------------------------------------------------------------------------
-// Source data (already extracted + reconciled from the workbook)
-// ---------------------------------------------------------------------------
 type RawData = {
   purchases: [string, string | null, string, number, number, number][];
   sales: [string, string, string | null, string, number, number, number][];
