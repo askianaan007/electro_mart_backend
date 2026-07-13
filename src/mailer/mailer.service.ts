@@ -138,6 +138,24 @@ export class MailerService {
     });
   }
 
+  notifyDealerPasswordReset(
+    dealerEmail: string,
+    businessName: string,
+    username: string,
+    temporaryPassword: string,
+  ): Promise<void> {
+    return this.send({
+      to: dealerEmail,
+      subject: 'Your Electro Mart password has been reset',
+      html: `
+        <p>Hello ${businessName},</p>
+        <p>An administrator has reset your account password.</p>
+        <p><strong>Username:</strong> ${username}<br/><strong>New temporary password:</strong> ${temporaryPassword}</p>
+        <p>Please log in and change your password as soon as possible.</p>
+      `,
+    });
+  }
+
   notifyDealerOrderDelivered(
     dealerEmail: string,
     data: {

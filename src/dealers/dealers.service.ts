@@ -196,6 +196,41 @@ export class DealersService {
     }, TRANSACTION_OPTIONS);
   }
 
+  async resetPassword(id: string, adminId: string) {
+    const dealer = await this.findOne(id);
+
+    const temporaryPassword = generateTempPassword();
+    const hashed = await bcrypt.hash(temporaryPassword, PASSWORD_SALT_ROUNDS);
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.dealer.update({
+        where: { id },
+        data: { password: hashed },
+        omit: { password: true },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RESET_DEALER_PASSWORD',
+        targetId: result.id,
+        details: `Reset password for dealer ${result.businessName} (${result.username})`,
+      });
+
+      return result;
+    }, TRANSACTION_OPTIONS);
+
+    if (dealer.email) {
+      await this.mailer.notifyDealerPasswordReset(
+        dealer.email,
+        updated.businessName,
+        updated.username,
+        temporaryPassword,
+      );
+    }
+
+    return { dealer: updated, temporaryPassword };
+  }
+
   async setStatus(id: string, status: AccountStatus, adminId: string) {
     await this.findOne(id);
 

@@ -57,6 +57,14 @@ export class DealersController {
     return this.dealersService.update(id, dto, adminId);
   }
 
+  @Post(':id/reset-password')
+  @ApiOperation({
+    summary: 'Generate a new temporary password for a dealer account',
+  })
+  resetPassword(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.dealersService.resetPassword(id, adminId);
+  }
+
   @Patch(':id/status')
   @ApiOperation({ summary: 'Activate or deactivate a dealer account' })
   setStatus(
