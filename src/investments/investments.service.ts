@@ -57,13 +57,19 @@ export class InvestmentsService {
       ...(query.search && {
         reason: { contains: query.search, mode: 'insensitive' },
       }),
+      ...((query.dateFrom || query.dateTo) && {
+        investmentDate: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lte: new Date(query.dateTo) }),
+        },
+      }),
     };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.investment.findMany({
         where,
         include: { investor: true },
-        orderBy: { investmentDate: 'desc' },
+        orderBy: [{ investmentDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
       }),

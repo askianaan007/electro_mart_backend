@@ -68,7 +68,11 @@ export class PurchasesService {
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.purchase.findMany({
-        include: { supplier: true, items: true },
+        include: {
+          supplier: true,
+          items: true,
+          purchaseReturns: { select: { totalAmount: true } },
+        },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -86,6 +90,7 @@ export class PurchasesService {
         supplier: true,
         items: { include: { product: true } },
         admin: { omit: { password: true } },
+        purchaseReturns: { select: { totalAmount: true } },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');

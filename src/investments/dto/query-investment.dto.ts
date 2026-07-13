@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsUUID } from 'class-validator';
+import { IsDateString, IsIn, IsOptional, IsUUID } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export class QueryInvestmentDto extends PaginationQueryDto {
@@ -16,4 +16,14 @@ export class QueryInvestmentDto extends PaginationQueryDto {
   @IsOptional()
   @IsIn(['DEPOSIT', 'WITHDRAWAL'])
   type?: 'DEPOSIT' | 'WITHDRAWAL';
+
+  @ApiPropertyOptional({ description: 'Start of date range (inclusive), matches Investment.investmentDate' })
+  @IsOptional()
+  @IsDateString()
+  dateFrom?: string;
+
+  @ApiPropertyOptional({ description: 'End of date range (inclusive), matches Investment.investmentDate' })
+  @IsOptional()
+  @IsDateString()
+  dateTo?: string;
 }

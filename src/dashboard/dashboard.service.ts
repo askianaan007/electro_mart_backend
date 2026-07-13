@@ -42,7 +42,8 @@ export class DashboardService {
     const [
       salesAnalysis,
       salesReturnAgg,
-      netPurchaseAgg,
+      purchaseAgg,
+      purchaseReturnAgg,
       duePaymentsAgg,
       supplierPaymentsAgg,
     ] = await Promise.all([
@@ -60,6 +61,10 @@ export class DashboardService {
         where: { purchaseDate: { gte: rangeStart, lt: rangeEnd } },
         _sum: { totalValue: true },
       }),
+      this.prisma.purchaseReturn.aggregate({
+        where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { totalAmount: true },
+      }),
       this.prisma.payment.aggregate({
         where: { paymentDate: { gte: rangeStart, lt: rangeEnd } },
         _sum: { amount: true },
@@ -75,7 +80,9 @@ export class DashboardService {
 
     const netSales = toNumber(salesAnalysis.totalSales);
     const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
-    const netPurchase = toNumber(netPurchaseAgg._sum.totalValue);
+    const grossPurchase = toNumber(purchaseAgg._sum.totalValue);
+    const totalPurchaseReturn = toNumber(purchaseReturnAgg._sum.totalAmount);
+    const netPurchase = grossPurchase - totalPurchaseReturn;
     const totalExpenses = toNumber(salesAnalysis.totalExpenses);
     const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
     const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
@@ -86,6 +93,7 @@ export class DashboardService {
     return {
       netSales,
       totalSalesReturn,
+      totalPurchaseReturn,
       netPurchase,
       totalExpenses,
       invoiceDuePayments,
@@ -144,6 +152,11 @@ export class DashboardService {
       totalSalesReturnChangePct: pctChange(
         current.totalSalesReturn,
         previous.totalSalesReturn,
+      ),
+      totalPurchaseReturn: current.totalPurchaseReturn,
+      totalPurchaseReturnChangePct: pctChange(
+        current.totalPurchaseReturn,
+        previous.totalPurchaseReturn,
       ),
       netPurchase: current.netPurchase,
       netPurchaseChangePct: pctChange(

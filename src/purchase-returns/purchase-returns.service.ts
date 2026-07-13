@@ -60,6 +60,10 @@ export class PurchaseReturnsService {
           `Cannot return ${item.quantity} of product ${item.productId}; only ${remaining} remain returnable`,
         );
       }
+      // Track this line's quantity so a second line for the same product in
+      // the same request is checked against the reduced remaining, not the
+      // stale pre-request value.
+      returnedMap.set(item.productId, alreadyReturnedQty + item.quantity);
 
       const lineTotal = purchaseItem.unitCost.mul(item.quantity);
       totalAmount = totalAmount.add(lineTotal);
