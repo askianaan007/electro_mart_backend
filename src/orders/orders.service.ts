@@ -168,6 +168,50 @@ export class OrdersService {
     return { savedOrder, invoice };
   }
 
+  /** Shared by approve() and the admin-create-order path. */
+  private resolveDiscount(
+    subtotal: Prisma.Decimal,
+    dto?: { discountPercentage?: number; discountAmount?: number },
+  ) {
+    if (
+      dto?.discountPercentage !== undefined &&
+      dto?.discountAmount !== undefined
+    ) {
+      throw new BadRequestException(
+        'Provide either a discount percentage or a fixed discount amount, not both',
+      );
+    }
+
+    let discountTotal = new Prisma.Decimal(0);
+    let discountDescription: string | null = null;
+    if (dto?.discountAmount !== undefined) {
+      if (dto.discountAmount < 0) {
+        throw new BadRequestException('Discount amount cannot be negative');
+      }
+      discountTotal = new Prisma.Decimal(dto.discountAmount);
+      if (discountTotal.greaterThan(subtotal)) {
+        throw new BadRequestException(
+          'Discount amount cannot exceed the order subtotal',
+        );
+      }
+      if (discountTotal.greaterThan(0)) {
+        discountDescription = `a fixed discount of ${discountTotal.toString()}`;
+      }
+    } else if (dto?.discountPercentage !== undefined) {
+      if (dto.discountPercentage < 0 || dto.discountPercentage > 100) {
+        throw new BadRequestException(
+          'Discount percentage must be between 0 and 100',
+        );
+      }
+      discountTotal = subtotal.mul(dto.discountPercentage).div(100);
+      if (dto.discountPercentage > 0) {
+        discountDescription = `${dto.discountPercentage}% discount`;
+      }
+    }
+
+    return { discountTotal, discountDescription };
+  }
+
   private async checkAndNotifyOutOfStock(productIds: string[]) {
     const productsAfterReserve = await this.prisma.product.findMany({
       where: { id: { in: productIds } },
