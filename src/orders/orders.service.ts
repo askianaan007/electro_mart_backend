@@ -555,7 +555,7 @@ export class OrdersService {
   ) {
     const order = await this.prisma.order.findUnique({
       where: { id },
-      include: { invoice: true },
+      include: this.orderInclude,
     });
     if (!order) throw new NotFoundException('Order not found');
 
@@ -566,7 +566,7 @@ export class OrdersService {
       );
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const updated = await this.prisma.$transaction(async (tx) => {
       const timestampField = TIMESTAMP_FIELD[nextStatus];
 
       if (nextStatus === 'COMPLETED' && order.invoice) {
@@ -576,7 +576,7 @@ export class OrdersService {
         });
       }
 
-      const updated = await tx.order.update({
+      const saved = await tx.order.update({
         where: { id },
         data: {
           status: nextStatus,
@@ -591,8 +591,28 @@ export class OrdersService {
         targetId: id,
       });
 
-      return updated;
+      return saved;
     }, TRANSACTION_OPTIONS);
+
+    if (nextStatus === 'DELIVERED' && updated.invoice && updated.dealer.email) {
+      await this.mailer.notifyDealerOrderDelivered(updated.dealer.email, {
+        orderNumber: updated.orderNumber,
+        dealerName: updated.dealer.businessName,
+        invoiceNumber: updated.invoice.invoiceNumber,
+        invoiceDate: updated.invoice.createdAt,
+        items: updated.items.map((item) => ({
+          productName: item.product.name,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice.toString(),
+          lineTotal: item.lineTotal.toString(),
+        })),
+        subtotal: updated.invoice.subtotal.toString(),
+        discountTotal: updated.invoice.discountTotal.toString(),
+        grandTotal: updated.invoice.grandTotal.toString(),
+      });
+    }
+
+    return updated;
   }
 
   /**

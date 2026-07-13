@@ -7,6 +7,7 @@ import { AccountStatus, OrderStatus, Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { MailerService } from '../mailer/mailer.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
@@ -21,6 +22,7 @@ export class DealersService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private mailer: MailerService,
   ) {}
 
   async create(dto: CreateDealerDto, adminId: string) {
@@ -67,6 +69,15 @@ export class DealersService {
 
       return created;
     }, TRANSACTION_OPTIONS);
+
+    if (dealer.email) {
+      await this.mailer.notifyDealerWelcome(
+        dealer.email,
+        dealer.businessName,
+        dealer.username,
+        tempPassword,
+      );
+    }
 
     return {
       dealer,
