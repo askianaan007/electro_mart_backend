@@ -312,6 +312,7 @@ model SupplierPayment {
   reference         String?
   paymentDate       DateTime
   chequeStatus      ChequeStatus?
+  chequeStatusUpdatedAt DateTime?
   chequeDepositDate DateTime?
   remarks           String?
   createdAt         DateTime      @default(now())

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -16,6 +17,7 @@ import { ApproveOrderDto } from './dto/approve-order.dto';
 import { QueryOrderDto } from './dto/query-order.dto';
 import { RejectOrderDto } from './dto/reject-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
+import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -30,10 +32,13 @@ export class OrdersController {
   constructor(private ordersService: OrdersService) {}
 
   @Post()
-  @Roles(Role.DEALER)
-  @ApiOperation({ summary: 'Dealer submits a new order for approval' })
-  create(@CurrentUser('sub') dealerId: string, @Body() dto: CreateOrderDto) {
-    return this.ordersService.create(dealerId, dto);
+  @Roles(Role.ADMIN, Role.DEALER)
+  @ApiOperation({
+    summary:
+      "Create an order — dealers submit their own for approval; admins create one pre-approved on a dealer's behalf",
+  })
+  create(@CurrentUser() user: JwtPayload, @Body() dto: CreateOrderDto) {
+    return this.ordersService.create({ role: user.role, id: user.sub }, dto);
   }
 
   @Get()
@@ -68,6 +73,19 @@ export class OrdersController {
     return this.ordersService.approve(id, adminId, dto);
   }
 
+  @Patch(':id/items')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary: "Replace a pending order's line items (only while PENDING_APPROVAL)",
+  })
+  updateItems(
+    @Param('id') id: string,
+    @CurrentUser('sub') adminId: string,
+    @Body() dto: UpdateOrderItemsDto,
+  ) {
+    return this.ordersService.updateItems(id, adminId, dto);
+  }
+
   @Patch(':id/reject')
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Reject a pending order with a reason' })
@@ -90,5 +108,15 @@ export class OrdersController {
     @Body() dto: UpdateOrderStatusDto,
   ) {
     return this.ordersService.advanceStatus(id, adminId, dto.status);
+  }
+
+  @Delete(':id')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      'Delete an order any time before COMPLETED, reversing its stock reservation and invoice if it was approved',
+  })
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.ordersService.remove(id, adminId);
   }
 }

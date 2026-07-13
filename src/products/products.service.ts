@@ -3,9 +3,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { InventoryService } from '../inventory/inventory.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
@@ -25,6 +26,7 @@ export class ProductsService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private inventoryService: InventoryService,
   ) {}
 
   private async assertCodesAreUnique(
@@ -50,12 +52,21 @@ export class ProductsService {
     await this.assertCodesAreUnique(dto);
 
     const product = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.product.create({
+      let created = await tx.product.create({
         data: {
           ...dto,
-          currentStock: dto.currentStock ?? 0,
+          currentStock: 0,
         },
       });
+
+      if (dto.currentStock && dto.currentStock > 0) {
+        created = await this.inventoryService.recordMovement(tx, {
+          productId: created.id,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityIn: dto.currentStock,
+          reference: 'Opening stock',
+        });
+      }
 
       await this.activityLogService.log(tx, {
         adminId,

@@ -91,6 +91,12 @@ export class PaymentsService {
     const where: Prisma.PaymentWhereInput = {
       mode: query.mode,
       dealerId: query.dealerId,
+      ...((query.dateFrom || query.dateTo) && {
+        paymentDate: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lt: new Date(query.dateTo) }),
+        },
+      }),
       ...(query.search && {
         reference: { contains: query.search, mode: 'insensitive' },
       }),

@@ -8,7 +8,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePurchaseReturnDto } from './dto/create-purchase-return.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { QueryPurchaseReturnsDto } from './dto/query-purchase-returns.dto';
 import { paginate } from '../common/utils/paginate';
 import { nextSequenceNumber } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
@@ -116,19 +116,31 @@ export class PurchaseReturnsService {
     }, TRANSACTION_OPTIONS);
   }
 
-  async findAll(query: PaginationQueryDto) {
+  async findAll(query: QueryPurchaseReturnsDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
-    const where: Prisma.PurchaseReturnWhereInput = query.search
-      ? { returnNumber: { contains: query.search, mode: 'insensitive' } }
-      : {};
+    const where: Prisma.PurchaseReturnWhereInput = {
+      ...(query.supplierId && { supplierId: query.supplierId }),
+      ...(query.search && {
+        OR: [
+          { returnNumber: { contains: query.search, mode: 'insensitive' } },
+          { reason: { contains: query.search, mode: 'insensitive' } },
+        ],
+      }),
+      ...((query.dateFrom || query.dateTo) && {
+        returnDate: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lte: new Date(query.dateTo) }),
+        },
+      }),
+    };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.purchaseReturn.findMany({
         where,
         include: this.include,
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ returnDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
       }),

@@ -16,7 +16,12 @@ type OrderWithRelations = Prisma.OrderGetPayload<{
   include: typeof ORDER_INCLUDE;
 }>;
 
-type RangeFilter = { dateFrom?: string; dateTo?: string; dealerId?: string };
+type RangeFilter = {
+  dateFrom?: string;
+  dateTo?: string;
+  dealerId?: string;
+  search?: string;
+};
 
 @Injectable()
 export class SalesAnalysisService {
@@ -32,15 +37,68 @@ export class SalesAnalysisService {
           ...(query.dateTo && { lt: new Date(query.dateTo) }),
         },
       }),
+      ...(query.search && {
+        OR: [
+          { orderNumber: { contains: query.search, mode: 'insensitive' } },
+          {
+            dealer: {
+              businessName: { contains: query.search, mode: 'insensitive' },
+            },
+          },
+        ],
+      }),
     };
   }
 
-  private toRow(order: OrderWithRelations) {
-    const buyingPrice = order.items.reduce(
+  /**
+   * A completed order that later has a sales return recorded against it
+   * should no longer show its pre-return selling price/profit here — a
+   * return unwinds both the revenue and the cost of the returned units.
+   * Batched into one query per call site rather than looked up per-order.
+   */
+  private async fetchReturnsByOrder(orderIds: string[]) {
+    const map = new Map<
+      string,
+      { returnedSelling: Prisma.Decimal; returnedCost: Prisma.Decimal }
+    >();
+    if (orderIds.length === 0) return map;
+
+    const returnItems = await this.prisma.salesReturnItem.findMany({
+      where: { salesReturn: { orderId: { in: orderIds } } },
+      include: {
+        product: { select: { costPrice: true } },
+        salesReturn: { select: { orderId: true } },
+      },
+    });
+
+    for (const item of returnItems) {
+      const orderId = item.salesReturn.orderId;
+      const existing = map.get(orderId) ?? {
+        returnedSelling: ZERO,
+        returnedCost: ZERO,
+      };
+      map.set(orderId, {
+        returnedSelling: existing.returnedSelling.add(item.lineTotal),
+        returnedCost: existing.returnedCost.add(
+          item.product.costPrice.mul(item.quantity),
+        ),
+      });
+    }
+    return map;
+  }
+
+  private toRow(
+    order: OrderWithRelations,
+    returns?: { returnedSelling: Prisma.Decimal; returnedCost: Prisma.Decimal },
+  ) {
+    const grossBuyingPrice = order.items.reduce(
       (sum, item) => sum.add(item.product.costPrice.mul(item.quantity)),
       ZERO,
     );
-    const sellingPrice = order.totalAmount;
+    const sellingPrice = order.totalAmount.sub(
+      returns?.returnedSelling ?? ZERO,
+    );
+    const buyingPrice = grossBuyingPrice.sub(returns?.returnedCost ?? ZERO);
     const profit = sellingPrice.sub(buyingPrice);
     return {
       orderId: order.id,
@@ -71,8 +129,12 @@ export class SalesAnalysisService {
       this.prisma.order.count({ where }),
     ]);
 
+    const returnsByOrder = await this.fetchReturnsByOrder(
+      orders.map((o) => o.id),
+    );
+
     return paginate(
-      orders.map((o) => this.toRow(o)),
+      orders.map((o) => this.toRow(o, returnsByOrder.get(o.id))),
       total,
       page,
       limit,
@@ -87,7 +149,10 @@ export class SalesAnalysisService {
       include: ORDER_INCLUDE,
     });
 
-    const rows = orders.map((o) => this.toRow(o));
+    const returnsByOrder = await this.fetchReturnsByOrder(
+      orders.map((o) => o.id),
+    );
+    const rows = orders.map((o) => this.toRow(o, returnsByOrder.get(o.id)));
     const totalSales = rows.reduce((sum, r) => sum.add(r.sellingPrice), ZERO);
     const totalBuying = rows.reduce((sum, r) => sum.add(r.buyingPrice), ZERO);
     const totalProfit = rows.reduce((sum, r) => sum.add(r.profit), ZERO);

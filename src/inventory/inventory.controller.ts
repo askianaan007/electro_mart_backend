@@ -11,7 +11,8 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { InventoryService } from './inventory.service';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { QueryInventoryDto } from './dto/query-inventory.dto';
+import { QueryLedgerDto } from './dto/query-ledger.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -27,7 +28,7 @@ export class InventoryController {
 
   @Get()
   @ApiOperation({ summary: 'List current stock levels with status badges' })
-  listStock(@Query() query: PaginationQueryDto) {
+  listStock(@Query() query: QueryInventoryDto) {
     return this.inventoryService.listStock(query);
   }
 
@@ -35,7 +36,7 @@ export class InventoryController {
   @ApiOperation({ summary: 'Get stock movement ledger for a product' })
   getLedger(
     @Param('productId') productId: string,
-    @Query() query: PaginationQueryDto,
+    @Query() query: QueryLedgerDto,
   ) {
     return this.inventoryService.getLedger(productId, query);
   }

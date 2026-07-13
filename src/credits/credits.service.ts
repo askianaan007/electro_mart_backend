@@ -8,9 +8,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { QueryCreditsDto } from './dto/query-credits.dto';
+import { QuerySettlementsDto } from './dto/query-settlements.dto';
 import { paginate } from '../common/utils/paginate';
 
 const ZERO = new Prisma.Decimal(0);
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 // A cheque that has bounced no longer counts as money paid to the supplier —
 // everything else (cash, bank transfer, pending or cleared cheques) does.
@@ -140,30 +142,49 @@ export class CreditsService {
     });
     if (!supplier) throw new NotFoundException('Supplier not found');
 
-    const [balances, purchases, purchaseReturns, payments] = await Promise.all([
-      this.computeCreditBalance(supplierId),
-      this.prisma.purchase.findMany({
-        where: { supplierId },
-        include: { items: true },
-        orderBy: { purchaseDate: 'desc' },
-      }),
-      this.prisma.purchaseReturn.findMany({
-        where: { supplierId },
-        orderBy: { returnDate: 'desc' },
-      }),
-      this.prisma.supplierPayment.findMany({
-        where: { supplierId },
-        orderBy: { paymentDate: 'desc' },
-      }),
-    ]);
+    const balances = await this.computeCreditBalance(supplierId);
 
     return {
       supplier,
       ...balances,
-      purchases,
-      purchaseReturns,
-      payments,
     };
+  }
+
+  async getSettlements(supplierId: string, query: QuerySettlementsDto) {
+    const supplier = await this.prisma.supplier.findUnique({
+      where: { id: supplierId },
+    });
+    if (!supplier) throw new NotFoundException('Supplier not found');
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+
+    const where: Prisma.SupplierPaymentWhereInput = {
+      supplierId,
+      ...(query.mode && { mode: query.mode }),
+      ...(query.chequeStatus && { chequeStatus: query.chequeStatus }),
+      ...(query.search && {
+        reference: { contains: query.search, mode: 'insensitive' },
+      }),
+      ...((query.dateFrom || query.dateTo) && {
+        paymentDate: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lte: new Date(query.dateTo) }),
+        },
+      }),
+    };
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.supplierPayment.findMany({
+        where,
+        orderBy: [{ paymentDate: 'desc' }, { createdAt: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.supplierPayment.count({ where }),
+    ]);
+
+    return paginate(data, total, page, limit);
   }
 
   async createSettlement(
@@ -200,6 +221,7 @@ export class CreditsService {
           paymentDate: new Date(dto.paymentDate),
           chequeStatus:
             dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
+          chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : undefined,
           chequeDepositDate:
             dto.mode === 'CHEQUE' && dto.chequeDepositDate
               ? new Date(dto.chequeDepositDate)
@@ -221,7 +243,7 @@ export class CreditsService {
 
   async updateChequeStatus(
     paymentId: string,
-    status: 'CLEARED' | 'RETURNED',
+    status: 'CLEARED' | 'RETURNED' | 'PENDING',
     adminId: string,
   ) {
     const payment = await this.prisma.supplierPayment.findUnique({
@@ -233,26 +255,70 @@ export class CreditsService {
         'Only cheque settlements have a cheque status',
       );
     }
-    if (payment.chequeStatus !== ChequeStatus.PENDING) {
-      throw new BadRequestException(
-        `This cheque is already marked ${payment.chequeStatus}`,
-      );
+
+    let details: string;
+
+    if (status === ChequeStatus.PENDING) {
+      if (payment.chequeStatus === ChequeStatus.PENDING) {
+        throw new BadRequestException('This cheque is already pending');
+      }
+      const changedAt = payment.chequeStatusUpdatedAt;
+      if (!changedAt || Date.now() - changedAt.getTime() > DAY_MS) {
+        throw new BadRequestException(
+          'This cheque can only be reverted to pending within 1 day of being marked ' +
+            `${payment.chequeStatus}`,
+        );
+      }
+      details = `Cheque ${payment.reference ?? paymentId} reverted from ${payment.chequeStatus} to PENDING`;
+    } else {
+      if (payment.chequeStatus !== ChequeStatus.PENDING) {
+        throw new BadRequestException(
+          `This cheque is already marked ${payment.chequeStatus}`,
+        );
+      }
+      details = `Cheque ${payment.reference ?? paymentId} marked ${status}`;
     }
 
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.supplierPayment.update({
         where: { id: paymentId },
-        data: { chequeStatus: status },
+        data: { chequeStatus: status, chequeStatusUpdatedAt: new Date() },
       });
 
       await this.activityLogService.log(tx, {
         adminId,
         action: 'UPDATED_CHEQUE_STATUS',
         targetId: paymentId,
-        details: `Cheque ${payment.reference ?? paymentId} marked ${status}`,
+        details,
       });
 
       return updated;
+    });
+  }
+
+  async deleteSettlement(paymentId: string, adminId: string) {
+    const payment = await this.prisma.supplierPayment.findUnique({
+      where: { id: paymentId },
+      include: { supplier: true },
+    });
+    if (!payment) throw new NotFoundException('Settlement not found');
+    if (Date.now() - payment.createdAt.getTime() > DAY_MS) {
+      throw new BadRequestException(
+        'This settlement can only be deleted within 1 day of being recorded',
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.supplierPayment.delete({ where: { id: paymentId } });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'DELETED_SUPPLIER_SETTLEMENT',
+        targetId: paymentId,
+        details: `Deleted ${payment.mode} settlement of ${payment.amount.toString()} to ${payment.supplier.name}`,
+      });
+
+      return { message: 'Settlement deleted' };
     });
   }
 }

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -9,17 +10,22 @@ import {
   InventoryLogType,
   OrderStatus,
   Prisma,
+  Role,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { MailerService } from '../mailer/mailer.service';
-import { CreateOrderDto } from './dto/create-order.dto';
+import { CreateOrderDto, OrderItemDto } from './dto/create-order.dto';
 import { ApproveOrderDto } from './dto/approve-order.dto';
 import { QueryOrderDto } from './dto/query-order.dto';
+import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
 import { paginate } from '../common/utils/paginate';
 import { nextSequenceNumber } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { isForeignKeyViolation } from '../common/utils/prisma-errors';
+
+type TransactionClient = Prisma.TransactionClient;
 
 const INVOICE_DUE_DAYS = 15;
 
@@ -53,15 +59,8 @@ export class OrdersService {
     invoice: true,
   } satisfies Prisma.OrderInclude;
 
-  async create(dealerId: string, dto: CreateOrderDto) {
-    const dealer = await this.prisma.dealer.findUnique({
-      where: { id: dealerId },
-    });
-    if (!dealer) throw new NotFoundException('Dealer not found');
-    if (dealer.status !== AccountStatus.ACTIVE)
-      throw new ForbiddenException('Dealer account is inactive');
-
-    const productIds = dto.items.map((item) => item.productId);
+  private async buildItemsAndSubtotal(items: OrderItemDto[]) {
+    const productIds = items.map((item) => item.productId);
     const products = await this.prisma.product.findMany({
       where: { id: { in: productIds } },
     });
@@ -70,7 +69,7 @@ export class OrdersService {
       products.map((product) => [product.id, product]),
     );
     let subtotal = new Prisma.Decimal(0);
-    const itemsData = dto.items.map((item) => {
+    const itemsData = items.map((item) => {
       const product = productMap.get(item.productId);
       if (!product)
         throw new NotFoundException(`Product ${item.productId} not found`);
@@ -96,6 +95,123 @@ export class OrdersService {
       };
     });
 
+    return { itemsData, subtotal };
+  }
+
+  /**
+   * Shared by approve() and the admin-create-order path: reserves stock,
+   * generates the invoice, marks the order APPROVED, and logs the action.
+   */
+  private async applyApproval(
+    tx: TransactionClient,
+    order: {
+      id: string;
+      orderNumber: string;
+      dealerId: string;
+      subtotal: Prisma.Decimal;
+      items: { productId: string; quantity: number }[];
+    },
+    adminId: string,
+    options: {
+      discountTotal: Prisma.Decimal;
+      discountDescription: string | null;
+      activityAction: string;
+    },
+  ) {
+    for (const item of order.items) {
+      await this.inventoryService.recordMovement(tx, {
+        productId: item.productId,
+        type: InventoryLogType.RESERVE,
+        quantityOut: item.quantity,
+        reference: order.id,
+      });
+    }
+
+    const invoiceNumber = await nextSequenceNumber(tx, 'invoice', 'INV');
+    const dueDate = new Date();
+    dueDate.setDate(dueDate.getDate() + INVOICE_DUE_DAYS);
+    const grandTotal = order.subtotal.sub(options.discountTotal);
+
+    const invoice = await tx.invoice.create({
+      data: {
+        invoiceNumber,
+        orderId: order.id,
+        dealerId: order.dealerId,
+        subtotal: order.subtotal,
+        discountTotal: options.discountTotal,
+        grandTotal,
+        dueDate,
+      },
+    });
+
+    const savedOrder = await tx.order.update({
+      where: { id: order.id },
+      data: {
+        status: OrderStatus.APPROVED,
+        approvedByAdminId: adminId,
+        approvedAt: new Date(),
+        discount: options.discountTotal,
+        totalAmount: grandTotal,
+      },
+      include: this.orderInclude,
+    });
+
+    await this.activityLogService.log(tx, {
+      adminId,
+      action: options.activityAction,
+      targetId: order.id,
+      details: options.discountDescription
+        ? `Approved ${order.orderNumber} with ${options.discountDescription}, generated invoice ${invoice.invoiceNumber}`
+        : `Approved ${order.orderNumber}, generated invoice ${invoice.invoiceNumber}`,
+    });
+
+    return { savedOrder, invoice };
+  }
+
+  private async checkAndNotifyOutOfStock(productIds: string[]) {
+    const productsAfterReserve = await this.prisma.product.findMany({
+      where: { id: { in: productIds } },
+    });
+    const outOfStockProducts = productsAfterReserve.filter(
+      (product) => product.currentStock <= 0,
+    );
+    if (outOfStockProducts.length === 0) return;
+
+    const admins = await this.prisma.admin.findMany({
+      select: { email: true },
+    });
+    await Promise.all(
+      outOfStockProducts.flatMap((product) =>
+        admins.map((a) =>
+          this.mailer.notifyAdminOutOfStock(a.email, product.name),
+        ),
+      ),
+    );
+  }
+
+  async create(
+    requester: { role: Role; id: string },
+    dto: CreateOrderDto,
+  ) {
+    const dealerId =
+      requester.role === Role.ADMIN ? dto.dealerId : requester.id;
+    if (requester.role === Role.ADMIN && !dealerId) {
+      throw new BadRequestException(
+        'dealerId is required when an admin creates an order',
+      );
+    }
+
+    const dealer = await this.prisma.dealer.findUnique({
+      where: { id: dealerId },
+    });
+    if (!dealer) throw new NotFoundException('Dealer not found');
+    if (dealer.status !== AccountStatus.ACTIVE)
+      throw new ForbiddenException('Dealer account is inactive');
+
+    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(
+      dto.items,
+    );
+
     const totalAmount = subtotal;
     const projectedOutstanding = dealer.outstandingBalance.add(totalAmount);
     if (
@@ -103,8 +219,48 @@ export class OrdersService {
       projectedOutstanding.greaterThan(dealer.creditLimit)
     ) {
       throw new BadRequestException(
-        'This order exceeds your available credit limit',
+        requester.role === Role.ADMIN
+          ? "This order exceeds the dealer's available credit limit"
+          : 'This order exceeds your available credit limit',
       );
+    }
+
+    if (requester.role === Role.ADMIN) {
+      const { savedOrder } = await this.prisma.$transaction(async (tx) => {
+        const orderNumber = await nextSequenceNumber(tx, 'order', 'ORD');
+        const order = await tx.order.create({
+          data: {
+            orderNumber,
+            dealerId: dealerId as string,
+            subtotal,
+            discount: 0,
+            totalAmount,
+            items: { create: itemsData },
+          },
+          include: { items: true },
+        });
+
+        return this.applyApproval(tx, order, requester.id, {
+          discountTotal: new Prisma.Decimal(0),
+          discountDescription: null,
+          activityAction: 'ADMIN_CREATED_ORDER',
+        });
+      }, TRANSACTION_OPTIONS);
+
+      if (dealer.email) {
+        await this.mailer.notifyDealerOrderApproved(
+          dealer.email,
+          savedOrder.orderNumber,
+          savedOrder.invoice?.invoiceNumber ?? '',
+          savedOrder.totalAmount.toString(),
+        );
+      }
+
+      await this.checkAndNotifyOutOfStock(
+        itemsData.map((item) => item.productId),
+      );
+
+      return savedOrder;
     }
 
     const order = await this.prisma.$transaction(async (tx) => {
@@ -112,7 +268,7 @@ export class OrdersService {
       return tx.order.create({
         data: {
           orderNumber,
-          dealerId,
+          dealerId: dealerId as string,
           subtotal,
           discount: 0,
           totalAmount,
@@ -138,6 +294,53 @@ export class OrdersService {
     return order;
   }
 
+  async updateItems(id: string, adminId: string, dto: UpdateOrderItemsDto) {
+    const order = await this.prisma.order.findUnique({
+      where: { id },
+      include: { dealer: true },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.status !== OrderStatus.PENDING_APPROVAL) {
+      throw new BadRequestException(
+        'Only pending orders can have their items edited',
+      );
+    }
+
+    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(
+      dto.items,
+    );
+
+    const projectedOutstanding = order.dealer.outstandingBalance.add(
+      subtotal,
+    );
+    if (
+      !order.dealer.unlimitedCredit &&
+      projectedOutstanding.greaterThan(order.dealer.creditLimit)
+    ) {
+      throw new BadRequestException(
+        "This change exceeds the dealer's available credit limit",
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.orderItem.deleteMany({ where: { orderId: id } });
+      const savedOrder = await tx.order.update({
+        where: { id },
+        data: { subtotal, totalAmount: subtotal, items: { create: itemsData } },
+        include: this.orderInclude,
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_ORDER_ITEMS',
+        targetId: id,
+        details: `Updated line items for ${order.orderNumber}`,
+      });
+
+      return savedOrder;
+    }, TRANSACTION_OPTIONS);
+  }
+
   async findAllForAdmin(query: QueryOrderDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -145,6 +348,12 @@ export class OrdersService {
     const where: Prisma.OrderWhereInput = {
       status: query.status,
       dealerId: query.dealerId,
+      ...((query.dateFrom || query.dateTo) && {
+        createdAt: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lt: new Date(query.dateTo) }),
+        },
+      }),
       ...(query.search && {
         OR: [
           { orderNumber: { contains: query.search, mode: 'insensitive' } },
@@ -251,88 +460,31 @@ export class OrdersService {
         discountDescription = `${dto.discountPercentage}% discount`;
       }
     }
-    const grandTotal = order.subtotal.sub(discountTotal);
-
-    const updated = await this.prisma.$transaction(async (tx) => {
-      for (const item of order.items) {
-        await this.inventoryService.recordMovement(tx, {
-          productId: item.productId,
-          type: InventoryLogType.RESERVE,
-          quantityOut: item.quantity,
-          reference: order.id,
-        });
-      }
-
-      const invoiceNumber = await nextSequenceNumber(tx, 'invoice', 'INV');
-      const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + INVOICE_DUE_DAYS);
-
-      const invoice = await tx.invoice.create({
-        data: {
-          invoiceNumber,
-          orderId: order.id,
-          dealerId: order.dealerId,
-          subtotal: order.subtotal,
+    const { savedOrder, invoice } = await this.prisma.$transaction(
+      (tx) =>
+        this.applyApproval(tx, order, adminId, {
           discountTotal,
-          grandTotal,
-          dueDate,
-        },
-      });
-
-      const savedOrder = await tx.order.update({
-        where: { id: order.id },
-        data: {
-          status: OrderStatus.APPROVED,
-          approvedByAdminId: adminId,
-          approvedAt: new Date(),
-          discount: discountTotal,
-          totalAmount: grandTotal,
-        },
-        include: this.orderInclude,
-      });
-
-      await this.activityLogService.log(tx, {
-        adminId,
-        action: 'APPROVED_ORDER',
-        targetId: order.id,
-        details: discountDescription
-          ? `Approved ${order.orderNumber} with ${discountDescription}, generated invoice ${invoice.invoiceNumber}`
-          : `Approved ${order.orderNumber}, generated invoice ${invoice.invoiceNumber}`,
-      });
-
-      return savedOrder;
-    }, TRANSACTION_OPTIONS);
+          discountDescription,
+          activityAction: 'APPROVED_ORDER',
+        }),
+      TRANSACTION_OPTIONS,
+    );
 
     if (order.dealer.email) {
       await this.mailer.notifyDealerOrderApproved(
         order.dealer.email,
         order.orderNumber,
-        updated.invoice?.invoiceNumber ?? '',
-        grandTotal.toString(),
+        invoice.invoiceNumber,
+        invoice.grandTotal.toString(),
         discountDescription ?? undefined,
       );
     }
 
-    const productsAfterReserve = await this.prisma.product.findMany({
-      where: { id: { in: order.items.map((item) => item.productId) } },
-    });
-    const outOfStockProducts = productsAfterReserve.filter(
-      (product) => product.currentStock <= 0,
+    await this.checkAndNotifyOutOfStock(
+      order.items.map((item) => item.productId),
     );
-    if (outOfStockProducts.length > 0) {
-      const admins = await this.prisma.admin.findMany({
-        select: { email: true },
-      });
-      await Promise.all(
-        outOfStockProducts.flatMap((product) =>
-          admins.map((a) =>
-            this.mailer.notifyAdminOutOfStock(a.email, product.name),
-          ),
-        ),
-      );
-    }
 
-    return updated;
+    return savedOrder;
   }
 
   async reject(id: string, adminId: string, reason: string) {
@@ -422,5 +574,64 @@ export class OrdersService {
 
       return updated;
     }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Deletes an order any time before it's COMPLETED. If it was already
+   * approved, that reserved the stock and generated an invoice — both are
+   * reversed here. Blocked outright if the invoice already has payments
+   * recorded, so money already collected is never silently unwound.
+   */
+  async remove(id: string, adminId: string) {
+    const order = await this.prisma.order.findUnique({
+      where: { id },
+      include: { items: true, invoice: { include: { payments: true } } },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (order.status === OrderStatus.COMPLETED) {
+      throw new BadRequestException('Completed orders cannot be deleted');
+    }
+    if (order.invoice && order.invoice.payments.length > 0) {
+      throw new BadRequestException(
+        'This order has payments recorded against its invoice and cannot be deleted',
+      );
+    }
+
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        if (order.invoice) {
+          for (const item of order.items) {
+            await this.inventoryService.recordMovement(tx, {
+              productId: item.productId,
+              type: InventoryLogType.ADJUSTMENT,
+              quantityIn: item.quantity,
+              reference: `Reversal of deleted order ${order.orderNumber}`,
+            });
+          }
+          await tx.invoice.delete({ where: { id: order.invoice.id } });
+        }
+
+        await tx.orderItem.deleteMany({ where: { orderId: id } });
+        await tx.order.delete({ where: { id } });
+
+        await this.activityLogService.log(tx, {
+          adminId,
+          action: 'DELETED_ORDER',
+          targetId: id,
+          details: order.invoice
+            ? `Deleted order ${order.orderNumber} and reversed its stock reservation`
+            : `Deleted order ${order.orderNumber}`,
+        });
+
+        return { message: 'Order deleted' };
+      }, TRANSACTION_OPTIONS);
+    } catch (error) {
+      if (isForeignKeyViolation(error)) {
+        throw new ConflictException(
+          'This order has related records (e.g. a sales return) and cannot be deleted',
+        );
+      }
+      throw error;
+    }
   }
 }

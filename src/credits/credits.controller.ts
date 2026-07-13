@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -14,6 +15,7 @@ import { CreditsService } from './credits.service';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { UpdateChequeStatusDto } from './dto/update-cheque-status.dto';
 import { QueryCreditsDto } from './dto/query-credits.dto';
+import { QuerySettlementsDto } from './dto/query-settlements.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -42,6 +44,12 @@ export class CreditsController {
     return this.creditsService.getSupplierDetail(supplierId);
   }
 
+  @Get(':supplierId/settlements')
+  @ApiOperation({ summary: 'Paginated, filterable settlement history for a supplier' })
+  getSettlements(@Param('supplierId') supplierId: string, @Query() query: QuerySettlementsDto) {
+    return this.creditsService.getSettlements(supplierId, query);
+  }
+
   @Post(':supplierId/settlements')
   @ApiOperation({
     summary:
@@ -55,10 +63,22 @@ export class CreditsController {
     return this.creditsService.createSettlement(supplierId, dto, adminId);
   }
 
+  @Delete('settlements/:paymentId')
+  @ApiOperation({
+    summary: 'Delete a settlement within 1 day of it being recorded',
+  })
+  deleteSettlement(
+    @Param('paymentId') paymentId: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.creditsService.deleteSettlement(paymentId, adminId);
+  }
+
   @Patch('settlements/:paymentId/status')
   @ApiOperation({
     summary:
-      'Mark a pending cheque settlement as cleared or returned (bounced)',
+      'Mark a pending cheque settlement as cleared or returned (bounced), ' +
+      'or revert a cleared/returned cheque back to pending within 1 day of that change',
   })
   updateChequeStatus(
     @Param('paymentId') paymentId: string,

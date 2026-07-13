@@ -39,7 +39,7 @@ export class PurchaseReturnsController {
 
   @Get()
   @ApiOperation({ summary: 'List purchase returns' })
-  findAll(@Query() query: PaginationQueryDto) {
+  findAll(@Query() query: QueryPurchaseReturnsDto) {
     return this.purchaseReturnsService.findAll(query);
   }
 

@@ -8,8 +8,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { QueryInventoryDto } from './dto/query-inventory.dto';
+import { QueryLedgerDto } from './dto/query-ledger.dto';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -65,18 +66,20 @@ export class InventoryService {
     return updated;
   }
 
-  async listStock(query: PaginationQueryDto) {
+  async listStock(query: QueryInventoryDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
-    const where: Prisma.ProductWhereInput = query.search
-      ? {
-          OR: [
-            { name: { contains: query.search, mode: 'insensitive' } },
-            { productCode: { contains: query.search, mode: 'insensitive' } },
-          ],
-        }
-      : {};
+    const where: Prisma.ProductWhereInput = {
+      ...(query.search && {
+        OR: [
+          { name: { contains: query.search, mode: 'insensitive' } },
+          { productCode: { contains: query.search, mode: 'insensitive' } },
+        ],
+      }),
+      ...(query.status === 'OUT_OF_STOCK' && { currentStock: { lte: 0 } }),
+      ...(query.status === 'IN_STOCK' && { currentStock: { gt: 0 } }),
+    };
 
     const [products, total] = await this.prisma.$transaction([
       this.prisma.product.findMany({
@@ -103,7 +106,7 @@ export class InventoryService {
     return paginate(data, total, page, limit);
   }
 
-  async getLedger(productId: string, query: PaginationQueryDto) {
+  async getLedger(productId: string, query: QueryLedgerDto) {
     const product = await this.prisma.product.findUnique({
       where: { id: productId },
     });
@@ -112,14 +115,25 @@ export class InventoryService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
+    const where: Prisma.InventoryLogWhereInput = {
+      productId,
+      ...(query.type && { type: query.type }),
+      ...((query.dateFrom || query.dateTo) && {
+        createdAt: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lt: new Date(query.dateTo) }),
+        },
+      }),
+    };
+
     const [data, total] = await this.prisma.$transaction([
       this.prisma.inventoryLog.findMany({
-        where: { productId },
+        where,
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.inventoryLog.count({ where: { productId } }),
+      this.prisma.inventoryLog.count({ where }),
     ]);
 
     return paginate(data, total, page, limit);

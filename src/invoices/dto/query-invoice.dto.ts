@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { PaymentStatus } from '@prisma/client';
-import { IsEnum, IsOptional, IsUUID } from 'class-validator';
+import { IsDateString, IsEnum, IsOptional, IsUUID } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export class QueryInvoiceDto extends PaginationQueryDto {
@@ -13,4 +13,18 @@ export class QueryInvoiceDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID()
   dealerId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Start of date range (inclusive), matches Invoice.createdAt',
+  })
+  @IsOptional()
+  @IsDateString()
+  dateFrom?: string;
+
+  @ApiPropertyOptional({
+    description: 'End of date range (exclusive), matches Invoice.createdAt',
+  })
+  @IsOptional()
+  @IsDateString()
+  dateTo?: string;
 }
