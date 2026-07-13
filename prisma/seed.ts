@@ -10,6 +10,7 @@ async function main() {
   const existing = await prisma.admin.findUnique({ where: { email } });
   if (existing) {
     console.log('Admin already exists:', email);
+    
     return;
   }
 
