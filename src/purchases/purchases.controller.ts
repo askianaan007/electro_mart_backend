@@ -12,7 +12,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -34,7 +34,7 @@ export class PurchasesController {
 
   @Get()
   @ApiOperation({ summary: 'List purchases' })
-  findAll(@Query() query: PaginationQueryDto) {
+  findAll(@Query() query: QueryPurchasesDto) {
     return this.purchasesService.findAll(query);
   }
 

@@ -1,10 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { InventoryLogType } from '@prisma/client';
+import { InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
@@ -62,22 +62,36 @@ export class PurchasesService {
     }, TRANSACTION_OPTIONS);
   }
 
-  async findAll(query: PaginationQueryDto) {
+  async findAll(query: QueryPurchasesDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
+    const where: Prisma.PurchaseWhereInput = {
+      ...(query.supplierId && { supplierId: query.supplierId }),
+      ...(query.search && {
+        invoiceNumber: { contains: query.search, mode: 'insensitive' },
+      }),
+      ...((query.dateFrom || query.dateTo) && {
+        purchaseDate: {
+          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
+          ...(query.dateTo && { lte: new Date(query.dateTo) }),
+        },
+      }),
+    };
+
     const [data, total] = await this.prisma.$transaction([
       this.prisma.purchase.findMany({
+        where,
         include: {
           supplier: true,
           items: true,
           purchaseReturns: { select: { totalAmount: true } },
         },
-        orderBy: { createdAt: 'desc' },
+        orderBy: [{ purchaseDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.purchase.count(),
+      this.prisma.purchase.count({ where }),
     ]);
 
     return paginate(data, total, page, limit);
