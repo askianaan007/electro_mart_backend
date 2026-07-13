@@ -256,7 +256,12 @@ export class OrdersService {
       dto.items,
     );
 
-    const totalAmount = subtotal;
+    const { discountTotal, discountDescription } =
+      requester.role === Role.ADMIN
+        ? this.resolveDiscount(subtotal, dto)
+        : { discountTotal: new Prisma.Decimal(0), discountDescription: null };
+
+    const totalAmount = subtotal.sub(discountTotal);
     const projectedOutstanding = dealer.outstandingBalance.add(totalAmount);
     if (
       !dealer.unlimitedCredit &&
@@ -285,8 +290,8 @@ export class OrdersService {
         });
 
         return this.applyApproval(tx, order, requester.id, {
-          discountTotal: new Prisma.Decimal(0),
-          discountDescription: null,
+          discountTotal,
+          discountDescription,
           activityAction: 'ADMIN_CREATED_ORDER',
         });
       }, TRANSACTION_OPTIONS);
@@ -297,6 +302,7 @@ export class OrdersService {
           savedOrder.orderNumber,
           savedOrder.invoice?.invoiceNumber ?? '',
           savedOrder.totalAmount.toString(),
+          discountDescription ?? undefined,
         );
       }
 
@@ -469,41 +475,10 @@ export class OrdersService {
       throw new BadRequestException('Only pending orders can be approved');
     }
 
-    if (
-      dto?.discountPercentage !== undefined &&
-      dto?.discountAmount !== undefined
-    ) {
-      throw new BadRequestException(
-        'Provide either a discount percentage or a fixed discount amount, not both',
-      );
-    }
-
-    let discountTotal = new Prisma.Decimal(0);
-    let discountDescription: string | null = null;
-    if (dto?.discountAmount !== undefined) {
-      if (dto.discountAmount < 0) {
-        throw new BadRequestException('Discount amount cannot be negative');
-      }
-      discountTotal = new Prisma.Decimal(dto.discountAmount);
-      if (discountTotal.greaterThan(order.subtotal)) {
-        throw new BadRequestException(
-          'Discount amount cannot exceed the order subtotal',
-        );
-      }
-      if (discountTotal.greaterThan(0)) {
-        discountDescription = `a fixed discount of ${discountTotal.toString()}`;
-      }
-    } else if (dto?.discountPercentage !== undefined) {
-      if (dto.discountPercentage < 0 || dto.discountPercentage > 100) {
-        throw new BadRequestException(
-          'Discount percentage must be between 0 and 100',
-        );
-      }
-      discountTotal = order.subtotal.mul(dto.discountPercentage).div(100);
-      if (dto.discountPercentage > 0) {
-        discountDescription = `${dto.discountPercentage}% discount`;
-      }
-    }
+    const { discountTotal, discountDescription } = this.resolveDiscount(
+      order.subtotal,
+      dto,
+    );
     const { savedOrder, invoice } = await this.prisma.$transaction(
       (tx) =>
         this.applyApproval(tx, order, adminId, {
