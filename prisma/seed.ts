@@ -5,7 +5,7 @@ const prisma = new PrismaClient();
 
 async function main() {
   const email = 'admin@electromart.com';
-  const plainPassword = 'Aa@em2026MAM'
+  const plainPassword = 'Aa@amjaskmub077'
   ;
 
   const existing = await prisma.admin.findUnique({ where: { email } });

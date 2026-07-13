@@ -51,6 +51,13 @@ export class PurchasesService {
         });
       }
 
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RECORDED_PURCHASE',
+        targetId: purchase.id,
+        details: `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue} (${purchase.items.length} item(s))`,
+      });
+
       return purchase;
     }, TRANSACTION_OPTIONS);
   }

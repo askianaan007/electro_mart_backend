@@ -15,6 +15,7 @@ import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @ApiTags('Inventory')
 @ApiBearerAuth('access-token')
@@ -41,7 +42,7 @@ export class InventoryController {
 
   @Post('adjustment')
   @ApiOperation({ summary: 'Manually adjust stock for a product' })
-  adjustStock(@Body() dto: AdjustStockDto) {
-    return this.inventoryService.adjustStock(dto);
+  adjustStock(@Body() dto: AdjustStockDto, @CurrentUser('sub') adminId: string) {
+    return this.inventoryService.adjustStock(dto, adminId);
   }
 }

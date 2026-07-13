@@ -5,11 +5,13 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { paginate } from '../common/utils/paginate';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 function withStockFlag<T extends { currentStock: number }>(product: T) {
   return {
@@ -20,7 +22,10 @@ function withStockFlag<T extends { currentStock: number }>(product: T) {
 
 @Injectable()
 export class ProductsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private activityLogService: ActivityLogService,
+  ) {}
 
   private async assertCodesAreUnique(
     dto: { productCode?: string; sku?: string; barcode?: string },
@@ -41,14 +46,27 @@ export class ProductsService {
       );
   }
 
-  async create(dto: CreateProductDto) {
+  async create(dto: CreateProductDto, adminId: string) {
     await this.assertCodesAreUnique(dto);
-    const product = await this.prisma.product.create({
-      data: {
-        ...dto,
-        currentStock: dto.currentStock ?? 0,
-      },
-    });
+
+    const product = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.product.create({
+        data: {
+          ...dto,
+          currentStock: dto.currentStock ?? 0,
+        },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'CREATED_PRODUCT',
+        targetId: created.id,
+        details: `Created product ${created.name} (${created.productCode})`,
+      });
+
+      return created;
+    }, TRANSACTION_OPTIONS);
+
     return withStockFlag(product);
   }
 
@@ -89,30 +107,66 @@ export class ProductsService {
     return withStockFlag(product);
   }
 
-  async update(id: string, dto: UpdateProductDto) {
+  async update(id: string, dto: UpdateProductDto, adminId: string) {
     await this.findOne(id);
     await this.assertCodesAreUnique(dto, id);
-    const product = await this.prisma.product.update({
-      where: { id },
-      data: dto,
-    });
+
+    const product = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.product.update({
+        where: { id },
+        data: dto,
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_PRODUCT',
+        targetId: updated.id,
+        details: `Updated product ${updated.name}`,
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
+
     return withStockFlag(product);
   }
 
-  async setStatus(id: string, status: 'ACTIVE' | 'INACTIVE') {
+  async setStatus(id: string, status: 'ACTIVE' | 'INACTIVE', adminId: string) {
     await this.findOne(id);
-    const product = await this.prisma.product.update({
-      where: { id },
-      data: { status },
-    });
+
+    const product = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.product.update({
+        where: { id },
+        data: { status },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: `PRODUCT_${status}`,
+        targetId: updated.id,
+        details: `Product ${updated.name} set to ${status}`,
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
+
     return withStockFlag(product);
   }
 
-  async remove(id: string) {
-    await this.findOne(id);
+  async remove(id: string, adminId: string) {
+    const product = await this.findOne(id);
     try {
-      await this.prisma.product.delete({ where: { id } });
-      return { message: 'Product deleted' };
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.product.delete({ where: { id } });
+
+        await this.activityLogService.log(tx, {
+          adminId,
+          action: 'DELETED_PRODUCT',
+          targetId: id,
+          details: `Deleted product ${product.name}`,
+        });
+
+        return { message: 'Product deleted' };
+      }, TRANSACTION_OPTIONS);
     } catch (error) {
       if (isForeignKeyViolation(error)) {
         throw new ConflictException(

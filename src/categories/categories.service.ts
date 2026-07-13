@@ -5,21 +5,38 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { paginate } from '../common/utils/paginate';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 @Injectable()
 export class CategoriesService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private activityLogService: ActivityLogService,
+  ) {}
 
-  async create(dto: CreateCategoryDto) {
+  async create(dto: CreateCategoryDto, adminId: string) {
     const existing = await this.prisma.category.findUnique({
       where: { name: dto.name },
     });
     if (existing) throw new ConflictException('Category already exists');
-    return this.prisma.category.create({ data: dto });
+
+    return this.prisma.$transaction(async (tx) => {
+      const category = await tx.category.create({ data: dto });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'CREATED_CATEGORY',
+        targetId: category.id,
+        details: `Created category ${category.name}`,
+      });
+
+      return category;
+    }, TRANSACTION_OPTIONS);
   }
 
   async findAll(query: PaginationQueryDto) {
@@ -49,8 +66,8 @@ export class CategoriesService {
     return category;
   }
 
-  async update(id: string, dto: UpdateCategoryDto) {
-    await this.findOne(id);
+  async update(id: string, dto: UpdateCategoryDto, adminId: string) {
+    const existingCategory = await this.findOne(id);
     if (dto.name) {
       const existing = await this.prisma.category.findUnique({
         where: { name: dto.name },
@@ -58,12 +75,38 @@ export class CategoriesService {
       if (existing && existing.id !== id)
         throw new ConflictException('Category already exists');
     }
-    return this.prisma.category.update({ where: { id }, data: dto });
+
+    return this.prisma.$transaction(async (tx) => {
+      const category = await tx.category.update({ where: { id }, data: dto });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_CATEGORY',
+        targetId: category.id,
+        details:
+          dto.name && dto.name !== existingCategory.name
+            ? `Renamed category "${existingCategory.name}" to "${category.name}"`
+            : `Updated category ${category.name}`,
+      });
+
+      return category;
+    }, TRANSACTION_OPTIONS);
   }
 
-  async remove(id: string) {
-    await this.findOne(id);
-    await this.prisma.category.delete({ where: { id } });
-    return { message: 'Category deleted' };
+  async remove(id: string, adminId: string) {
+    const category = await this.findOne(id);
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.category.delete({ where: { id } });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'DELETED_CATEGORY',
+        targetId: id,
+        details: `Deleted category ${category.name}`,
+      });
+
+      return { message: 'Category deleted' };
+    }, TRANSACTION_OPTIONS);
   }
 }

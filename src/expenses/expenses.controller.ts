@@ -14,10 +14,11 @@ import { Role } from '@prisma/client';
 import { ExpensesService } from './expenses.service';
 import { CreateExpenseDto } from './dto/create-expense.dto';
 import { UpdateExpenseDto } from './dto/update-expense.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { QueryExpensesDto } from './dto/query-expenses.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @ApiTags('Expenses')
 @ApiBearerAuth('access-token')
@@ -29,13 +30,13 @@ export class ExpensesController {
 
   @Post()
   @ApiOperation({ summary: 'Record a business expense' })
-  create(@Body() dto: CreateExpenseDto) {
-    return this.expensesService.create(dto);
+  create(@Body() dto: CreateExpenseDto, @CurrentUser('sub') adminId: string) {
+    return this.expensesService.create(dto, adminId);
   }
 
   @Get()
   @ApiOperation({ summary: 'List business expenses' })
-  findAll(@Query() query: PaginationQueryDto) {
+  findAll(@Query() query: QueryExpensesDto) {
     return this.expensesService.findAll(query);
   }
 
@@ -47,13 +48,17 @@ export class ExpensesController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update an expense entry' })
-  update(@Param('id') id: string, @Body() dto: UpdateExpenseDto) {
-    return this.expensesService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateExpenseDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.expensesService.update(id, dto, adminId);
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete an expense entry' })
-  remove(@Param('id') id: string) {
-    return this.expensesService.remove(id);
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.expensesService.remove(id, adminId);
   }
 }

@@ -18,6 +18,7 @@ import { QueryInvestmentDto } from './dto/query-investment.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @ApiTags('Investments')
 @ApiBearerAuth('access-token')
@@ -29,8 +30,8 @@ export class InvestmentsController {
 
   @Post()
   @ApiOperation({ summary: 'Record an investor contribution or withdrawal' })
-  create(@Body() dto: CreateInvestmentDto) {
-    return this.investmentsService.create(dto);
+  create(@Body() dto: CreateInvestmentDto, @CurrentUser('sub') adminId: string) {
+    return this.investmentsService.create(dto, adminId);
   }
 
   @Get()
@@ -47,13 +48,17 @@ export class InvestmentsController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update an investment entry' })
-  update(@Param('id') id: string, @Body() dto: UpdateInvestmentDto) {
-    return this.investmentsService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateInvestmentDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.investmentsService.update(id, dto, adminId);
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete an investment entry' })
-  remove(@Param('id') id: string) {
-    return this.investmentsService.remove(id);
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.investmentsService.remove(id, adminId);
   }
 }

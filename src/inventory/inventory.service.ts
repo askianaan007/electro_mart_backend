@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -14,7 +15,10 @@ type TransactionClient = Prisma.TransactionClient;
 
 @Injectable()
 export class InventoryService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private activityLogService: ActivityLogService,
+  ) {}
 
   async recordMovement(
     tx: TransactionClient,
@@ -121,17 +125,24 @@ export class InventoryService {
     return paginate(data, total, page, limit);
   }
 
-  async adjustStock(dto: AdjustStockDto) {
-    return this.prisma.$transaction(
-      (tx) =>
-        this.recordMovement(tx, {
-          productId: dto.productId,
-          type: InventoryLogType.ADJUSTMENT,
-          quantityIn: dto.direction === 'IN' ? dto.quantity : 0,
-          quantityOut: dto.direction === 'OUT' ? dto.quantity : 0,
-          reference: dto.reason,
-        }),
-      TRANSACTION_OPTIONS,
-    );
+  async adjustStock(dto: AdjustStockDto, adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const product = await this.recordMovement(tx, {
+        productId: dto.productId,
+        type: InventoryLogType.ADJUSTMENT,
+        quantityIn: dto.direction === 'IN' ? dto.quantity : 0,
+        quantityOut: dto.direction === 'OUT' ? dto.quantity : 0,
+        reference: dto.reason,
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'ADJUSTED_INVENTORY',
+        targetId: product.id,
+        details: `Stock ${dto.direction === 'IN' ? 'increased' : 'decreased'} by ${dto.quantity} for ${product.name}${dto.reason ? ` (${dto.reason})` : ''}`,
+      });
+
+      return product;
+    }, TRANSACTION_OPTIONS);
   }
 }

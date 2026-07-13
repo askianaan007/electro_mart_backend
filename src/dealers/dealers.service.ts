@@ -6,19 +6,24 @@ import {
 import { AccountStatus, OrderStatus, Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
 import { paginate } from '../common/utils/paginate';
 import { generateTempPassword } from '../common/utils/generate-password';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 const PASSWORD_SALT_ROUNDS = 10;
 
 @Injectable()
 export class DealersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private activityLogService: ActivityLogService,
+  ) {}
 
-  async create(dto: CreateDealerDto) {
+  async create(dto: CreateDealerDto, adminId: string) {
     const existingUsername = await this.prisma.dealer.findUnique({
       where: { username: dto.username },
     });
@@ -35,22 +40,33 @@ export class DealersService {
     const tempPassword = dto.password ?? generateTempPassword();
     const hashed = await bcrypt.hash(tempPassword, PASSWORD_SALT_ROUNDS);
 
-    const dealer = await this.prisma.dealer.create({
-      data: {
-        businessName: dto.businessName,
-        ownerName: dto.ownerName,
-        phone: dto.phone,
-        email: dto.email,
-        address: dto.address,
-        district: dto.district,
-        username: dto.username,
-        password: hashed,
-        creditLimit: dto.creditLimit ?? 0,
-        unlimitedCredit: dto.unlimitedCredit ?? false,
-        status: dto.status ?? AccountStatus.ACTIVE,
-      },
-      omit: { password: true },
-    });
+    const dealer = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.dealer.create({
+        data: {
+          businessName: dto.businessName,
+          ownerName: dto.ownerName,
+          phone: dto.phone,
+          email: dto.email,
+          address: dto.address,
+          district: dto.district,
+          username: dto.username,
+          password: hashed,
+          creditLimit: dto.creditLimit ?? 0,
+          unlimitedCredit: dto.unlimitedCredit ?? false,
+          status: dto.status ?? AccountStatus.ACTIVE,
+        },
+        omit: { password: true },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'CREATED_DEALER',
+        targetId: created.id,
+        details: `Created dealer ${created.businessName} (${created.username})`,
+      });
+
+      return created;
+    }, TRANSACTION_OPTIONS);
 
     return {
       dealer,
@@ -115,7 +131,7 @@ export class DealersService {
     };
   }
 
-  async update(id: string, dto: UpdateDealerDto) {
+  async update(id: string, dto: UpdateDealerDto, adminId: string) {
     await this.findOne(id);
 
     if (dto.username) {
@@ -151,20 +167,42 @@ export class DealersService {
       data.password = await bcrypt.hash(dto.password, PASSWORD_SALT_ROUNDS);
     }
 
-    const dealer = await this.prisma.dealer.update({
-      where: { id },
-      data,
-      omit: { password: true },
-    });
-    return dealer;
+    return this.prisma.$transaction(async (tx) => {
+      const dealer = await tx.dealer.update({
+        where: { id },
+        data,
+        omit: { password: true },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_DEALER',
+        targetId: dealer.id,
+        details: `Updated dealer ${dealer.businessName}`,
+      });
+
+      return dealer;
+    }, TRANSACTION_OPTIONS);
   }
 
-  async setStatus(id: string, status: AccountStatus) {
+  async setStatus(id: string, status: AccountStatus, adminId: string) {
     await this.findOne(id);
-    return this.prisma.dealer.update({
-      where: { id },
-      data: { status },
-      omit: { password: true },
-    });
+
+    return this.prisma.$transaction(async (tx) => {
+      const dealer = await tx.dealer.update({
+        where: { id },
+        data: { status },
+        omit: { password: true },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: `DEALER_${status}`,
+        targetId: dealer.id,
+        details: `Dealer ${dealer.businessName} set to ${status}`,
+      });
+
+      return dealer;
+    }, TRANSACTION_OPTIONS);
   }
 }

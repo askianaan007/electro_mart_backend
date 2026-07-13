@@ -18,6 +18,7 @@ import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @ApiTags('Categories')
 @ApiBearerAuth('access-token')
@@ -29,8 +30,8 @@ export class CategoriesController {
   @Post()
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Create a product category' })
-  create(@Body() dto: CreateCategoryDto) {
-    return this.categoriesService.create(dto);
+  create(@Body() dto: CreateCategoryDto, @CurrentUser('sub') adminId: string) {
+    return this.categoriesService.create(dto, adminId);
   }
 
   @Get()
@@ -43,14 +44,18 @@ export class CategoriesController {
   @Patch(':id')
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Rename a category' })
-  update(@Param('id') id: string, @Body() dto: UpdateCategoryDto) {
-    return this.categoriesService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateCategoryDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.categoriesService.update(id, dto, adminId);
   }
 
   @Delete(':id')
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Delete a category' })
-  remove(@Param('id') id: string) {
-    return this.categoriesService.remove(id);
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.categoriesService.remove(id, adminId);
   }
 }

@@ -18,6 +18,7 @@ import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
 
 @ApiTags('Suppliers')
 @ApiBearerAuth('access-token')
@@ -29,8 +30,8 @@ export class SuppliersController {
 
   @Post()
   @ApiOperation({ summary: 'Create a supplier' })
-  create(@Body() dto: CreateSupplierDto) {
-    return this.suppliersService.create(dto);
+  create(@Body() dto: CreateSupplierDto, @CurrentUser('sub') adminId: string) {
+    return this.suppliersService.create(dto, adminId);
   }
 
   @Get()
@@ -47,13 +48,17 @@ export class SuppliersController {
 
   @Patch(':id')
   @ApiOperation({ summary: 'Update supplier details' })
-  update(@Param('id') id: string, @Body() dto: UpdateSupplierDto) {
-    return this.suppliersService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateSupplierDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.suppliersService.update(id, dto, adminId);
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete a supplier' })
-  remove(@Param('id') id: string) {
-    return this.suppliersService.remove(id);
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.suppliersService.remove(id, adminId);
   }
 }

@@ -41,8 +41,8 @@ export class ProductsController {
   @Post()
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Create a product' })
-  create(@Body() dto: CreateProductDto) {
-    return this.productsService.create(dto);
+  create(@Body() dto: CreateProductDto, @CurrentUser('sub') adminId: string) {
+    return this.productsService.create(dto, adminId);
   }
 
   @Get()
@@ -76,8 +76,12 @@ export class ProductsController {
   @Patch(':id')
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Update a product' })
-  update(@Param('id') id: string, @Body() dto: UpdateProductDto) {
-    return this.productsService.update(id, dto);
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateProductDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.productsService.update(id, dto, adminId);
   }
 
   @Patch(':id/status')
@@ -86,8 +90,9 @@ export class ProductsController {
   setStatus(
     @Param('id') id: string,
     @Body('status') status: 'ACTIVE' | 'INACTIVE',
+    @CurrentUser('sub') adminId: string,
   ) {
-    return this.productsService.setStatus(id, status);
+    return this.productsService.setStatus(id, status, adminId);
   }
 
   @Delete(':id')
@@ -95,7 +100,7 @@ export class ProductsController {
   @ApiOperation({
     summary: 'Delete a product (only if it has no order/purchase history)',
   })
-  remove(@Param('id') id: string) {
-    return this.productsService.remove(id);
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.productsService.remove(id, adminId);
   }
 }
