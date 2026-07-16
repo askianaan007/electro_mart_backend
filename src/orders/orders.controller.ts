@@ -110,6 +110,16 @@ export class OrdersController {
     return this.ordersService.advanceStatus(id, adminId, dto.status);
   }
 
+  @Patch(':id/complete')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      'Fast-forward an approved order straight to Completed, applying any skipped Packed/Delivered steps along the way',
+  })
+  completeDirectly(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.ordersService.completeDirectly(id, adminId);
+  }
+
   @Delete(':id')
   @Roles(Role.ADMIN)
   @ApiOperation({

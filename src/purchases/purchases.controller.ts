@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Param,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -12,6 +13,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { PurchasesService } from './purchases.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -42,6 +44,19 @@ export class PurchasesController {
   @ApiOperation({ summary: 'Get purchase details' })
   findOne(@Param('id') id: string) {
     return this.purchasesService.findOne(id);
+  }
+
+  @Patch(':id')
+  @ApiOperation({
+    summary:
+      "Edit a purchase's details and line items, reconciling stock for any quantity changes. Blocked if returns exist against it.",
+  })
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdatePurchaseDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.purchasesService.update(id, dto, adminId);
   }
 
   @Delete(':id')

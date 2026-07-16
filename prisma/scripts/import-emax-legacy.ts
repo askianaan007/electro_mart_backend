@@ -185,7 +185,7 @@ for (const r of orderableSaleRows) {
     group = { key, date: r.date, customer: r.customer, invRef: r.invRef, items: new Map() };
     groupIndex.set(key, group);
     orderGroups.push(group);
-  }
+  } 
   const existing = group.items.get(r.code);
   if (existing) {
     existing.qty += r.qty;

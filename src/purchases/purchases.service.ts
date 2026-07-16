@@ -1,9 +1,14 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
+import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
@@ -109,6 +114,81 @@ export class PurchasesService {
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
     return purchase;
+  }
+
+  /**
+   * Replaces a purchase's details and line items. Reverses the stock the
+   * original items brought in, then applies the new items, so it fails
+   * loudly (via recordMovement's negative-stock guard) if any of that stock
+   * has since been sold. Blocked entirely if returns exist against this
+   * purchase, since they reference quantities from the original items.
+   */
+  async update(id: string, dto: UpdatePurchaseDto, adminId: string) {
+    const purchase = await this.prisma.purchase.findUnique({
+      where: { id },
+      include: { items: true, purchaseReturns: true },
+    });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+
+    if (purchase.purchaseReturns.length > 0) {
+      throw new BadRequestException(
+        'This purchase has returns recorded against it and cannot be edited. Delete the purchase instead if it needs to be corrected.',
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      for (const item of purchase.items) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityOut: item.quantity,
+          reference: `Reversed for edit of purchase ${purchase.invoiceNumber}`,
+        });
+      }
+      await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
+
+      const totalValue = dto.items.reduce(
+        (sum, item) => sum + item.quantity * item.unitCost,
+        0,
+      );
+
+      const updated = await tx.purchase.update({
+        where: { id },
+        data: {
+          supplierId: dto.supplierId,
+          invoiceNumber: dto.invoiceNumber,
+          purchaseDate: new Date(dto.purchaseDate),
+          totalValue,
+          items: {
+            create: dto.items.map((item) => ({
+              productId: item.productId,
+              quantity: item.quantity,
+              unitCost: item.unitCost,
+              lineTotal: item.quantity * item.unitCost,
+            })),
+          },
+        },
+        include: { items: true, supplier: true },
+      });
+
+      for (const item of updated.items) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.PURCHASE,
+          quantityIn: item.quantity,
+          reference: purchase.id,
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_PURCHASE',
+        targetId: id,
+        details: `Updated purchase ${updated.invoiceNumber} from ${updated.supplier.name} (${updated.items.length} item(s), total ${totalValue})`,
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
   }
 
   /**

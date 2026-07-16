@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { AccountStatus, OrderStatus, Prisma } from '@prisma/client';
+import { AccountStatus, OrderStatus, Prisma, Role } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
@@ -14,6 +14,7 @@ import { QueryDealerDto } from './dto/query-dealer.dto';
 import { paginate } from '../common/utils/paginate';
 import { generateTempPassword } from '../common/utils/generate-password';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 
 const PASSWORD_SALT_ROUNDS = 10;
 
@@ -229,6 +230,36 @@ export class DealersService {
     }
 
     return { dealer: updated, temporaryPassword };
+  }
+
+  async remove(id: string, adminId: string) {
+    const dealer = await this.findOne(id);
+
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.refreshToken.deleteMany({
+          where: { userId: id, role: Role.DEALER },
+        });
+
+        await tx.dealer.delete({ where: { id } });
+
+        await this.activityLogService.log(tx, {
+          adminId,
+          action: 'DELETED_DEALER',
+          targetId: id,
+          details: `Deleted dealer ${dealer.businessName} (${dealer.username})`,
+        });
+      }, TRANSACTION_OPTIONS);
+    } catch (error) {
+      if (isForeignKeyViolation(error)) {
+        throw new ConflictException(
+          'This dealer has orders, invoices, payments, or return records and cannot be deleted. Deactivate it instead.',
+        );
+      }
+      throw error;
+    }
+
+    return { message: 'Dealer deleted' };
   }
 
   async setStatus(id: string, status: AccountStatus, adminId: string) {

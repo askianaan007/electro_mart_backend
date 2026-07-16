@@ -418,3 +418,8 @@ If designing in stages, build in this order — it matches how a dealer's first 
 - 6. Admin Dashboard → 7. Order Approval Screen → 8. Orders List (Admin)
 - 9. My Orders (Dealer) → 10. Order Detail (Dealer) → 11. Invoice Screen
 - Remaining screens (Products, Inventory, Purchases, Dealers, Payments) can follow after the core loop is approved.
+
+
+npx prisma migrate reset  
+npx prisma                                
+npx prisma studio  

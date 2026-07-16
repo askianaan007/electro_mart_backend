@@ -616,6 +616,84 @@ export class OrdersService {
   }
 
   /**
+   * Fast-forwards an approved order straight to COMPLETED, applying
+   * whichever intermediate Packed/Delivered timestamps it's still missing
+   * and running the same side effects (delivery email, balance increment)
+   * as stepping through them one at a time would have.
+   */
+  async completeDirectly(id: string, adminId: string) {
+    const order = await this.prisma.order.findUnique({
+      where: { id },
+      include: this.orderInclude,
+    });
+    if (!order) throw new NotFoundException('Order not found');
+
+    if (order.status === OrderStatus.COMPLETED) {
+      throw new BadRequestException('Order is already completed');
+    }
+    if (
+      order.status !== OrderStatus.APPROVED &&
+      order.status !== OrderStatus.PACKED &&
+      order.status !== OrderStatus.DELIVERED
+    ) {
+      throw new BadRequestException(
+        `Cannot complete an order with status ${order.status}. It must be approved first.`,
+      );
+    }
+
+    const now = new Date();
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      if (order.invoice) {
+        await tx.dealer.update({
+          where: { id: order.dealerId },
+          data: { outstandingBalance: { increment: order.invoice.grandTotal } },
+        });
+      }
+
+      const saved = await tx.order.update({
+        where: { id },
+        data: {
+          status: OrderStatus.COMPLETED,
+          packedAt: order.packedAt ?? now,
+          deliveredAt: order.deliveredAt ?? now,
+          completedAt: now,
+        },
+        include: this.orderInclude,
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'ORDER_DIRECTLY_COMPLETED',
+        targetId: id,
+        details: `Fast-forwarded order ${order.orderNumber} from ${order.status} to COMPLETED`,
+      });
+
+      return saved;
+    }, TRANSACTION_OPTIONS);
+
+    if (!order.deliveredAt && updated.invoice && updated.dealer.email) {
+      await this.mailer.notifyDealerOrderDelivered(updated.dealer.email, {
+        orderNumber: updated.orderNumber,
+        dealerName: updated.dealer.businessName,
+        invoiceNumber: updated.invoice.invoiceNumber,
+        invoiceDate: updated.invoice.createdAt,
+        items: updated.items.map((item) => ({
+          productName: item.product.name,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice.toString(),
+          lineTotal: item.lineTotal.toString(),
+        })),
+        subtotal: updated.invoice.subtotal.toString(),
+        discountTotal: updated.invoice.discountTotal.toString(),
+        grandTotal: updated.invoice.grandTotal.toString(),
+      });
+    }
+
+    return updated;
+  }
+
+  /**
    * Deletes an order any time before it's COMPLETED. If it was already
    * approved, that reserved the stock and generated an invoice — both are
    * reversed here. Blocked outright if the invoice already has payments

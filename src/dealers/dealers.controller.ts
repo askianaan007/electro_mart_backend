@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -63,6 +64,14 @@ export class DealersController {
   })
   resetPassword(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
     return this.dealersService.resetPassword(id, adminId);
+  }
+
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Delete a dealer account (only if it has no orders or related records)',
+  })
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.dealersService.remove(id, adminId);
   }
 
   @Patch(':id/status')
