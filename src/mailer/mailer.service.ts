@@ -21,7 +21,7 @@ export class MailerService {
     const pass = this.config.get<string>('SMTP_PASS');
     this.fromAddress =
       this.config.get<string>('MAIL_FROM') ??
-      'Electro Mart <no-reply@electromart.com>';
+      'Electro Mart <electromarttrade@gmail.com>';
 
     this.transporter =
       host && port && user && pass
@@ -152,6 +152,48 @@ export class MailerService {
         <p>An administrator has reset your account password.</p>
         <p><strong>Username:</strong> ${username}<br/><strong>New temporary password:</strong> ${temporaryPassword}</p>
         <p>Please log in and change your password as soon as possible.</p>
+      `,
+    });
+  }
+
+  notifyAdminChequeDepositReminder(
+    adminEmail: string,
+    cheques: {
+      supplierName: string;
+      amount: string;
+      chequeDepositDate: Date;
+      reference: string | null;
+    }[],
+  ): Promise<void> {
+    const rows = cheques
+      .map(
+        (cheque) => `
+          <tr>
+            <td style="padding:6px 10px;border:1px solid #ddd;">${cheque.supplierName}</td>
+            <td style="padding:6px 10px;border:1px solid #ddd;">${cheque.reference ?? '—'}</td>
+            <td style="padding:6px 10px;border:1px solid #ddd;text-align:right;">${cheque.amount}</td>
+            <td style="padding:6px 10px;border:1px solid #ddd;">${cheque.chequeDepositDate.toLocaleDateString('en-GB')}</td>
+          </tr>`,
+      )
+      .join('');
+
+    const plural = cheques.length === 1 ? 'cheque' : 'cheques';
+    return this.send({
+      to: adminEmail,
+      subject: `Reminder: ${cheques.length} supplier ${plural} due for bank deposit tomorrow`,
+      html: `
+        <p>The following supplier ${plural} are due for bank deposit tomorrow:</p>
+        <table style="border-collapse:collapse;width:100%;max-width:560px;">
+          <thead>
+            <tr>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Supplier</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Reference</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:right;">Amount</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Deposit Date</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
       `,
     });
   }

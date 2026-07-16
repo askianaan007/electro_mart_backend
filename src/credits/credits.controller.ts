@@ -35,6 +35,16 @@ export class CreditsController {
     return this.creditsService.getSummary(query);
   }
 
+  @Post('cheques/send-reminders')
+  @ApiOperation({
+    summary:
+      "Manually trigger the cheque deposit reminder email for tomorrow's due cheques " +
+      '(this also runs automatically once a day)',
+  })
+  sendChequeReminders() {
+    return this.creditsService.sendChequeDepositReminders();
+  }
+
   @Get(':supplierId')
   @ApiOperation({
     summary:

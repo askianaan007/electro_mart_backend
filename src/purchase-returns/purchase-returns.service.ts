@@ -28,8 +28,19 @@ export class PurchaseReturnsService {
   } satisfies Prisma.PurchaseReturnInclude;
 
   async create(dto: CreatePurchaseReturnDto, adminId: string) {
+    if (dto.purchaseId) {
+      return this.createAgainstPurchase(dto.purchaseId, dto, adminId);
+    }
+    return this.createStandalone(dto, adminId);
+  }
+
+  private async createAgainstPurchase(
+    purchaseId: string,
+    dto: CreatePurchaseReturnDto,
+    adminId: string,
+  ) {
     const purchase = await this.prisma.purchase.findUnique({
-      where: { id: dto.purchaseId },
+      where: { id: purchaseId },
       include: { items: true },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
@@ -110,6 +121,81 @@ export class PurchaseReturnsService {
         action: 'RECORDED_PURCHASE_RETURN',
         targetId: purchaseReturn.id,
         details: `Purchase return ${returnNumber} of ${totalAmount.toString()} against purchase invoice ${purchase.invoiceNumber}`,
+      });
+
+      return purchaseReturn;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  // For returns not tied to a specific purchase invoice — e.g. a damaged unit
+  // found in stock — the admin supplies the cost per item directly since
+  // there's no purchase line to look it up from.
+  private async createStandalone(
+    dto: CreatePurchaseReturnDto,
+    adminId: string,
+  ) {
+    if (!dto.supplierId) {
+      throw new BadRequestException(
+        'supplierId is required when the return is not tied to a purchase',
+      );
+    }
+    const supplier = await this.prisma.supplier.findUnique({
+      where: { id: dto.supplierId },
+    });
+    if (!supplier) throw new NotFoundException('Supplier not found');
+
+    let totalAmount = new Prisma.Decimal(0);
+    const itemsData = dto.items.map((item) => {
+      if (item.unitCost === undefined) {
+        throw new BadRequestException(
+          `unitCost is required for product ${item.productId} since this return isn't tied to a purchase`,
+        );
+      }
+      const unitCost = new Prisma.Decimal(item.unitCost);
+      const lineTotal = unitCost.mul(item.quantity);
+      totalAmount = totalAmount.add(lineTotal);
+
+      return {
+        productId: item.productId,
+        quantity: item.quantity,
+        unitCost,
+        lineTotal,
+      };
+    });
+
+    return this.prisma.$transaction(async (tx) => {
+      const returnNumber = await nextSequenceNumber(
+        tx,
+        'purchaseReturn',
+        'PRTN',
+      );
+
+      const purchaseReturn = await tx.purchaseReturn.create({
+        data: {
+          returnNumber,
+          supplierId: supplier.id,
+          reason: dto.reason,
+          totalAmount,
+          returnDate: new Date(dto.returnDate),
+          items: { create: itemsData },
+        },
+        include: this.include,
+      });
+
+      for (const item of itemsData) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityOut: item.quantity,
+          reference: purchaseReturn.id,
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RECORDED_PURCHASE_RETURN',
+        targetId: purchaseReturn.id,
+        details: `Standalone purchase return ${returnNumber} of ${totalAmount.toString()} to ${supplier.name} (${dto.reason})`,
       });
 
       return purchaseReturn;

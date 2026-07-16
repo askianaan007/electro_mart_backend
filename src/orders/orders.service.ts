@@ -20,6 +20,7 @@ import { CreateOrderDto, OrderItemDto } from './dto/create-order.dto';
 import { ApproveOrderDto } from './dto/approve-order.dto';
 import { QueryOrderDto } from './dto/query-order.dto';
 import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
 import { paginate } from '../common/utils/paginate';
 import { nextSequenceNumber } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
@@ -59,9 +60,12 @@ export class OrdersService {
     invoice: true,
   } satisfies Prisma.OrderInclude;
 
-  private async buildItemsAndSubtotal(items: OrderItemDto[]) {
+  private async buildItemsAndSubtotal(
+    items: OrderItemDto[],
+    client: TransactionClient | PrismaService = this.prisma,
+  ) {
     const productIds = items.map((item) => item.productId);
-    const products = await this.prisma.product.findMany({
+    const products = await client.product.findMany({
       where: { id: { in: productIds } },
     });
 
@@ -101,6 +105,13 @@ export class OrdersService {
   /**
    * Shared by approve() and the admin-create-order path: reserves stock,
    * generates the invoice, marks the order APPROVED, and logs the action.
+   *
+   * When `completionDate` is set (admin-create-order path only, for
+   * recording a walk-in/offline sale after the fact), the order is instead
+   * created directly as COMPLETED — approvedAt/packedAt/deliveredAt/
+   * completedAt all set to that date — and the dealer's outstanding balance
+   * is incremented immediately, mirroring what stepping through
+   * Packed/Delivered/Completed one at a time would have done.
    */
   private async applyApproval(
     tx: TransactionClient,
@@ -116,6 +127,7 @@ export class OrdersService {
       discountTotal: Prisma.Decimal;
       discountDescription: string | null;
       activityAction: string;
+      completionDate?: Date;
     },
   ) {
     for (const item of order.items) {
@@ -144,12 +156,26 @@ export class OrdersService {
       },
     });
 
+    const completionDate = options.completionDate;
+
+    if (completionDate) {
+      await tx.dealer.update({
+        where: { id: order.dealerId },
+        data: { outstandingBalance: { increment: grandTotal } },
+      });
+    }
+
     const savedOrder = await tx.order.update({
       where: { id: order.id },
       data: {
-        status: OrderStatus.APPROVED,
+        status: completionDate ? OrderStatus.COMPLETED : OrderStatus.APPROVED,
         approvedByAdminId: adminId,
-        approvedAt: new Date(),
+        approvedAt: completionDate ?? new Date(),
+        ...(completionDate && {
+          packedAt: completionDate,
+          deliveredAt: completionDate,
+          completedAt: completionDate,
+        }),
         discount: options.discountTotal,
         totalAmount: grandTotal,
       },
@@ -275,6 +301,8 @@ export class OrdersService {
     }
 
     if (requester.role === Role.ADMIN) {
+      const completionDate = dto.saleDate ? new Date(dto.saleDate) : undefined;
+
       const { savedOrder } = await this.prisma.$transaction(async (tx) => {
         const orderNumber = await nextSequenceNumber(tx, 'order', 'ORD');
         const order = await tx.order.create({
@@ -284,6 +312,7 @@ export class OrdersService {
             subtotal,
             discount: 0,
             totalAmount,
+            createdByAdminId: requester.id,
             items: { create: itemsData },
           },
           include: { items: true },
@@ -293,6 +322,7 @@ export class OrdersService {
           discountTotal,
           discountDescription,
           activityAction: 'ADMIN_CREATED_ORDER',
+          completionDate,
         });
       }, TRANSACTION_OPTIONS);
 
@@ -385,6 +415,153 @@ export class OrdersService {
         action: 'UPDATED_ORDER_ITEMS',
         targetId: id,
         details: `Updated line items for ${order.orderNumber}`,
+      });
+
+      return savedOrder;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Edits an order an admin recorded directly (a walk-in/offline sale via
+   * the New Order form) — for fixing a mistake after the fact: wrong
+   * product/quantity, wrong dealer, wrong discount, or wrong sale date.
+   * Reverses the stock reservation and dealer balance impact of the
+   * original recording, then re-applies both for the corrected version.
+   * Blocked if a sales return or an invoice payment has already been
+   * recorded against it, since those reference the original figures.
+   */
+  async updateAdminOrder(id: string, dto: UpdateOrderDto, adminId: string) {
+    const order = await this.prisma.order.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        invoice: { include: { payments: true } },
+        salesReturns: true,
+      },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+    if (!order.createdByAdminId) {
+      throw new BadRequestException(
+        'Only orders recorded directly by an admin can be edited this way',
+      );
+    }
+    if (order.status !== OrderStatus.COMPLETED || !order.invoice) {
+      throw new BadRequestException(
+        'Only completed admin-recorded orders can be edited',
+      );
+    }
+    if (order.salesReturns.length > 0) {
+      throw new BadRequestException(
+        'This order has a sales return recorded against it and cannot be edited',
+      );
+    }
+    if (order.invoice.payments.length > 0) {
+      throw new BadRequestException(
+        "This order's invoice already has payments recorded and cannot be edited",
+      );
+    }
+
+    const newDealer = await this.prisma.dealer.findUnique({
+      where: { id: dto.dealerId },
+    });
+    if (!newDealer) throw new NotFoundException('Dealer not found');
+    if (newDealer.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException('Dealer account is inactive');
+    }
+
+    const oldGrandTotal = order.invoice.grandTotal;
+    const invoiceId = order.invoice.id;
+    const saleDate = new Date(dto.saleDate);
+
+    return this.prisma.$transaction(async (tx) => {
+      // Reverse the original stock reservation and dealer balance impact.
+      for (const item of order.items) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityIn: item.quantity,
+          reference: `Reversed for edit of order ${order.orderNumber}`,
+        });
+      }
+      await tx.dealer.update({
+        where: { id: order.dealerId },
+        data: { outstandingBalance: { decrement: oldGrandTotal } },
+      });
+      await tx.orderItem.deleteMany({ where: { orderId: id } });
+
+      // Rebuilt only now, against post-reversal stock figures.
+      const { itemsData, subtotal } = await this.buildItemsAndSubtotal(
+        dto.items,
+        tx,
+      );
+      const { discountTotal, discountDescription } = this.resolveDiscount(
+        subtotal,
+        dto,
+      );
+      const grandTotal = subtotal.sub(discountTotal);
+
+      const dealerForCheck = await tx.dealer.findUniqueOrThrow({
+        where: { id: dto.dealerId },
+      });
+      const projectedOutstanding =
+        dealerForCheck.outstandingBalance.add(grandTotal);
+      if (
+        !dealerForCheck.unlimitedCredit &&
+        projectedOutstanding.greaterThan(dealerForCheck.creditLimit)
+      ) {
+        throw new BadRequestException(
+          "This change exceeds the dealer's available credit limit",
+        );
+      }
+
+      // Re-apply: reserve stock for the corrected items.
+      for (const item of itemsData) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.RESERVE,
+          quantityOut: item.quantity,
+          reference: id,
+        });
+      }
+
+      await tx.dealer.update({
+        where: { id: dto.dealerId },
+        data: { outstandingBalance: { increment: grandTotal } },
+      });
+
+      await tx.invoice.update({
+        where: { id: invoiceId },
+        data: {
+          dealerId: dto.dealerId,
+          subtotal,
+          discountTotal,
+          grandTotal,
+        },
+      });
+
+      const savedOrder = await tx.order.update({
+        where: { id },
+        data: {
+          dealerId: dto.dealerId,
+          subtotal,
+          discount: discountTotal,
+          totalAmount: grandTotal,
+          approvedAt: saleDate,
+          packedAt: saleDate,
+          deliveredAt: saleDate,
+          completedAt: saleDate,
+          items: { create: itemsData },
+        },
+        include: this.orderInclude,
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'ADMIN_EDITED_ORDER',
+        targetId: id,
+        details: discountDescription
+          ? `Edited ${order.orderNumber} (${discountDescription}), new total ${grandTotal.toString()}`
+          : `Edited ${order.orderNumber}, new total ${grandTotal.toString()}`,
       });
 
       return savedOrder;

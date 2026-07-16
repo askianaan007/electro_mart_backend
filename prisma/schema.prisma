@@ -69,6 +69,7 @@ model Admin {
   purchases      Purchase[]
   activityLogs   ActivityLog[]
   approvedOrders Order[]       @relation("OrderApprovedBy")
+  createdOrders  Order[]       @relation("OrderCreatedBy")
 }
 
 model Dealer {
@@ -179,8 +180,8 @@ model Purchase {
 model PurchaseReturn {
   id           String               @id @default(uuid())
   returnNumber String               @unique
-  purchaseId   String
-  purchase     Purchase             @relation(fields: [purchaseId], references: [id])
+  purchaseId   String?
+  purchase     Purchase?            @relation(fields: [purchaseId], references: [id])
   supplierId   String
   supplier     Supplier             @relation(fields: [supplierId], references: [id])
   reason       String
@@ -255,6 +256,12 @@ model Order {
   deliveredAt       DateTime?
   completedAt       DateTime?
 
+  // Set only when an admin records this order directly (e.g. a walk-in sale)
+  // rather than a dealer submitting it for approval — distinguishes the two
+  // so only admin-recorded orders can be edited after the fact.
+  createdByAdminId String?
+  createdByAdmin   Admin?  @relation("OrderCreatedBy", fields: [createdByAdminId], references: [id])
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -327,6 +334,7 @@ model SupplierPayment {
   chequeStatus      ChequeStatus?
   chequeStatusUpdatedAt DateTime?
   chequeDepositDate DateTime?
+  chequeReminderSentAt DateTime?
   remarks           String?
   createdAt         DateTime      @default(now())
 

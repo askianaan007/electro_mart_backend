@@ -200,6 +200,7 @@ export class DashboardService {
       monthlyKpis,
       liquidCash,
       creditsSummary,
+      upcomingCheques,
     ] = await Promise.all([
       this.prisma.order.aggregate({
         where: {
@@ -235,6 +236,7 @@ export class DashboardService {
       this.getMonthlyKpis(),
       this.computeLiquidCash(),
       this.creditsService.getSummary(),
+      this.creditsService.getUpcomingCheques(),
     ]);
 
     const topProductRecords = await this.prisma.product.findMany({
@@ -262,6 +264,10 @@ export class DashboardService {
       invoiceDue: outstandingAgg._sum.outstandingBalance ?? 0,
       liquidCash,
       creditBalance: creditsSummary.totals.totalCreditBalance,
+      upcomingCheques: upcomingCheques.cheques,
+      chequesDueCount: upcomingCheques.dueCount,
+      chequesDueTotal: upcomingCheques.dueTotal,
+      chequesUpcomingCount: upcomingCheques.upcomingCount,
     };
   }
 

@@ -3,6 +3,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
+  IsDateString,
   IsInt,
   IsNumber,
   IsOptional,
@@ -60,4 +61,14 @@ export class CreateOrderDto {
   @IsNumber()
   @Min(0)
   discountAmount?: number;
+
+  @ApiPropertyOptional({
+    description:
+      "Admin-only: the date this sale actually happened. When provided, the order is created directly as COMPLETED " +
+      '(approved, packed, delivered, and completed all on this date) instead of sitting at APPROVED — for recording ' +
+      'a walk-in/offline sale after the fact. Ignored for dealer callers.',
+  })
+  @IsOptional()
+  @IsDateString()
+  saleDate?: string;
 }

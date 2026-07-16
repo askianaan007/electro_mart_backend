@@ -18,6 +18,7 @@ import { QueryOrderDto } from './dto/query-order.dto';
 import { RejectOrderDto } from './dto/reject-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
+import { UpdateOrderDto } from './dto/update-order.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -84,6 +85,20 @@ export class OrdersController {
     @Body() dto: UpdateOrderItemsDto,
   ) {
     return this.ordersService.updateItems(id, adminId, dto);
+  }
+
+  @Patch(':id')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      'Edit an order an admin recorded directly (fixes a mistake in dealer/items/discount/sale date) — reverses and re-applies its stock reservation and dealer balance impact',
+  })
+  update(
+    @Param('id') id: string,
+    @CurrentUser('sub') adminId: string,
+    @Body() dto: UpdateOrderDto,
+  ) {
+    return this.ordersService.updateAdminOrder(id, dto, adminId);
   }
 
   @Patch(':id/reject')

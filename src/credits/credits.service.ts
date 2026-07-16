@@ -1,11 +1,14 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { ChequeStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { MailerService } from '../mailer/mailer.service';
 import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { QueryCreditsDto } from './dto/query-credits.dto';
 import { QuerySettlementsDto } from './dto/query-settlements.dto';
@@ -13,6 +16,21 @@ import { paginate } from '../common/utils/paginate';
 
 const ZERO = new Prisma.Decimal(0);
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+function startOfDay(date: Date): Date {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function addDays(date: Date, days: number): Date {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+// How far into the future the dashboard's "upcoming cheques" list looks.
+const UPCOMING_CHEQUE_WINDOW_DAYS = 14;
 
 // A cheque that has bounced no longer counts as money paid to the supplier —
 // everything else (cash, bank transfer, pending or cleared cheques) does.
@@ -22,9 +40,12 @@ const EFFECTIVE_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
 
 @Injectable()
 export class CreditsService {
+  private readonly logger = new Logger(CreditsService.name);
+
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private mailer: MailerService,
   ) {}
 
   private async computeCreditBalance(supplierId: string) {
@@ -202,6 +223,13 @@ export class CreditsService {
         'Cheque deposit date is required for cheque settlements',
       );
     }
+    if (
+      dto.mode === 'CHEQUE' &&
+      dto.chequeDepositDate &&
+      new Date(dto.chequeDepositDate) < startOfDay(new Date())
+    ) {
+      throw new BadRequestException('Cheque deposit date cannot be in the past');
+    }
 
     const { creditBalance } = await this.computeCreditBalance(supplierId);
     const amount = new Prisma.Decimal(dto.amount);
@@ -320,5 +348,104 @@ export class CreditsService {
 
       return { message: 'Settlement deleted' };
     });
+  }
+
+  /**
+   * Cheques still PENDING whose deposit date has already passed (overdue) or
+   * falls within the next UPCOMING_CHEQUE_WINDOW_DAYS days — feeds the
+   * dashboard's "upcoming cheques" widget. Overdue cheques are always
+   * included regardless of how long ago they fell due, so nothing silently
+   * drops off the list until it's actually cleared or returned.
+   */
+  async getUpcomingCheques() {
+    const today = startOfDay(new Date());
+    const windowEnd = addDays(today, UPCOMING_CHEQUE_WINDOW_DAYS + 1);
+
+    const cheques = await this.prisma.supplierPayment.findMany({
+      where: {
+        mode: 'CHEQUE',
+        chequeStatus: 'PENDING',
+        chequeDepositDate: { lt: windowEnd },
+      },
+      include: { supplier: true },
+      orderBy: { chequeDepositDate: 'asc' },
+    });
+
+    const rows = cheques.map((cheque) => {
+      const depositDate = cheque.chequeDepositDate as Date;
+      const daysUntilDue = Math.round(
+        (startOfDay(depositDate).getTime() - today.getTime()) / DAY_MS,
+      );
+      return {
+        id: cheque.id,
+        supplierId: cheque.supplierId,
+        supplierName: cheque.supplier.name,
+        amount: cheque.amount,
+        reference: cheque.reference,
+        chequeDepositDate: depositDate,
+        daysUntilDue,
+        isDue: daysUntilDue <= 0,
+      };
+    });
+
+    const due = rows.filter((row) => row.isDue);
+
+    return {
+      cheques: rows,
+      dueCount: due.length,
+      dueTotal: due.reduce((sum, row) => sum + Number(row.amount), 0),
+      upcomingCount: rows.length - due.length,
+    };
+  }
+
+  /**
+   * Emails every admin a reminder for cheques due for bank deposit tomorrow.
+   * Runs daily; chequeReminderSentAt guards against double-sending if the
+   * job is ever triggered twice in the same day (e.g. a manual re-run).
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_8AM)
+  async sendChequeDepositReminders() {
+    const tomorrow = startOfDay(addDays(new Date(), 1));
+    const dayAfterTomorrow = addDays(tomorrow, 1);
+
+    const dueTomorrow = await this.prisma.supplierPayment.findMany({
+      where: {
+        mode: 'CHEQUE',
+        chequeStatus: 'PENDING',
+        chequeDepositDate: { gte: tomorrow, lt: dayAfterTomorrow },
+        chequeReminderSentAt: null,
+      },
+      include: { supplier: true },
+    });
+
+    if (dueTomorrow.length === 0) {
+      return { remindersSent: 0, chequeCount: 0 };
+    }
+
+    const admins = await this.prisma.admin.findMany({ select: { email: true } });
+    const cheques = dueTomorrow.map((cheque) => ({
+      supplierName: cheque.supplier.name,
+      amount: cheque.amount.toString(),
+      chequeDepositDate: cheque.chequeDepositDate as Date,
+      reference: cheque.reference,
+    }));
+
+    const results = await Promise.allSettled(
+      admins.map((admin) =>
+        this.mailer.notifyAdminChequeDepositReminder(admin.email, cheques),
+      ),
+    );
+    const sent = results.filter((r) => r.status === 'fulfilled').length;
+
+    await this.prisma.supplierPayment.updateMany({
+      where: { id: { in: dueTomorrow.map((cheque) => cheque.id) } },
+      data: { chequeReminderSentAt: new Date() },
+    });
+
+    this.logger.log(
+      `Sent cheque deposit reminders for ${dueTomorrow.length} cheque(s) to ${sent}/${admins.length} admin(s)`,
+    );
+
+    return { remindersSent: sent, chequeCount: dueTomorrow.length };
   }
 }

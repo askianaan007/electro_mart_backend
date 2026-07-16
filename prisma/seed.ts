@@ -11,7 +11,7 @@ async function main() {
   if (existing) {
     console.log('Admin already exists:', email);
 
-    return;
+    return; 
   }
 
   const hashed = await bcrypt.hash(plainPassword, 10);
