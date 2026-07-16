@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { PaymentMode } from '@prisma/client';
+import { ChequeStatus, PaymentMode } from '@prisma/client';
 import { IsDateString, IsEnum, IsOptional, IsUUID } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
@@ -8,6 +8,11 @@ export class QueryPaymentDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(PaymentMode)
   mode?: PaymentMode;
+
+  @ApiPropertyOptional({ enum: ChequeStatus, description: 'Filter cheque payments by status' })
+  @IsOptional()
+  @IsEnum(ChequeStatus)
+  chequeStatus?: ChequeStatus;
 
   @ApiPropertyOptional({ description: 'Admin only: filter by dealer' })
   @IsOptional()

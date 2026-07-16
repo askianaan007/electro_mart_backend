@@ -4,10 +4,18 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreditsService } from '../credits/credits.service';
 import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 
-// Liquid Cash tracks actual bank balance: cash/bank-transfer settlements
-// leave the account immediately, but a cheque doesn't until it actually
-// clears — while PENDING (or if it later bounces) the money hasn't left.
-const BANK_CASH_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
+// Liquid Cash tracks actual bank balance: cash/bank-transfer payments move
+// money immediately, but a cheque doesn't until it actually clears — while
+// PENDING (or if it later bounces) the money hasn't left/entered the bank
+// yet. Applies symmetrically to money going out (supplier payments) and
+// money coming in (dealer payments/collections).
+const SUPPLIER_CLEARED_FILTER: Prisma.SupplierPaymentWhereInput = {
+  OR: [
+    { mode: { not: 'CHEQUE' } },
+    { mode: 'CHEQUE', chequeStatus: 'CLEARED' },
+  ],
+};
+const DEALER_CLEARED_FILTER: Prisma.PaymentWhereInput = {
   OR: [
     { mode: { not: 'CHEQUE' } },
     { mode: 'CHEQUE', chequeStatus: 'CLEARED' },
@@ -66,13 +74,16 @@ export class DashboardService {
         _sum: { totalAmount: true },
       }),
       this.prisma.payment.aggregate({
-        where: { paymentDate: { gte: rangeStart, lt: rangeEnd } },
+        where: {
+          paymentDate: { gte: rangeStart, lt: rangeEnd },
+          ...DEALER_CLEARED_FILTER,
+        },
         _sum: { amount: true },
       }),
       this.prisma.supplierPayment.aggregate({
         where: {
           paymentDate: { gte: rangeStart, lt: rangeEnd },
-          ...BANK_CASH_PAYMENT_FILTER,
+          ...SUPPLIER_CLEARED_FILTER,
         },
         _sum: { amount: true },
       }),
@@ -105,17 +116,20 @@ export class DashboardService {
   /**
    * All-time cash-on-hand: investor contributions/withdrawals plus dealer
    * payments collected, minus supplier payments and expenses actually paid
-   * out. Supplier payments only count once a cheque has actually cleared
-   * (see BANK_CASH_PAYMENT_FILTER) — a pending cheque hasn't left the bank
-   * yet.
+   * out. Cheques on either side only count once they've actually cleared
+   * (see SUPPLIER_CLEARED_FILTER / DEALER_CLEARED_FILTER) — a pending cheque
+   * hasn't moved through the bank yet, and a returned one never will.
    */
   private async computeLiquidCash() {
     const [investmentAgg, paymentAgg, supplierPaymentAgg, expenseAgg] =
       await Promise.all([
         this.prisma.investment.aggregate({ _sum: { amount: true } }),
-        this.prisma.payment.aggregate({ _sum: { amount: true } }),
+        this.prisma.payment.aggregate({
+          where: DEALER_CLEARED_FILTER,
+          _sum: { amount: true },
+        }),
         this.prisma.supplierPayment.aggregate({
-          where: BANK_CASH_PAYMENT_FILTER,
+          where: SUPPLIER_CLEARED_FILTER,
           _sum: { amount: true },
         }),
         this.prisma.expense.aggregate({ _sum: { amount: true } }),

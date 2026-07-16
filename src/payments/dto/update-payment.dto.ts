@@ -6,15 +6,10 @@ import {
   IsNumber,
   IsOptional,
   IsString,
-  IsUUID,
   Min,
 } from 'class-validator';
 
-export class CreatePaymentDto {
-  @ApiProperty()
-  @IsUUID()
-  invoiceId: string;
-
+export class UpdatePaymentDto {
   @ApiProperty({ minimum: 0.01 })
   @IsNumber()
   @Min(0.01)

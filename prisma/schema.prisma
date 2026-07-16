@@ -319,6 +319,19 @@ model Payment {
   paymentDate DateTime
   createdAt   DateTime    @default(now())
 
+  // Cheque-specific fields, set when mode = CHEQUE. The dealer's outstanding
+  // balance and the invoice's paymentStatus are updated as soon as the cheque
+  // is recorded (PENDING) — money isn't counted in Liquid Cash until it
+  // actually CLEARS, and if it's marked RETURNED the balance/status effects
+  // of this payment are reversed.
+  chequeStatus          ChequeStatus?
+  chequeStatusUpdatedAt DateTime?
+  bankName              String?
+  chequeNumber          String?
+  chequeDate            DateTime?
+  collectedDate         DateTime?
+  remarks               String?
+
   @@index([invoiceId])
   @@index([dealerId])
 }

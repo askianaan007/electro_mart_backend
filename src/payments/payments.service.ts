@@ -4,13 +4,38 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { PaymentStatus, Prisma } from '@prisma/client';
+import { ChequeStatus, Payment, PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
+import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { QueryPaymentDto } from './dto/query-payment.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+
+type TransactionClient = Prisma.TransactionClient;
+
+const ZERO = new Prisma.Decimal(0);
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// A cheque marked RETURNED (bounced) never actually paid the invoice — every
+// other state (PENDING, CLEARED, or a non-cheque payment) counts as money
+// the dealer has actually handed over, so it reduces what they owe.
+function isEffective(payment: {
+  mode: string;
+  chequeStatus: ChequeStatus | null;
+}): boolean {
+  return !(payment.mode === 'CHEQUE' && payment.chequeStatus === 'RETURNED');
+}
+
+function computeEffectivePaid(
+  payments: { amount: Prisma.Decimal; mode: string; chequeStatus: ChequeStatus | null }[],
+): Prisma.Decimal {
+  return payments.reduce(
+    (sum, p) => (isEffective(p) ? sum.add(p.amount) : sum),
+    ZERO,
+  );
+}
 
 @Injectable()
 export class PaymentsService {
@@ -19,7 +44,52 @@ export class PaymentsService {
     private activityLogService: ActivityLogService,
   ) {}
 
+  private validateChequeFields(dto: {
+    mode: string;
+    bankName?: string;
+    chequeNumber?: string;
+    chequeDate?: string;
+    collectedDate?: string;
+  }) {
+    if (dto.mode !== 'CHEQUE') return;
+    if (!dto.bankName || !dto.chequeNumber || !dto.chequeDate || !dto.collectedDate) {
+      throw new BadRequestException(
+        'Bank name, cheque number, cheque date, and collected date are all required for cheque payments',
+      );
+    }
+    if (new Date(dto.collectedDate) > new Date()) {
+      throw new BadRequestException('Collected date cannot be in the future');
+    }
+  }
+
+  /**
+   * Recomputes an invoice's paymentStatus from its current payment rows —
+   * safe to call after any create/edit/delete/status-change since it reads
+   * the post-change state directly rather than applying a delta.
+   */
+  private async recomputeInvoicePaymentStatus(
+    tx: TransactionClient,
+    invoiceId: string,
+  ) {
+    const invoice = await tx.invoice.findUniqueOrThrow({
+      where: { id: invoiceId },
+    });
+    const payments = await tx.payment.findMany({ where: { invoiceId } });
+    const effectivePaid = computeEffectivePaid(payments);
+
+    const paymentStatus = effectivePaid.greaterThanOrEqualTo(invoice.grandTotal)
+      ? PaymentStatus.PAID
+      : effectivePaid.greaterThan(0)
+        ? PaymentStatus.PARTIAL
+        : PaymentStatus.PENDING;
+
+    await tx.invoice.update({ where: { id: invoiceId }, data: { paymentStatus } });
+    return paymentStatus;
+  }
+
   async create(dto: CreatePaymentDto, adminId: string) {
+    this.validateChequeFields(dto);
+
     const invoice = await this.prisma.invoice.findUnique({
       where: { id: dto.invoiceId },
       include: { payments: true },
@@ -27,11 +97,8 @@ export class PaymentsService {
     if (!invoice) throw new NotFoundException('Invoice not found');
 
     const amount = new Prisma.Decimal(dto.amount);
-    const alreadyPaid = invoice.payments.reduce(
-      (sum, p) => sum.add(p.amount),
-      new Prisma.Decimal(0),
-    );
-    if (alreadyPaid.add(amount).greaterThan(invoice.grandTotal)) {
+    const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
+    if (alreadyEffectivePaid.add(amount).greaterThan(invoice.grandTotal)) {
       throw new BadRequestException(
         'Payment amount exceeds the outstanding invoice balance',
       );
@@ -46,41 +113,242 @@ export class PaymentsService {
           mode: dto.mode,
           reference: dto.reference,
           paymentDate: new Date(dto.paymentDate),
+          chequeStatus: dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
+          chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : undefined,
+          bankName: dto.mode === 'CHEQUE' ? dto.bankName : undefined,
+          chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : undefined,
+          chequeDate: dto.mode === 'CHEQUE' && dto.chequeDate ? new Date(dto.chequeDate) : undefined,
+          collectedDate:
+            dto.mode === 'CHEQUE' && dto.collectedDate ? new Date(dto.collectedDate) : undefined,
+          remarks: dto.remarks,
         },
       });
 
-      const totalPaid = alreadyPaid.add(amount);
-      const paymentStatus = totalPaid.greaterThanOrEqualTo(invoice.grandTotal)
-        ? PaymentStatus.PAID
-        : totalPaid.greaterThan(0)
-          ? PaymentStatus.PARTIAL
-          : PaymentStatus.PENDING;
-
-      await tx.invoice.update({
-        where: { id: invoice.id },
-        data: { paymentStatus },
-      });
+      await this.recomputeInvoicePaymentStatus(tx, invoice.id);
 
       const dealer = await tx.dealer.findUniqueOrThrow({
         where: { id: invoice.dealerId },
       });
-      const newOutstanding = Prisma.Decimal.max(
-        0,
-        dealer.outstandingBalance.sub(amount),
-      );
       await tx.dealer.update({
         where: { id: invoice.dealerId },
-        data: { outstandingBalance: newOutstanding },
+        data: { outstandingBalance: Prisma.Decimal.max(0, dealer.outstandingBalance.sub(amount)) },
       });
 
       await this.activityLogService.log(tx, {
         adminId,
         action: 'RECORDED_PAYMENT',
         targetId: payment.id,
-        details: `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`,
+        details:
+          dto.mode === 'CHEQUE'
+            ? `Cheque payment of ${amount.toString()} against invoice ${invoice.invoiceNumber} (${dto.bankName}, #${dto.chequeNumber})`
+            : `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`,
       });
 
       return payment;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Edits a payment's details. Only available while it's still fully
+   * correctable — within 1 day of being recorded, and (for cheques) still
+   * PENDING, since CLEARED/RETURNED already had further real-world
+   * consequences that a plain edit shouldn't silently override.
+   */
+  async update(id: string, dto: UpdatePaymentDto, adminId: string) {
+    this.validateChequeFields(dto);
+
+    const payment = await this.prisma.payment.findUnique({
+      where: { id },
+      include: { invoice: { include: { payments: true } } },
+    });
+    if (!payment) throw new NotFoundException('Payment not found');
+    this.assertEditable(payment);
+
+    const amount = new Prisma.Decimal(dto.amount);
+    const otherEffectivePaid = computeEffectivePaid(
+      payment.invoice.payments.filter((p) => p.id !== id),
+    );
+    if (otherEffectivePaid.add(amount).greaterThan(payment.invoice.grandTotal)) {
+      throw new BadRequestException(
+        'Payment amount exceeds the outstanding invoice balance',
+      );
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.payment.update({
+        where: { id },
+        data: {
+          amount,
+          mode: dto.mode,
+          reference: dto.reference,
+          paymentDate: new Date(dto.paymentDate),
+          chequeStatus: dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : null,
+          chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : null,
+          bankName: dto.mode === 'CHEQUE' ? dto.bankName : null,
+          chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : null,
+          chequeDate: dto.mode === 'CHEQUE' && dto.chequeDate ? new Date(dto.chequeDate) : null,
+          collectedDate:
+            dto.mode === 'CHEQUE' && dto.collectedDate ? new Date(dto.collectedDate) : null,
+          remarks: dto.remarks,
+        },
+      });
+
+      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+
+      const dealer = await tx.dealer.findUniqueOrThrow({
+        where: { id: payment.dealerId },
+      });
+      // The old amount was fully effective (edits are blocked once a cheque
+      // moves past PENDING), so reverse it and apply the new one.
+      const rebalanced = dealer.outstandingBalance.add(payment.amount).sub(amount);
+      await tx.dealer.update({
+        where: { id: payment.dealerId },
+        data: { outstandingBalance: Prisma.Decimal.max(0, rebalanced) },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_PAYMENT',
+        targetId: id,
+        details: `Updated payment against invoice ${payment.invoice.invoiceNumber}: ${payment.amount.toString()} -> ${amount.toString()}`,
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Reverses a payment entirely — the "return the cash" correction — within
+   * 1 day of it being recorded, restoring the dealer's outstanding balance
+   * and the invoice's payment status as if it had never been entered.
+   */
+  async remove(id: string, adminId: string) {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id },
+      include: { invoice: true, dealer: true },
+    });
+    if (!payment) throw new NotFoundException('Payment not found');
+    this.assertEditable(payment);
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.payment.delete({ where: { id } });
+
+      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+
+      if (isEffective(payment)) {
+        const dealer = await tx.dealer.findUniqueOrThrow({
+          where: { id: payment.dealerId },
+        });
+        await tx.dealer.update({
+          where: { id: payment.dealerId },
+          data: { outstandingBalance: dealer.outstandingBalance.add(payment.amount) },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RETURNED_PAYMENT',
+        targetId: id,
+        details: `Returned/reversed payment of ${payment.amount.toString()} against invoice ${payment.invoice.invoiceNumber}`,
+      });
+
+      return { message: 'Payment returned' };
+    }, TRANSACTION_OPTIONS);
+  }
+
+  private assertEditable(payment: Payment) {
+    if (Date.now() - payment.createdAt.getTime() > DAY_MS) {
+      throw new BadRequestException(
+        'This payment can only be edited or returned within 1 day of being recorded',
+      );
+    }
+    if (payment.mode === 'CHEQUE' && payment.chequeStatus !== 'PENDING') {
+      throw new BadRequestException(
+        `This cheque has already been marked ${payment.chequeStatus} — revert it to pending first if it needs correcting`,
+      );
+    }
+  }
+
+  /**
+   * Moves a cheque payment through PENDING -> CLEARED/RETURNED (or reverts
+   * within 1 day). Marking RETURNED means the money was never actually
+   * received, so the dealer's outstanding balance and the invoice's payment
+   * status are restored as if this payment didn't count; reverting back to
+   * PENDING re-applies it.
+   */
+  async updateChequeStatus(
+    paymentId: string,
+    status: 'CLEARED' | 'RETURNED' | 'PENDING',
+    adminId: string,
+  ) {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: { invoice: true },
+    });
+    if (!payment) throw new NotFoundException('Payment not found');
+    if (payment.mode !== 'CHEQUE') {
+      throw new BadRequestException('Only cheque payments have a cheque status');
+    }
+
+    let details: string;
+
+    if (status === ChequeStatus.PENDING) {
+      if (payment.chequeStatus === ChequeStatus.PENDING) {
+        throw new BadRequestException('This cheque is already pending');
+      }
+      const changedAt = payment.chequeStatusUpdatedAt;
+      if (!changedAt || Date.now() - changedAt.getTime() > DAY_MS) {
+        throw new BadRequestException(
+          'This cheque can only be reverted to pending within 1 day of being marked ' +
+            `${payment.chequeStatus}`,
+        );
+      }
+      details = `Cheque ${payment.reference ?? paymentId} reverted from ${payment.chequeStatus} to PENDING`;
+    } else {
+      if (payment.chequeStatus !== ChequeStatus.PENDING) {
+        throw new BadRequestException(
+          `This cheque is already marked ${payment.chequeStatus}`,
+        );
+      }
+      details = `Cheque ${payment.reference ?? paymentId} marked ${status}`;
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.payment.update({
+        where: { id: paymentId },
+        data: { chequeStatus: status, chequeStatusUpdatedAt: new Date() },
+      });
+
+      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+
+      // Only the RETURNED <-> (PENDING/CLEARED) boundary changes whether
+      // this payment counts against the dealer's balance.
+      const wasEffective = isEffective(payment);
+      const nowEffective = isEffective(updated);
+      if (wasEffective !== nowEffective) {
+        const dealer = await tx.dealer.findUniqueOrThrow({
+          where: { id: payment.dealerId },
+        });
+        const delta = nowEffective ? payment.amount.neg() : payment.amount;
+        await tx.dealer.update({
+          where: { id: payment.dealerId },
+          data: {
+            outstandingBalance: Prisma.Decimal.max(
+              0,
+              dealer.outstandingBalance.add(delta),
+            ),
+          },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_PAYMENT_CHEQUE_STATUS',
+        targetId: paymentId,
+        details,
+      });
+
+      return updated;
     }, TRANSACTION_OPTIONS);
   }
 
@@ -90,6 +358,7 @@ export class PaymentsService {
 
     const where: Prisma.PaymentWhereInput = {
       mode: query.mode,
+      chequeStatus: query.chequeStatus,
       dealerId: query.dealerId,
       ...((query.dateFrom || query.dateTo) && {
         paymentDate: {
@@ -98,7 +367,11 @@ export class PaymentsService {
         },
       }),
       ...(query.search && {
-        reference: { contains: query.search, mode: 'insensitive' },
+        OR: [
+          { reference: { contains: query.search, mode: 'insensitive' } },
+          { chequeNumber: { contains: query.search, mode: 'insensitive' } },
+          { bankName: { contains: query.search, mode: 'insensitive' } },
+        ],
       }),
     };
 
@@ -120,7 +393,11 @@ export class PaymentsService {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
-    const where: Prisma.PaymentWhereInput = { dealerId, mode: query.mode };
+    const where: Prisma.PaymentWhereInput = {
+      dealerId,
+      mode: query.mode,
+      chequeStatus: query.chequeStatus,
+    };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.payment.findMany({
