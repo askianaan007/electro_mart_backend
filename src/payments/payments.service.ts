@@ -378,7 +378,7 @@ export class PaymentsService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.payment.findMany({
         where,
-        include: { invoice: true, dealer: { omit: { password: true } } },
+        include: { invoice: { include: { payments: true } }, dealer: { omit: { password: true } } },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -402,7 +402,7 @@ export class PaymentsService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.payment.findMany({
         where,
-        include: { invoice: true },
+        include: { invoice: { include: { payments: true } } },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -419,7 +419,7 @@ export class PaymentsService {
   ) {
     const payment = await this.prisma.payment.findUnique({
       where: { id },
-      include: { invoice: true, dealer: true },
+      include: { invoice: { include: { payments: true } }, dealer: true },
     });
     if (!payment) throw new NotFoundException('Payment not found');
     if (requester.role === 'DEALER' && payment.dealerId !== requester.id) {
