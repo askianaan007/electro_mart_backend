@@ -27,6 +27,7 @@ export class PurchasesService {
         (sum, item) => sum + item.quantity * item.unitCost,
         0,
       );
+      const transportCharges = dto.transportCharges ?? 0;
 
       const purchase = await tx.purchase.create({
         data: {
@@ -34,6 +35,7 @@ export class PurchasesService {
           invoiceNumber: dto.invoiceNumber,
           purchaseDate: new Date(dto.purchaseDate),
           totalValue,
+          transportCharges,
           adminId,
           items: {
             create: dto.items.map((item) => ({
@@ -60,7 +62,11 @@ export class PurchasesService {
         adminId,
         action: 'RECORDED_PURCHASE',
         targetId: purchase.id,
-        details: `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue} (${purchase.items.length} item(s))`,
+        details:
+          `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue} (${purchase.items.length} item(s))` +
+          (transportCharges > 0
+            ? `, transport charges ${transportCharges} deducted from supplier credit`
+            : ''),
       });
 
       return purchase;
@@ -89,7 +95,7 @@ export class PurchasesService {
         where,
         include: {
           supplier: true,
-          items: true,
+          items: { include: { product: true } },
           purchaseReturns: { select: { totalAmount: true } },
         },
         orderBy: [{ purchaseDate: 'desc' }, { createdAt: 'desc' }],
@@ -151,6 +157,7 @@ export class PurchasesService {
         (sum, item) => sum + item.quantity * item.unitCost,
         0,
       );
+      const transportCharges = dto.transportCharges ?? 0;
 
       const updated = await tx.purchase.update({
         where: { id },
@@ -159,6 +166,7 @@ export class PurchasesService {
           invoiceNumber: dto.invoiceNumber,
           purchaseDate: new Date(dto.purchaseDate),
           totalValue,
+          transportCharges,
           items: {
             create: dto.items.map((item) => ({
               productId: item.productId,
@@ -184,7 +192,11 @@ export class PurchasesService {
         adminId,
         action: 'UPDATED_PURCHASE',
         targetId: id,
-        details: `Updated purchase ${updated.invoiceNumber} from ${updated.supplier.name} (${updated.items.length} item(s), total ${totalValue})`,
+        details:
+          `Updated purchase ${updated.invoiceNumber} from ${updated.supplier.name} (${updated.items.length} item(s), total ${totalValue})` +
+          (transportCharges > 0
+            ? `, transport charges ${transportCharges} deducted from supplier credit`
+            : ''),
       });
 
       return updated;

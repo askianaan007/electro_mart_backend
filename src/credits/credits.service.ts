@@ -49,27 +49,42 @@ export class CreditsService {
   ) {}
 
   private async computeCreditBalance(supplierId: string) {
-    const [purchaseAgg, returnAgg, paymentAgg] = await Promise.all([
-      this.prisma.purchase.aggregate({
-        where: { supplierId },
-        _sum: { totalValue: true },
-      }),
-      this.prisma.purchaseReturn.aggregate({
-        where: { supplierId },
-        _sum: { totalAmount: true },
-      }),
-      this.prisma.supplierPayment.aggregate({
-        where: { supplierId, ...EFFECTIVE_PAYMENT_FILTER },
-        _sum: { amount: true },
-      }),
-    ]);
+    const [purchaseAgg, transportAgg, returnAgg, paymentAgg] =
+      await Promise.all([
+        this.prisma.purchase.aggregate({
+          where: { supplierId },
+          _sum: { totalValue: true },
+        }),
+        this.prisma.purchase.aggregate({
+          where: { supplierId },
+          _sum: { transportCharges: true },
+        }),
+        this.prisma.purchaseReturn.aggregate({
+          where: { supplierId },
+          _sum: { totalAmount: true },
+        }),
+        this.prisma.supplierPayment.aggregate({
+          where: { supplierId, ...EFFECTIVE_PAYMENT_FILTER },
+          _sum: { amount: true },
+        }),
+      ]);
 
     const totalPurchases = purchaseAgg._sum.totalValue ?? ZERO;
+    const totalTransportCharges = transportAgg._sum.transportCharges ?? ZERO;
     const totalReturns = returnAgg._sum.totalAmount ?? ZERO;
     const totalSettled = paymentAgg._sum.amount ?? ZERO;
-    const creditBalance = totalPurchases.sub(totalReturns).sub(totalSettled);
+    const creditBalance = totalPurchases
+      .sub(totalReturns)
+      .sub(totalSettled)
+      .sub(totalTransportCharges);
 
-    return { totalPurchases, totalReturns, totalSettled, creditBalance };
+    return {
+      totalPurchases,
+      totalTransportCharges,
+      totalReturns,
+      totalSettled,
+      creditBalance,
+    };
   }
 
   async getSummary(query: QueryCreditsDto = {}) {
@@ -84,26 +99,41 @@ export class CreditsService {
     });
     const supplierIds = suppliers.map((s) => s.id);
 
-    const [purchaseTotals, returnTotals, paymentTotals] = await Promise.all([
-      this.prisma.purchase.groupBy({
-        by: ['supplierId'],
-        where: { supplierId: { in: supplierIds } },
-        _sum: { totalValue: true },
-      }),
-      this.prisma.purchaseReturn.groupBy({
-        by: ['supplierId'],
-        where: { supplierId: { in: supplierIds } },
-        _sum: { totalAmount: true },
-      }),
-      this.prisma.supplierPayment.groupBy({
-        by: ['supplierId'],
-        where: { supplierId: { in: supplierIds }, ...EFFECTIVE_PAYMENT_FILTER },
-        _sum: { amount: true },
-      }),
-    ]);
+    const [purchaseTotals, transportTotals, returnTotals, paymentTotals] =
+      await Promise.all([
+        this.prisma.purchase.groupBy({
+          by: ['supplierId'],
+          where: { supplierId: { in: supplierIds } },
+          _sum: { totalValue: true },
+        }),
+        this.prisma.purchase.groupBy({
+          by: ['supplierId'],
+          where: { supplierId: { in: supplierIds } },
+          _sum: { transportCharges: true },
+        }),
+        this.prisma.purchaseReturn.groupBy({
+          by: ['supplierId'],
+          where: { supplierId: { in: supplierIds } },
+          _sum: { totalAmount: true },
+        }),
+        this.prisma.supplierPayment.groupBy({
+          by: ['supplierId'],
+          where: {
+            supplierId: { in: supplierIds },
+            ...EFFECTIVE_PAYMENT_FILTER,
+          },
+          _sum: { amount: true },
+        }),
+      ]);
 
     const purchaseMap = new Map(
       purchaseTotals.map((r) => [r.supplierId, r._sum.totalValue ?? ZERO]),
+    );
+    const transportMap = new Map(
+      transportTotals.map((r) => [
+        r.supplierId,
+        r._sum.transportCharges ?? ZERO,
+      ]),
     );
     const returnMap = new Map(
       returnTotals.map((r) => [r.supplierId, r._sum.totalAmount ?? ZERO]),
@@ -114,13 +144,18 @@ export class CreditsService {
 
     let entries = suppliers.map((supplier) => {
       const totalPurchases = purchaseMap.get(supplier.id) ?? ZERO;
+      const totalTransportCharges = transportMap.get(supplier.id) ?? ZERO;
       const totalReturns = returnMap.get(supplier.id) ?? ZERO;
       const totalSettled = paymentMap.get(supplier.id) ?? ZERO;
-      const creditBalance = totalPurchases.sub(totalReturns).sub(totalSettled);
+      const creditBalance = totalPurchases
+        .sub(totalReturns)
+        .sub(totalSettled)
+        .sub(totalTransportCharges);
       return {
         supplierId: supplier.id,
         supplierName: supplier.name,
         totalPurchases,
+        totalTransportCharges,
         totalReturns,
         totalSettled,
         creditBalance,
@@ -134,12 +169,16 @@ export class CreditsService {
     const totals = entries.reduce(
       (acc, e) => ({
         totalPurchases: acc.totalPurchases.add(e.totalPurchases),
+        totalTransportCharges: acc.totalTransportCharges.add(
+          e.totalTransportCharges,
+        ),
         totalReturns: acc.totalReturns.add(e.totalReturns),
         totalSettled: acc.totalSettled.add(e.totalSettled),
         totalCreditBalance: acc.totalCreditBalance.add(e.creditBalance),
       }),
       {
         totalPurchases: ZERO,
+        totalTransportCharges: ZERO,
         totalReturns: ZERO,
         totalSettled: ZERO,
         totalCreditBalance: ZERO,
@@ -228,7 +267,9 @@ export class CreditsService {
       dto.chequeDepositDate &&
       new Date(dto.chequeDepositDate) < startOfDay(new Date())
     ) {
-      throw new BadRequestException('Cheque deposit date cannot be in the past');
+      throw new BadRequestException(
+        'Cheque deposit date cannot be in the past',
+      );
     }
 
     const { creditBalance } = await this.computeCreditBalance(supplierId);
@@ -422,7 +463,9 @@ export class CreditsService {
       return { remindersSent: 0, chequeCount: 0 };
     }
 
-    const admins = await this.prisma.admin.findMany({ select: { email: true } });
+    const admins = await this.prisma.admin.findMany({
+      select: { email: true },
+    });
     const cheques = dueTomorrow.map((cheque) => ({
       supplierName: cheque.supplier.name,
       amount: cheque.amount.toString(),

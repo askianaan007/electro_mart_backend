@@ -161,15 +161,16 @@ model Supplier {
 }
 
 model Purchase {
-  id            String   @id @default(uuid())
-  supplierId    String
-  supplier      Supplier @relation(fields: [supplierId], references: [id])
-  invoiceNumber String
-  purchaseDate  DateTime
-  totalValue    Decimal
-  adminId       String
-  admin         Admin    @relation(fields: [adminId], references: [id])
-  createdAt     DateTime @default(now())
+  id               String   @id @default(uuid())
+  supplierId       String
+  supplier         Supplier @relation(fields: [supplierId], references: [id])
+  invoiceNumber    String
+  purchaseDate     DateTime
+  totalValue       Decimal
+  transportCharges Decimal  @default(0)
+  adminId          String
+  admin            Admin    @relation(fields: [adminId], references: [id])
+  createdAt        DateTime @default(now())
 
   items           PurchaseItem[]
   purchaseReturns PurchaseReturn[]
@@ -337,19 +338,19 @@ model Payment {
 }
 
 model SupplierPayment {
-  id                String        @id @default(uuid())
-  supplierId        String
-  supplier          Supplier      @relation(fields: [supplierId], references: [id])
-  amount            Decimal
-  mode              PaymentMode
-  reference         String?
-  paymentDate       DateTime
-  chequeStatus      ChequeStatus?
+  id                    String        @id @default(uuid())
+  supplierId            String
+  supplier              Supplier      @relation(fields: [supplierId], references: [id])
+  amount                Decimal
+  mode                  PaymentMode
+  reference             String?
+  paymentDate           DateTime
+  chequeStatus          ChequeStatus?
   chequeStatusUpdatedAt DateTime?
-  chequeDepositDate DateTime?
-  chequeReminderSentAt DateTime?
-  remarks           String?
-  createdAt         DateTime      @default(now())
+  chequeDepositDate     DateTime?
+  chequeReminderSentAt  DateTime?
+  remarks               String?
+  createdAt             DateTime      @default(now())
 
   @@index([supplierId])
 }
