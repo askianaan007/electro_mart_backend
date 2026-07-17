@@ -15,6 +15,7 @@ import { DealersService } from './dealers.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
+import { ClearDealerDataDto } from './dto/clear-dealer-data.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -72,6 +73,19 @@ export class DealersController {
   })
   remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
     return this.dealersService.remove(id, adminId);
+  }
+
+  @Post(':id/clear-data')
+  @ApiOperation({
+    summary:
+      "Permanently wipe a dealer's orders, invoices, payments, and sales returns while keeping the dealer's own profile. Requires the admin's password to confirm.",
+  })
+  clearData(
+    @Param('id') id: string,
+    @Body() dto: ClearDealerDataDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.dealersService.clearDealerData(id, adminId, dto.password);
   }
 
   @Patch(':id/status')

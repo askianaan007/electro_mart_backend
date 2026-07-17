@@ -22,7 +22,10 @@ import { QueryOrderDto } from './dto/query-order.dto';
 import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
 import { paginate } from '../common/utils/paginate';
-import { nextSequenceNumber } from '../common/utils/sequence';
+import {
+  nextSequenceNumber,
+  releaseSequenceNumberIfLatest,
+} from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 
@@ -430,6 +433,17 @@ export class OrdersService {
    * Blocked if a sales return or an invoice payment has already been
    * recorded against it, since those reference the original figures.
    */
+  /**
+   * Edits any order that already has an invoice (Approved and beyond),
+   * fixing a mistake in its dealer/items/discount/date. Reverses and
+   * re-applies the stock reservation, and — only for orders that had
+   * actually reached Completed, since that's the only point the dealer's
+   * balance and completion timeline are touched — the balance impact and
+   * the packed/delivered/completed timestamps. Blocked if a sales return or
+   * a payment already exists against it, since those reference the order's
+   * current state. Orders still Pending Approval (no invoice yet) use
+   * updateItems() instead.
+   */
   async updateAdminOrder(id: string, dto: UpdateOrderDto, adminId: string) {
     const order = await this.prisma.order.findUnique({
       where: { id },
@@ -440,14 +454,9 @@ export class OrdersService {
       },
     });
     if (!order) throw new NotFoundException('Order not found');
-    if (!order.createdByAdminId) {
+    if (!order.invoice) {
       throw new BadRequestException(
-        'Only orders recorded directly by an admin can be edited this way',
-      );
-    }
-    if (order.status !== OrderStatus.COMPLETED || !order.invoice) {
-      throw new BadRequestException(
-        'Only completed admin-recorded orders can be edited',
+        'Only orders that have an invoice (Approved or later) can be edited this way. Use Edit Items while the order is still Pending Approval.',
       );
     }
     if (order.salesReturns.length > 0) {
@@ -469,12 +478,15 @@ export class OrdersService {
       throw new ForbiddenException('Dealer account is inactive');
     }
 
+    const wasCompleted = order.status === OrderStatus.COMPLETED;
     const oldGrandTotal = order.invoice.grandTotal;
     const invoiceId = order.invoice.id;
-    const saleDate = new Date(dto.saleDate);
+    const saleDate =
+      wasCompleted && dto.saleDate ? new Date(dto.saleDate) : undefined;
 
     return this.prisma.$transaction(async (tx) => {
-      // Reverse the original stock reservation and dealer balance impact.
+      // Reverse the original stock reservation (and dealer balance, if this
+      // order had actually been completed).
       for (const item of order.items) {
         await this.inventoryService.recordMovement(tx, {
           productId: item.productId,
@@ -483,10 +495,12 @@ export class OrdersService {
           reference: `Reversed for edit of order ${order.orderNumber}`,
         });
       }
-      await tx.dealer.update({
-        where: { id: order.dealerId },
-        data: { outstandingBalance: { decrement: oldGrandTotal } },
-      });
+      if (wasCompleted) {
+        await tx.dealer.update({
+          where: { id: order.dealerId },
+          data: { outstandingBalance: { decrement: oldGrandTotal } },
+        });
+      }
       await tx.orderItem.deleteMany({ where: { orderId: id } });
 
       // Rebuilt only now, against post-reversal stock figures.
@@ -524,10 +538,12 @@ export class OrdersService {
         });
       }
 
-      await tx.dealer.update({
-        where: { id: dto.dealerId },
-        data: { outstandingBalance: { increment: grandTotal } },
-      });
+      if (wasCompleted) {
+        await tx.dealer.update({
+          where: { id: dto.dealerId },
+          data: { outstandingBalance: { increment: grandTotal } },
+        });
+      }
 
       await tx.invoice.update({
         where: { id: invoiceId },
@@ -546,11 +562,13 @@ export class OrdersService {
           subtotal,
           discount: discountTotal,
           totalAmount: grandTotal,
-          approvedAt: saleDate,
-          packedAt: saleDate,
-          deliveredAt: saleDate,
-          completedAt: saleDate,
           items: { create: itemsData },
+          ...(saleDate && {
+            approvedAt: saleDate,
+            packedAt: saleDate,
+            deliveredAt: saleDate,
+            completedAt: saleDate,
+          }),
         },
         include: this.orderInclude,
       });
@@ -871,10 +889,18 @@ export class OrdersService {
   }
 
   /**
-   * Deletes an order any time before it's COMPLETED. If it was already
-   * approved, that reserved the stock and generated an invoice — both are
-   * reversed here. Blocked outright if the invoice already has payments
-   * recorded, so money already collected is never silently unwound.
+   * Deletes an order at any status, including COMPLETED, reversing
+   * everything it caused: the stock it reserved, the dealer balance it
+   * added (if it had been completed), and its invoice. Blocked outright if
+   * the invoice already has payments recorded, so money already collected
+   * is never silently unwound, and blocked if a newer invoice has since
+   * been issued — deleting anything but the most recent invoice would
+   * either leave a permanent gap or force numbers to be reused out of
+   * order, so once another invoice exists after this one, this order is
+   * locked from deletion. When deletion does go through, the invoice
+   * number (and the order number, if it's also still the latest) is handed
+   * back to its sequence so the next one created reuses it instead of
+   * leaving a gap.
    */
   async remove(id: string, adminId: string) {
     const order = await this.prisma.order.findUnique({
@@ -882,9 +908,6 @@ export class OrdersService {
       include: { items: true, invoice: { include: { payments: true } } },
     });
     if (!order) throw new NotFoundException('Order not found');
-    if (order.status === OrderStatus.COMPLETED) {
-      throw new BadRequestException('Completed orders cannot be deleted');
-    }
     if (order.invoice && order.invoice.payments.length > 0) {
       throw new BadRequestException(
         'This order has payments recorded against its invoice and cannot be deleted',
@@ -894,6 +917,15 @@ export class OrdersService {
     try {
       return await this.prisma.$transaction(async (tx) => {
         if (order.invoice) {
+          const newerInvoice = await tx.invoice.findFirst({
+            where: { createdAt: { gt: order.invoice.createdAt } },
+          });
+          if (newerInvoice) {
+            throw new BadRequestException(
+              `A newer invoice (${newerInvoice.invoiceNumber}) has already been issued. Only the most recently issued invoice can be deleted, so invoice numbers stay sequential.`,
+            );
+          }
+
           for (const item of order.items) {
             await this.inventoryService.recordMovement(tx, {
               productId: item.productId,
@@ -902,18 +934,32 @@ export class OrdersService {
               reference: `Reversal of deleted order ${order.orderNumber}`,
             });
           }
+
+          if (order.status === OrderStatus.COMPLETED) {
+            await tx.dealer.update({
+              where: { id: order.dealerId },
+              data: { outstandingBalance: { decrement: order.invoice.grandTotal } },
+            });
+          }
+
           await tx.invoice.delete({ where: { id: order.invoice.id } });
+          await releaseSequenceNumberIfLatest(
+            tx,
+            'invoice',
+            order.invoice.invoiceNumber,
+          );
         }
 
         await tx.orderItem.deleteMany({ where: { orderId: id } });
         await tx.order.delete({ where: { id } });
+        await releaseSequenceNumberIfLatest(tx, 'order', order.orderNumber);
 
         await this.activityLogService.log(tx, {
           adminId,
           action: 'DELETED_ORDER',
           targetId: id,
           details: order.invoice
-            ? `Deleted order ${order.orderNumber} and reversed its stock reservation`
+            ? `Deleted order ${order.orderNumber} and invoice ${order.invoice.invoiceNumber} (number reclaimed), reversed its stock reservation${order.status === OrderStatus.COMPLETED ? ' and dealer balance' : ''}`
             : `Deleted order ${order.orderNumber}`,
         });
 

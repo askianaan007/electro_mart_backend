@@ -91,7 +91,7 @@ export class OrdersController {
   @Roles(Role.ADMIN)
   @ApiOperation({
     summary:
-      'Edit an order an admin recorded directly (fixes a mistake in dealer/items/discount/sale date) — reverses and re-applies its stock reservation and dealer balance impact',
+      'Edit any order that has an invoice (fixes a mistake in dealer/items/discount/sale date) — reverses and re-applies its stock reservation, and dealer balance impact if it was completed',
   })
   update(
     @Param('id') id: string,

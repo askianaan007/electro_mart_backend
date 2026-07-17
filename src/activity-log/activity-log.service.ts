@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryActivityLogDto } from './dto/query-activity-log.dto';
 import { paginate } from '../common/utils/paginate';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -71,5 +72,22 @@ export class ActivityLogService {
       select: { id: true, name: true },
       orderBy: { name: 'asc' },
     });
+  }
+
+  /**
+   * Wipes every existing entry, then writes one fresh entry recording the
+   * clear itself (who did it and how many were removed) — so the audit
+   * trail isn't left with zero evidence that a clear happened.
+   */
+  async clearAll(adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.activityLog.deleteMany({});
+      await this.log(tx, {
+        adminId,
+        action: 'CLEARED_ACTIVITY_LOG',
+        details: `Cleared ${count} activity log entr${count === 1 ? 'y' : 'ies'}`,
+      });
+      return { message: 'Activity log cleared', count };
+    }, TRANSACTION_OPTIONS);
   }
 }

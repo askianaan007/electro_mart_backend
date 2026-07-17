@@ -25,12 +25,13 @@ export class UpdateOrderDto {
   @Type(() => OrderItemDto)
   items: OrderItemDto[];
 
-  @ApiProperty({
+  @ApiPropertyOptional({
     description:
-      'The date this sale actually happened — approvedAt/packedAt/deliveredAt/completedAt are all reset to this date.',
+      'Only meaningful for orders that are already Completed — the date the sale actually happened; approvedAt/packedAt/deliveredAt/completedAt are all reset to this date. Ignored for orders not yet Completed.',
   })
+  @IsOptional()
   @IsDateString()
-  saleDate: string;
+  saleDate?: string;
 
   @ApiPropertyOptional({ minimum: 0, maximum: 100 })
   @IsOptional()

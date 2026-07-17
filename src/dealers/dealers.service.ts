@@ -2,12 +2,20 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  UnauthorizedException,
 } from '@nestjs/common';
-import { AccountStatus, OrderStatus, Prisma, Role } from '@prisma/client';
+import {
+  AccountStatus,
+  InventoryLogType,
+  OrderStatus,
+  Prisma,
+  Role,
+} from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { MailerService } from '../mailer/mailer.service';
+import { InventoryService } from '../inventory/inventory.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
@@ -24,6 +32,7 @@ export class DealersService {
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
     private mailer: MailerService,
+    private inventoryService: InventoryService,
   ) {}
 
   async create(dto: CreateDealerDto, adminId: string) {
@@ -260,6 +269,109 @@ export class DealersService {
     }
 
     return { message: 'Dealer deleted' };
+  }
+
+  /**
+   * Wipes every transactional record tied to this dealer — orders, invoices,
+   * payments, and sales returns — while keeping the dealer's own profile
+   * (name/username/credit terms) intact. Reverses each order's stock
+   * reservation and each sales return's stock addition via recordMovement,
+   * so product stock ends up exactly where purchases (untouched by this)
+   * left it. Never touches suppliers, purchases, investments, or expenses —
+   * those have no dealerId and this only ever queries/deletes by dealerId.
+   * Requires the admin to re-confirm their own password, since this is
+   * irreversible and has no other safety net (unlike single-order deletion,
+   * it deliberately does not block on existing payments).
+   */
+  async clearDealerData(id: string, adminId: string, password: string) {
+    const admin = await this.prisma.admin.findUnique({
+      where: { id: adminId },
+    });
+    if (!admin) throw new NotFoundException('Admin not found');
+    const passwordValid = await bcrypt.compare(password, admin.password);
+    if (!passwordValid) {
+      throw new UnauthorizedException('Incorrect password');
+    }
+
+    const dealer = await this.prisma.dealer.findUnique({ where: { id } });
+    if (!dealer) throw new NotFoundException('Dealer not found');
+
+    const orders = await this.prisma.order.findMany({
+      where: { dealerId: id },
+      include: {
+        items: true,
+        invoice: { include: { payments: true } },
+        salesReturns: { include: { items: true } },
+      },
+    });
+
+    const summary = {
+      orders: orders.length,
+      invoices: orders.filter((o) => o.invoice).length,
+      payments: orders.reduce(
+        (sum, o) => sum + (o.invoice?.payments.length ?? 0),
+        0,
+      ),
+      salesReturns: orders.reduce((sum, o) => sum + o.salesReturns.length, 0),
+    };
+
+    await this.prisma.$transaction(
+      async (tx) => {
+        for (const order of orders) {
+          for (const salesReturn of order.salesReturns) {
+            for (const item of salesReturn.items) {
+              await this.inventoryService.recordMovement(tx, {
+                productId: item.productId,
+                type: InventoryLogType.ADJUSTMENT,
+                quantityOut: item.quantity,
+                reference: `Reversed for data clear of dealer ${dealer.businessName}`,
+              });
+            }
+            await tx.salesReturnItem.deleteMany({
+              where: { salesReturnId: salesReturn.id },
+            });
+          }
+          if (order.salesReturns.length > 0) {
+            await tx.salesReturn.deleteMany({ where: { orderId: order.id } });
+          }
+
+          if (order.invoice) {
+            await tx.payment.deleteMany({
+              where: { invoiceId: order.invoice.id },
+            });
+
+            for (const item of order.items) {
+              await this.inventoryService.recordMovement(tx, {
+                productId: item.productId,
+                type: InventoryLogType.ADJUSTMENT,
+                quantityIn: item.quantity,
+                reference: `Reversed for data clear of dealer ${dealer.businessName}`,
+              });
+            }
+
+            await tx.invoice.delete({ where: { id: order.invoice.id } });
+          }
+
+          await tx.orderItem.deleteMany({ where: { orderId: order.id } });
+          await tx.order.delete({ where: { id: order.id } });
+        }
+
+        await tx.dealer.update({
+          where: { id },
+          data: { outstandingBalance: 0 },
+        });
+
+        await this.activityLogService.log(tx, {
+          adminId,
+          action: 'CLEARED_DEALER_DATA',
+          targetId: id,
+          details: `Cleared all transactional data for dealer ${dealer.businessName}: ${summary.orders} order(s), ${summary.invoices} invoice(s), ${summary.payments} payment(s), ${summary.salesReturns} sales return(s)`,
+        });
+      },
+      { maxWait: 15000, timeout: 60000 },
+    );
+
+    return { message: 'Dealer data cleared', ...summary };
   }
 
   async setStatus(id: string, status: AccountStatus, adminId: string) {
