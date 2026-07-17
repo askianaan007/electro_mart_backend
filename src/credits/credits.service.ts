@@ -262,15 +262,6 @@ export class CreditsService {
         'Cheque deposit date is required for cheque settlements',
       );
     }
-    if (
-      dto.mode === 'CHEQUE' &&
-      dto.chequeDepositDate &&
-      new Date(dto.chequeDepositDate) < startOfDay(new Date())
-    ) {
-      throw new BadRequestException(
-        'Cheque deposit date cannot be in the past',
-      );
-    }
 
     const { creditBalance } = await this.computeCreditBalance(supplierId);
     const amount = new Prisma.Decimal(dto.amount);
