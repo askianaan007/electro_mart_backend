@@ -234,10 +234,16 @@ export class CreditsService {
       }),
     };
 
+    const sortOrder = query.sortOrder ?? 'desc';
+    const orderBy: Prisma.SupplierPaymentOrderByWithRelationInput[] =
+      query.sortBy === 'chequeDepositDate'
+        ? [{ chequeDepositDate: { sort: sortOrder, nulls: 'last' } }, { paymentDate: 'desc' }]
+        : [{ paymentDate: sortOrder }, { createdAt: 'desc' }];
+
     const [data, total] = await this.prisma.$transaction([
       this.prisma.supplierPayment.findMany({
         where,
-        orderBy: [{ paymentDate: 'desc' }, { createdAt: 'desc' }],
+        orderBy,
         skip: (page - 1) * limit,
         take: limit,
       }),
