@@ -23,6 +23,7 @@ import { UpdateOrderItemsDto } from './dto/update-order-items.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
 import { paginate } from '../common/utils/paginate';
 import {
+  isLatestSequenceNumber,
   nextSequenceNumber,
   releaseSequenceNumberIfLatest,
 } from '../common/utils/sequence';
@@ -47,6 +48,24 @@ const TIMESTAMP_FIELD: Record<
   DELIVERED: 'deliveredAt',
   COMPLETED: 'completedAt',
 };
+
+/**
+ * Takes a date-only value (e.g. a historical sale date entered while
+ * migrating past data) and stamps it with the current time-of-day, so
+ * records backfilled for the same past date still get distinct, sortable
+ * createdAt timestamps instead of all collapsing to midnight.
+ */
+function withCurrentTime(date: Date): Date {
+  const now = new Date();
+  const combined = new Date(date);
+  combined.setUTCHours(
+    now.getUTCHours(),
+    now.getUTCMinutes(),
+    now.getUTCSeconds(),
+    now.getUTCMilliseconds(),
+  );
+  return combined;
+}
 
 @Injectable()
 export class OrdersService {
@@ -131,6 +150,7 @@ export class OrdersService {
       discountDescription: string | null;
       activityAction: string;
       completionDate?: Date;
+      createdAt?: Date;
     },
   ) {
     for (const item of order.items) {
@@ -143,7 +163,7 @@ export class OrdersService {
     }
 
     const invoiceNumber = await nextSequenceNumber(tx, 'invoice', 'INV');
-    const dueDate = new Date();
+    const dueDate = new Date(options.createdAt ?? new Date());
     dueDate.setDate(dueDate.getDate() + INVOICE_DUE_DAYS);
     const grandTotal = order.subtotal.sub(options.discountTotal);
 
@@ -156,6 +176,7 @@ export class OrdersService {
         discountTotal: options.discountTotal,
         grandTotal,
         dueDate,
+        ...(options.createdAt && { createdAt: options.createdAt }),
       },
     });
 
@@ -305,6 +326,13 @@ export class OrdersService {
 
     if (requester.role === Role.ADMIN) {
       const completionDate = dto.saleDate ? new Date(dto.saleDate) : undefined;
+      // Backfilling a historical sale (migrating past data) should not be
+      // stamped with today's date — createdAt follows the chosen sale date,
+      // just with the actual current time-of-day so same-day backfills stay
+      // distinctly ordered.
+      const createdAt = completionDate
+        ? withCurrentTime(completionDate)
+        : undefined;
 
       const { savedOrder } = await this.prisma.$transaction(async (tx) => {
         const orderNumber = await nextSequenceNumber(tx, 'order', 'ORD');
@@ -317,6 +345,7 @@ export class OrdersService {
             totalAmount,
             createdByAdminId: requester.id,
             items: { create: itemsData },
+            ...(createdAt && { createdAt }),
           },
           include: { items: true },
         });
@@ -326,6 +355,7 @@ export class OrdersService {
           discountDescription,
           activityAction: 'ADMIN_CREATED_ORDER',
           completionDate,
+          createdAt,
         });
       }, TRANSACTION_OPTIONS);
 
@@ -917,12 +947,14 @@ export class OrdersService {
     try {
       return await this.prisma.$transaction(async (tx) => {
         if (order.invoice) {
-          const newerInvoice = await tx.invoice.findFirst({
-            where: { createdAt: { gt: order.invoice.createdAt } },
-          });
-          if (newerInvoice) {
+          const isLatestInvoice = await isLatestSequenceNumber(
+            tx,
+            'invoice',
+            order.invoice.invoiceNumber,
+          );
+          if (!isLatestInvoice) {
             throw new BadRequestException(
-              `A newer invoice (${newerInvoice.invoiceNumber}) has already been issued. Only the most recently issued invoice can be deleted, so invoice numbers stay sequential.`,
+              'A newer invoice has already been issued. Only the most recently issued invoice can be deleted, so invoice numbers stay sequential.',
             );
           }
 
