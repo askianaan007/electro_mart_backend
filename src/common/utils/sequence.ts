@@ -39,28 +39,6 @@ export async function isLatestSequenceNumber(
 }
 
 /**
- * Rolls a sequence counter back by one, but only if `sequenceValue` is the
- * number the counter most recently handed out — i.e. this is the newest
- * record in the sequence and reclaiming it can't collide with or
- * un-sequence anything else. Silently no-ops otherwise, so callers can use
- * this as a best-effort "give the number back" without needing to gate
- * deletion on it.
- */
-export async function releaseSequenceNumberIfLatest(
-  tx: TransactionClient,
-  key: string,
-  sequenceValue: string,
-  padding = 5,
-): Promise<boolean> {
-  if (!(await isLatestSequenceNumber(tx, key, sequenceValue, padding))) {
-    return false;
-  }
-
-  await tx.counter.update({ where: { key }, data: { value: { decrement: 1 } } });
-  return true;
-}
-
-/**
  * Realigns a counter with what's actually in the table — for after a bulk
  * clear (e.g. clearing a dealer's data) leaves the counter stuck high with
  * no records left to justify it. Sets the counter to the highest serial

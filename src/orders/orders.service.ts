@@ -25,7 +25,6 @@ import { paginate } from '../common/utils/paginate';
 import {
   isLatestSequenceNumber,
   nextSequenceNumber,
-  releaseSequenceNumberIfLatest,
   resetSequenceCounter,
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
@@ -976,24 +975,34 @@ export class OrdersService {
           }
 
           await tx.invoice.delete({ where: { id: order.invoice.id } });
-          await releaseSequenceNumberIfLatest(
+
+          const remainingInvoices = await tx.invoice.findMany({
+            select: { invoiceNumber: true },
+          });
+          await resetSequenceCounter(
             tx,
             'invoice',
-            order.invoice.invoiceNumber,
+            remainingInvoices.map((i) => i.invoiceNumber),
           );
         }
 
         await tx.orderItem.deleteMany({ where: { orderId: id } });
         await tx.order.delete({ where: { id } });
-        await releaseSequenceNumberIfLatest(tx, 'order', order.orderNumber);
+
+        const remainingOrders = await tx.order.findMany({ select: { orderNumber: true } });
+        await resetSequenceCounter(
+          tx,
+          'order',
+          remainingOrders.map((o) => o.orderNumber),
+        );
 
         await this.activityLogService.log(tx, {
           adminId,
           action: 'DELETED_ORDER',
           targetId: id,
           details: order.invoice
-            ? `Deleted order ${order.orderNumber} and invoice ${order.invoice.invoiceNumber} (number reclaimed), reversed its stock reservation${order.status === OrderStatus.COMPLETED ? ' and dealer balance' : ''}`
-            : `Deleted order ${order.orderNumber}`,
+            ? `Deleted order ${order.orderNumber} and invoice ${order.invoice.invoiceNumber} (counters realigned), reversed its stock reservation${order.status === OrderStatus.COMPLETED ? ' and dealer balance' : ''}`
+            : `Deleted order ${order.orderNumber} (counter realigned)`,
         });
 
         return { message: 'Order deleted' };
