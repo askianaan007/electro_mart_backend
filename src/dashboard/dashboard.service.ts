@@ -114,6 +114,42 @@ export class DashboardService {
   }
 
   /**
+   * All-time totals — the same scope Sales Analysis and Equity use. A sale
+   * recorded by an admin with a backdated sale date (e.g. entering a past
+   * walk-in sale) has a completedAt outside the current calendar month, so
+   * it would otherwise vanish from Net Sales/Profit here while still
+   * counting everywhere else. These headline figures stay all-time so they
+   * always agree with Sales Analysis/Equity; only their *ChangePct badges
+   * (below) compare this month against last.
+   */
+  private async computeAllTimeFinancials() {
+    const [salesAnalysis, salesReturnAgg, purchaseAgg, purchaseReturnAgg] =
+      await Promise.all([
+        this.salesAnalysisService.getSummary({}),
+        this.prisma.salesReturn.aggregate({ _sum: { totalAmount: true } }),
+        this.prisma.purchase.aggregate({ _sum: { totalValue: true } }),
+        this.prisma.purchaseReturn.aggregate({ _sum: { totalAmount: true } }),
+      ]);
+
+    const netSales = toNumber(salesAnalysis.totalSales);
+    const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
+    const grossPurchase = toNumber(purchaseAgg._sum.totalValue);
+    const totalPurchaseReturn = toNumber(purchaseReturnAgg._sum.totalAmount);
+    const netPurchase = grossPurchase - totalPurchaseReturn;
+    const totalExpenses = toNumber(salesAnalysis.totalExpenses);
+    const profit = toNumber(salesAnalysis.netProfit);
+
+    return {
+      netSales,
+      totalSalesReturn,
+      totalPurchaseReturn,
+      netPurchase,
+      totalExpenses,
+      profit,
+    };
+  }
+
+  /**
    * All-time cash-on-hand: investor contributions/withdrawals plus dealer
    * payments collected, minus supplier payments and expenses actually paid
    * out. Cheques on either side only count once they've actually cleared
@@ -154,33 +190,34 @@ export class DashboardService {
     const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
 
-    const [current, previous] = await Promise.all([
+    const [current, previous, allTime] = await Promise.all([
       this.computeMonthlyFinancials(startOfThisMonth, startOfNextMonth),
       this.computeMonthlyFinancials(startOfLastMonth, startOfThisMonth),
+      this.computeAllTimeFinancials(),
     ]);
 
     return {
-      netSales: current.netSales,
+      netSales: allTime.netSales,
       netSalesChangePct: pctChange(current.netSales, previous.netSales),
-      totalSalesReturn: current.totalSalesReturn,
+      totalSalesReturn: allTime.totalSalesReturn,
       totalSalesReturnChangePct: pctChange(
         current.totalSalesReturn,
         previous.totalSalesReturn,
       ),
-      totalPurchaseReturn: current.totalPurchaseReturn,
+      totalPurchaseReturn: allTime.totalPurchaseReturn,
       totalPurchaseReturnChangePct: pctChange(
         current.totalPurchaseReturn,
         previous.totalPurchaseReturn,
       ),
-      netPurchase: current.netPurchase,
+      netPurchase: allTime.netPurchase,
       netPurchaseChangePct: pctChange(
         current.netPurchase,
         previous.netPurchase,
       ),
       netCashFlow: current.netCashFlow,
-      profit: current.profit,
+      profit: allTime.profit,
       profitChangePct: pctChange(current.profit, previous.profit),
-      totalExpenses: current.totalExpenses,
+      totalExpenses: allTime.totalExpenses,
       totalExpensesChangePct: pctChange(
         current.totalExpenses,
         previous.totalExpenses,
