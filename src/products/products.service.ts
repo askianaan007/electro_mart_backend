@@ -182,6 +182,7 @@ export class ProductsService {
     let result: { message: string };
     try {
       result = await this.prisma.$transaction(async (tx) => {
+        await tx.inventoryLog.deleteMany({ where: { productId: id } });
         await tx.product.delete({ where: { id } });
 
         await this.activityLogService.log(tx, {

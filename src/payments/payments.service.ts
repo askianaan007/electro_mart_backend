@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ChequeStatus, Payment, PaymentStatus, Prisma } from '@prisma/client';
+import { ChequeStatus, Payment, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
@@ -12,30 +12,16 @@ import { UpdatePaymentDto } from './dto/update-payment.dto';
 import { QueryPaymentDto } from './dto/query-payment.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import {
+  computeEffectivePaid,
+  computeReturnedAmount,
+  derivePaymentStatus,
+  isEffectivePayment,
+} from '../common/utils/invoice-financials';
 
 type TransactionClient = Prisma.TransactionClient;
 
-const ZERO = new Prisma.Decimal(0);
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-// A cheque marked RETURNED (bounced) never actually paid the invoice — every
-// other state (PENDING, CLEARED, or a non-cheque payment) counts as money
-// the dealer has actually handed over, so it reduces what they owe.
-function isEffective(payment: {
-  mode: string;
-  chequeStatus: ChequeStatus | null;
-}): boolean {
-  return !(payment.mode === 'CHEQUE' && payment.chequeStatus === 'RETURNED');
-}
-
-function computeEffectivePaid(
-  payments: { amount: Prisma.Decimal; mode: string; chequeStatus: ChequeStatus | null }[],
-): Prisma.Decimal {
-  return payments.reduce(
-    (sum, p) => (isEffective(p) ? sum.add(p.amount) : sum),
-    ZERO,
-  );
-}
 
 @Injectable()
 export class PaymentsService {
@@ -65,7 +51,9 @@ export class PaymentsService {
   /**
    * Recomputes an invoice's paymentStatus from its current payment rows —
    * safe to call after any create/edit/delete/status-change since it reads
-   * the post-change state directly rather than applying a delta.
+   * the post-change state directly rather than applying a delta. Compares
+   * against grandTotal minus any returned goods, not the raw grandTotal —
+   * a return lowers what's actually still owed on this invoice.
    */
   private async recomputeInvoicePaymentStatus(
     tx: TransactionClient,
@@ -76,12 +64,10 @@ export class PaymentsService {
     });
     const payments = await tx.payment.findMany({ where: { invoiceId } });
     const effectivePaid = computeEffectivePaid(payments);
+    const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
+    const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
 
-    const paymentStatus = effectivePaid.greaterThanOrEqualTo(invoice.grandTotal)
-      ? PaymentStatus.PAID
-      : effectivePaid.greaterThan(0)
-        ? PaymentStatus.PARTIAL
-        : PaymentStatus.PENDING;
+    const paymentStatus = derivePaymentStatus(effectivePaid, netGrandTotal);
 
     await tx.invoice.update({ where: { id: invoiceId }, data: { paymentStatus } });
     return paymentStatus;
@@ -98,7 +84,9 @@ export class PaymentsService {
 
     const amount = new Prisma.Decimal(dto.amount);
     const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
-    if (alreadyEffectivePaid.add(amount).greaterThan(invoice.grandTotal)) {
+    const returnedAmount = await computeReturnedAmount(this.prisma, invoice.orderId);
+    const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
+    if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
       throw new BadRequestException(
         'Payment amount exceeds the outstanding invoice balance',
       );
@@ -126,12 +114,15 @@ export class PaymentsService {
 
       await this.recomputeInvoicePaymentStatus(tx, invoice.id);
 
+      // Not clamped to zero — a payment recorded while the dealer already
+      // has a return credit correctly pushes their balance further negative
+      // rather than discarding part of that credit.
       const dealer = await tx.dealer.findUniqueOrThrow({
         where: { id: invoice.dealerId },
       });
       await tx.dealer.update({
         where: { id: invoice.dealerId },
-        data: { outstandingBalance: Prisma.Decimal.max(0, dealer.outstandingBalance.sub(amount)) },
+        data: { outstandingBalance: dealer.outstandingBalance.sub(amount) },
       });
 
       await this.activityLogService.log(tx, {
@@ -168,7 +159,9 @@ export class PaymentsService {
     const otherEffectivePaid = computeEffectivePaid(
       payment.invoice.payments.filter((p) => p.id !== id),
     );
-    if (otherEffectivePaid.add(amount).greaterThan(payment.invoice.grandTotal)) {
+    const returnedAmount = await computeReturnedAmount(this.prisma, payment.invoice.orderId);
+    const netGrandTotal = payment.invoice.grandTotal.sub(returnedAmount);
+    if (otherEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
       throw new BadRequestException(
         'Payment amount exceeds the outstanding invoice balance',
       );
@@ -203,7 +196,7 @@ export class PaymentsService {
       const rebalanced = dealer.outstandingBalance.add(payment.amount).sub(amount);
       await tx.dealer.update({
         where: { id: payment.dealerId },
-        data: { outstandingBalance: Prisma.Decimal.max(0, rebalanced) },
+        data: { outstandingBalance: rebalanced },
       });
 
       await this.activityLogService.log(tx, {
@@ -235,7 +228,7 @@ export class PaymentsService {
 
       await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
 
-      if (isEffective(payment)) {
+      if (isEffectivePayment(payment)) {
         const dealer = await tx.dealer.findUniqueOrThrow({
           where: { id: payment.dealerId },
         });
@@ -323,8 +316,8 @@ export class PaymentsService {
 
       // Only the RETURNED <-> (PENDING/CLEARED) boundary changes whether
       // this payment counts against the dealer's balance.
-      const wasEffective = isEffective(payment);
-      const nowEffective = isEffective(updated);
+      const wasEffective = isEffectivePayment(payment);
+      const nowEffective = isEffectivePayment(updated);
       if (wasEffective !== nowEffective) {
         const dealer = await tx.dealer.findUniqueOrThrow({
           where: { id: payment.dealerId },
@@ -332,12 +325,7 @@ export class PaymentsService {
         const delta = nowEffective ? payment.amount.neg() : payment.amount;
         await tx.dealer.update({
           where: { id: payment.dealerId },
-          data: {
-            outstandingBalance: Prisma.Decimal.max(
-              0,
-              dealer.outstandingBalance.add(delta),
-            ),
-          },
+          data: { outstandingBalance: dealer.outstandingBalance.add(delta) },
         });
       }
 

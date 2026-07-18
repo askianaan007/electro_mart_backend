@@ -3,15 +3,25 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InventoryLogType, Prisma } from '@prisma/client';
+import { InventoryLogType, OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { InventoryService } from '../inventory/inventory.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
-import { CreateSalesReturnDto } from './dto/create-sales-return.dto';
+import { CreateSalesReturnDto, SalesReturnItemDto } from './dto/create-sales-return.dto';
+import { UpdateSalesReturnDto } from './dto/update-sales-return.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { paginate } from '../common/utils/paginate';
 import { nextSequenceNumber } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import {
+  computeEffectivePaid,
+  computeReturnedAmount,
+  derivePaymentStatus,
+} from '../common/utils/invoice-financials';
+
+type TransactionClient = Prisma.TransactionClient;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class SalesReturnsService {
@@ -30,47 +40,20 @@ export class SalesReturnsService {
   async create(dto: CreateSalesReturnDto, adminId: string) {
     const order = await this.prisma.order.findUnique({
       where: { id: dto.orderId },
-      include: { items: true },
+      include: { items: true, invoice: { include: { payments: true } } },
     });
     if (!order) throw new NotFoundException('Order not found');
-
-    const alreadyReturned = await this.prisma.salesReturnItem.groupBy({
-      by: ['productId'],
-      where: { salesReturn: { orderId: order.id } },
-      _sum: { quantity: true },
-    });
-    const returnedMap = new Map(
-      alreadyReturned.map((row) => [row.productId, row._sum.quantity ?? 0]),
-    );
-
-    let totalAmount = new Prisma.Decimal(0);
-    const itemsData = dto.items.map((item) => {
-      const orderItem = order.items.find(
-        (oi) => oi.productId === item.productId,
+    if (order.status !== OrderStatus.COMPLETED) {
+      throw new BadRequestException(
+        'Only completed orders can have items returned — the goods must have actually been delivered first',
       );
-      if (!orderItem) {
-        throw new BadRequestException(
-          `Product ${item.productId} was not part of this order`,
-        );
-      }
-      const alreadyReturnedQty = returnedMap.get(item.productId) ?? 0;
-      const remaining = orderItem.quantity - alreadyReturnedQty;
-      if (item.quantity > remaining) {
-        throw new BadRequestException(
-          `Cannot return ${item.quantity} of product ${item.productId}; only ${remaining} remain returnable`,
-        );
-      }
+    }
 
-      const lineTotal = orderItem.unitPrice.mul(item.quantity);
-      totalAmount = totalAmount.add(lineTotal);
-
-      return {
-        productId: item.productId,
-        quantity: item.quantity,
-        unitPrice: orderItem.unitPrice,
-        lineTotal,
-      };
-    });
+    const { itemsData, totalAmount } = await this.computeItemsData(
+      this.prisma,
+      order,
+      dto.items,
+    );
 
     return this.prisma.$transaction(async (tx) => {
       const returnNumber = await nextSequenceNumber(tx, 'salesReturn', 'RTN');
@@ -97,17 +80,31 @@ export class SalesReturnsService {
         });
       }
 
+      // Reduces what the dealer owes for this order. If they'd already paid
+      // in full (or this pushes past what they now owe once the return is
+      // netted in), the balance goes negative — that's store credit, usable
+      // against future orders via the same balance the credit-limit check
+      // already reads. Never clamped to zero: clamping would silently
+      // discard the credit instead of recording it.
       const dealer = await tx.dealer.findUniqueOrThrow({
         where: { id: order.dealerId },
       });
-      const newOutstanding = Prisma.Decimal.max(
-        0,
-        dealer.outstandingBalance.sub(totalAmount),
-      );
       await tx.dealer.update({
         where: { id: order.dealerId },
-        data: { outstandingBalance: newOutstanding },
+        data: { outstandingBalance: dealer.outstandingBalance.sub(totalAmount) },
       });
+
+      if (order.invoice) {
+        const effectivePaid = computeEffectivePaid(order.invoice.payments);
+        const returnedAmount = await computeReturnedAmount(tx, order.id);
+        const netGrandTotal = order.invoice.grandTotal.sub(returnedAmount);
+        await tx.invoice.update({
+          where: { id: order.invoice.id },
+          data: {
+            paymentStatus: derivePaymentStatus(effectivePaid, netGrandTotal),
+          },
+        });
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -117,6 +114,168 @@ export class SalesReturnsService {
       });
 
       return salesReturn;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Reverses the old items' stock and applies the new ones, and rebalances
+   * the dealer's credit by the delta — the "fix a mistaken entry" edit path.
+   * Only allowed within 1 day of the return being recorded, mirroring the
+   * same window payments use for edits/reversals.
+   */
+  async update(id: string, dto: UpdateSalesReturnDto, adminId: string) {
+    const salesReturn = await this.prisma.salesReturn.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        order: { include: { items: true, invoice: { include: { payments: true } } } },
+      },
+    });
+    if (!salesReturn) throw new NotFoundException('Sales return not found');
+    this.assertEditable(salesReturn);
+
+    const order = salesReturn.order;
+    if (order.status !== OrderStatus.COMPLETED) {
+      throw new BadRequestException(
+        'Only completed orders can have items returned — the goods must have actually been delivered first',
+      );
+    }
+
+    const oldItems = salesReturn.items;
+    const oldTotalAmount = salesReturn.totalAmount;
+
+    const { itemsData, totalAmount } = await this.computeItemsData(
+      this.prisma,
+      order,
+      dto.items,
+      id,
+    );
+
+    return this.prisma.$transaction(async (tx) => {
+      for (const item of oldItems) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityOut: item.quantity,
+          reference: salesReturn.id,
+        });
+      }
+      for (const item of itemsData) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityIn: item.quantity,
+          reference: salesReturn.id,
+        });
+      }
+
+      const updated = await tx.salesReturn.update({
+        where: { id },
+        data: {
+          reason: dto.reason,
+          returnDate: new Date(dto.returnDate),
+          totalAmount,
+          items: { deleteMany: {}, create: itemsData },
+        },
+        include: this.include,
+      });
+
+      const dealer = await tx.dealer.findUniqueOrThrow({
+        where: { id: order.dealerId },
+      });
+      await tx.dealer.update({
+        where: { id: order.dealerId },
+        data: {
+          outstandingBalance: dealer.outstandingBalance
+            .add(oldTotalAmount)
+            .sub(totalAmount),
+        },
+      });
+
+      if (order.invoice) {
+        const effectivePaid = computeEffectivePaid(order.invoice.payments);
+        const returnedAmount = await computeReturnedAmount(tx, order.id);
+        const netGrandTotal = order.invoice.grandTotal.sub(returnedAmount);
+        await tx.invoice.update({
+          where: { id: order.invoice.id },
+          data: {
+            paymentStatus: derivePaymentStatus(effectivePaid, netGrandTotal),
+          },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_SALES_RETURN',
+        targetId: id,
+        details: `Updated sales return ${salesReturn.returnNumber} against order ${order.orderNumber}: ${oldTotalAmount.toString()} -> ${totalAmount.toString()}`,
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Fully reverses a mistaken return: removes the restocked units, gives
+   * back the dealer credit it created, and recomputes the invoice's payment
+   * status. Only allowed within 1 day of being recorded.
+   */
+  async remove(id: string, adminId: string) {
+    const salesReturn = await this.prisma.salesReturn.findUnique({
+      where: { id },
+      include: {
+        items: true,
+        order: { include: { invoice: { include: { payments: true } } } },
+      },
+    });
+    if (!salesReturn) throw new NotFoundException('Sales return not found');
+    this.assertEditable(salesReturn);
+
+    const order = salesReturn.order;
+
+    return this.prisma.$transaction(async (tx) => {
+      for (const item of salesReturn.items) {
+        await this.inventoryService.recordMovement(tx, {
+          productId: item.productId,
+          type: InventoryLogType.ADJUSTMENT,
+          quantityOut: item.quantity,
+          reference: salesReturn.id,
+        });
+      }
+
+      await tx.salesReturnItem.deleteMany({ where: { salesReturnId: id } });
+      await tx.salesReturn.delete({ where: { id } });
+
+      const dealer = await tx.dealer.findUniqueOrThrow({
+        where: { id: order.dealerId },
+      });
+      await tx.dealer.update({
+        where: { id: order.dealerId },
+        data: {
+          outstandingBalance: dealer.outstandingBalance.add(salesReturn.totalAmount),
+        },
+      });
+
+      if (order.invoice) {
+        const effectivePaid = computeEffectivePaid(order.invoice.payments);
+        const returnedAmount = await computeReturnedAmount(tx, order.id);
+        const netGrandTotal = order.invoice.grandTotal.sub(returnedAmount);
+        await tx.invoice.update({
+          where: { id: order.invoice.id },
+          data: {
+            paymentStatus: derivePaymentStatus(effectivePaid, netGrandTotal),
+          },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'DELETED_SALES_RETURN',
+        targetId: id,
+        details: `Deleted sales return ${salesReturn.returnNumber} of ${salesReturn.totalAmount.toString()} against order ${order.orderNumber}`,
+      });
+
+      return { message: 'Sales return deleted' };
     }, TRANSACTION_OPTIONS);
   }
 
@@ -142,6 +301,14 @@ export class SalesReturnsService {
     return paginate(data, total, page, limit);
   }
 
+  async findAllForOrder(orderId: string) {
+    return this.prisma.salesReturn.findMany({
+      where: { orderId },
+      include: this.include,
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
   async findOne(id: string) {
     const salesReturn = await this.prisma.salesReturn.findUnique({
       where: { id },
@@ -149,5 +316,73 @@ export class SalesReturnsService {
     });
     if (!salesReturn) throw new NotFoundException('Sales return not found');
     return salesReturn;
+  }
+
+  /**
+   * Validates requested return quantities against what's still returnable
+   * (order quantity minus what other returns already took), and prices the
+   * line items off the order's own unit prices. Shared by create() and
+   * update() — update() passes excludeReturnId so the return being edited
+   * doesn't count against its own remaining allowance.
+   */
+  private async computeItemsData(
+    client: PrismaService | TransactionClient,
+    order: {
+      id: string;
+      items: { productId: string; quantity: number; unitPrice: Prisma.Decimal }[];
+    },
+    dtoItems: SalesReturnItemDto[],
+    excludeReturnId?: string,
+  ) {
+    const alreadyReturned = await client.salesReturnItem.groupBy({
+      by: ['productId'],
+      where: {
+        salesReturn: {
+          orderId: order.id,
+          ...(excludeReturnId ? { id: { not: excludeReturnId } } : {}),
+        },
+      },
+      _sum: { quantity: true },
+    });
+    const returnedMap = new Map(
+      alreadyReturned.map((row) => [row.productId, row._sum.quantity ?? 0]),
+    );
+
+    let totalAmount = new Prisma.Decimal(0);
+    const itemsData = dtoItems.map((item) => {
+      const orderItem = order.items.find((oi) => oi.productId === item.productId);
+      if (!orderItem) {
+        throw new BadRequestException(
+          `Product ${item.productId} was not part of this order`,
+        );
+      }
+      const alreadyReturnedQty = returnedMap.get(item.productId) ?? 0;
+      const remaining = orderItem.quantity - alreadyReturnedQty;
+      if (item.quantity > remaining) {
+        throw new BadRequestException(
+          `Cannot return ${item.quantity} of product ${item.productId}; only ${remaining} remain returnable`,
+        );
+      }
+
+      const lineTotal = orderItem.unitPrice.mul(item.quantity);
+      totalAmount = totalAmount.add(lineTotal);
+
+      return {
+        productId: item.productId,
+        quantity: item.quantity,
+        unitPrice: orderItem.unitPrice,
+        lineTotal,
+      };
+    });
+
+    return { itemsData, totalAmount };
+  }
+
+  private assertEditable(salesReturn: { createdAt: Date }) {
+    if (Date.now() - salesReturn.createdAt.getTime() > DAY_MS) {
+      throw new BadRequestException(
+        'This return can only be edited or deleted within 1 day of being recorded',
+      );
+    }
   }
 }

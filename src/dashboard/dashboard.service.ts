@@ -204,6 +204,7 @@ export class DashboardService {
 
     const [
       todaysSalesAgg,
+      todaysReturnsAgg,
       todaysOrders,
       pendingApprovals,
       outOfStockItems,
@@ -211,6 +212,7 @@ export class DashboardService {
       recentOrders,
       monthlyRevenue,
       topProductsGrouped,
+      returnedQtyGrouped,
       monthlyKpis,
       liquidCash,
       creditsSummary,
@@ -221,6 +223,12 @@ export class DashboardService {
           status: OrderStatus.COMPLETED,
           completedAt: { gte: startOfToday },
         },
+        _sum: { totalAmount: true },
+      }),
+      // Goods returned today net against today's sales — a same-day return
+      // shouldn't still count toward "Today's Sales".
+      this.prisma.salesReturn.aggregate({
+        where: { returnDate: { gte: startOfToday } },
         _sum: { totalAmount: true },
       }),
       this.prisma.order.count({ where: { createdAt: { gte: startOfToday } } }),
@@ -240,12 +248,18 @@ export class DashboardService {
         WHERE status = 'COMPLETED' AND "completedAt" >= ${sixMonthsAgo}
         GROUP BY 1 ORDER BY 1
       `,
+      // Over-fetch by gross quantity, then net against returns and re-rank
+      // below — a product's true top-5 rank can shift once returns count.
       this.prisma.orderItem.groupBy({
         by: ['productId'],
         where: { order: { status: { in: FULFILLMENT_STATUSES } } },
         _sum: { quantity: true },
         orderBy: { _sum: { quantity: 'desc' } },
-        take: 5,
+        take: 20,
+      }),
+      this.prisma.salesReturnItem.groupBy({
+        by: ['productId'],
+        _sum: { quantity: true },
       }),
       this.getMonthlyKpis(),
       this.computeLiquidCash(),
@@ -253,20 +267,34 @@ export class DashboardService {
       this.creditsService.getUpcomingCheques(),
     ]);
 
+    const returnedQtyByProduct = new Map(
+      returnedQtyGrouped.map((row) => [row.productId, row._sum.quantity ?? 0]),
+    );
+    const netTopProducts = topProductsGrouped
+      .map((row) => ({
+        productId: row.productId,
+        quantitySold: (row._sum.quantity ?? 0) - (returnedQtyByProduct.get(row.productId) ?? 0),
+      }))
+      .sort((a, b) => b.quantitySold - a.quantitySold)
+      .slice(0, 5);
+
     const topProductRecords = await this.prisma.product.findMany({
-      where: { id: { in: topProductsGrouped.map((row) => row.productId) } },
+      where: { id: { in: netTopProducts.map((row) => row.productId) } },
       select: { id: true, name: true, productCode: true },
     });
     const topProductById = new Map(
       topProductRecords.map((product) => [product.id, product]),
     );
-    const topProducts = topProductsGrouped.map((row) => ({
+    const topProducts = netTopProducts.map((row) => ({
       product: topProductById.get(row.productId) ?? null,
-      quantitySold: row._sum.quantity ?? 0,
+      quantitySold: row.quantitySold,
     }));
 
+    const todaysSales =
+      Number(todaysSalesAgg._sum.totalAmount ?? 0) - Number(todaysReturnsAgg._sum.totalAmount ?? 0);
+
     return {
-      todaysSales: todaysSalesAgg._sum.totalAmount ?? 0,
+      todaysSales,
       todaysOrders,
       pendingApprovals,
       outOfStockItems,

@@ -7,6 +7,9 @@ import { PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryInvoiceDto } from './dto/query-invoice.dto';
 import { paginate } from '../common/utils/paginate';
+import { computeReturnedAmount } from '../common/utils/invoice-financials';
+
+const ZERO = new Prisma.Decimal(0);
 
 @Injectable()
 export class InvoicesService {
@@ -38,6 +41,33 @@ export class InvoicesService {
       invoice.dueDate !== null &&
       invoice.dueDate < new Date();
     return isPastDue ? { ...invoice, paymentStatus: PaymentStatus.OVERDUE } : invoice;
+  }
+
+  /**
+   * Attaches `returnedAmount`/`netGrandTotal` to each invoice, batched into
+   * one groupBy for the whole page rather than one query per row. A return
+   * lowers what's actually still owed on an invoice without rewriting its
+   * original grandTotal, so this is display-only — paymentStatus is already
+   * derived from the net figure server-side (see invoice-financials.ts).
+   */
+  private async withReturnedAmounts<
+    T extends { orderId: string; grandTotal: Prisma.Decimal },
+  >(invoices: T[]): Promise<(T & { returnedAmount: Prisma.Decimal; netGrandTotal: Prisma.Decimal })[]> {
+    if (invoices.length === 0) return [];
+    const sums = await this.prisma.salesReturn.groupBy({
+      by: ['orderId'],
+      where: { orderId: { in: invoices.map((i) => i.orderId) } },
+      _sum: { totalAmount: true },
+    });
+    const map = new Map(sums.map((s) => [s.orderId, s._sum.totalAmount ?? ZERO]));
+    return invoices.map((invoice) => {
+      const returnedAmount = map.get(invoice.orderId) ?? ZERO;
+      return {
+        ...invoice,
+        returnedAmount,
+        netGrandTotal: invoice.grandTotal.sub(returnedAmount),
+      };
+    });
   }
 
   private buildPaymentStatusWhere(
@@ -92,7 +122,8 @@ export class InvoicesService {
       this.prisma.invoice.count({ where }),
     ]);
 
-    return paginate(data.map((i) => this.withComputedStatus(i)), total, page, limit);
+    const withReturns = await this.withReturnedAmounts(data);
+    return paginate(withReturns.map((i) => this.withComputedStatus(i)), total, page, limit);
   }
 
   async findAllForDealer(dealerId: string, query: QueryInvoiceDto) {
@@ -121,7 +152,8 @@ export class InvoicesService {
       this.prisma.invoice.count({ where }),
     ]);
 
-    return paginate(data.map((i) => this.withComputedStatus(i)), total, page, limit);
+    const withReturns = await this.withReturnedAmounts(data);
+    return paginate(withReturns.map((i) => this.withComputedStatus(i)), total, page, limit);
   }
 
   async findOne(
@@ -136,6 +168,11 @@ export class InvoicesService {
     if (requester.role === 'DEALER' && invoice.dealerId !== requester.id) {
       throw new ForbiddenException('You do not have access to this invoice');
     }
-    return this.withComputedStatus(invoice);
+    const returnedAmount = await computeReturnedAmount(this.prisma, invoice.orderId);
+    return this.withComputedStatus({
+      ...invoice,
+      returnedAmount,
+      netGrandTotal: invoice.grandTotal.sub(returnedAmount),
+    });
   }
 }
