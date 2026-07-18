@@ -13,7 +13,7 @@ async function bootstrap() {
 
   app.use(helmet());
 
-  // Behind a reverse proxy (Render/Railway/etc.), req.ip is the proxy's own
+  // Behind a reverse proxy (Render /Railway/etc.), req.ip is the proxy's own
   // address for every request unless this is set — which would otherwise
   // make the login throttle (@Throttle on auth.controller.ts) either share
   // one bucket across every user, or silently do nothing.
