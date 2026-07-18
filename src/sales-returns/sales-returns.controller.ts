@@ -51,6 +51,15 @@ export class SalesReturnsController {
     return this.salesReturnsService.findAllForOrder(orderId);
   }
 
+  @Post('reset-counter')
+  @ApiOperation({
+    summary:
+      "Realign the return-number counter with what's actually in the table (next return = highest remaining returnNumber + 1, or 1 if none) — for after a bulk data clear left it stuck high",
+  })
+  resetCounter(@CurrentUser('sub') adminId: string) {
+    return this.salesReturnsService.resetSalesReturnCounter(adminId);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get sales return details' })
   findOne(@Param('id') id: string) {

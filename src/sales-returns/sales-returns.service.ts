@@ -11,7 +11,7 @@ import { CreateSalesReturnDto, SalesReturnItemDto } from './dto/create-sales-ret
 import { UpdateSalesReturnDto } from './dto/update-sales-return.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { paginate } from '../common/utils/paginate';
-import { nextSequenceNumber } from '../common/utils/sequence';
+import { nextSequenceNumber, resetSequenceCounter } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import {
   computeEffectivePaid,
@@ -384,5 +384,31 @@ export class SalesReturnsService {
         'This return can only be edited or deleted within 1 day of being recorded',
       );
     }
+  }
+
+  /**
+   * Realigns the return-number counter with what's actually in the table —
+   * for after a bulk clear (e.g. clearing a dealer's data) leaves it stuck
+   * high with no returns left to justify it. Next return issued will be
+   * one past the highest returnNumber still on record, or 1 if there are
+   * none.
+   */
+  async resetSalesReturnCounter(adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const salesReturns = await tx.salesReturn.findMany({ select: { returnNumber: true } });
+      const newValue = await resetSequenceCounter(
+        tx,
+        'salesReturn',
+        salesReturns.map((r) => r.returnNumber),
+      );
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RESET_SALES_RETURN_COUNTER',
+        details: `Reset sales return counter — next return will be RTN-${new Date().getFullYear()}-${String(newValue + 1).padStart(5, '0')}`,
+      });
+
+      return { message: 'Sales return counter reset', nextSerial: newValue + 1 };
+    }, TRANSACTION_OPTIONS);
   }
 }

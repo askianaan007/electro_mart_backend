@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { InvoicesService } from './invoices.service';
@@ -25,6 +25,16 @@ export class InvoicesController {
     return user.role === Role.ADMIN
       ? this.invoicesService.findAllForAdmin(query)
       : this.invoicesService.findAllForDealer(user.sub, query);
+  }
+
+  @Post('reset-counter')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      "Realign the invoice-number counter with what's actually in the table (next invoice = highest remaining invoiceNumber + 1, or 1 if none) — for after a bulk data clear left it stuck high",
+  })
+  resetCounter(@CurrentUser('sub') adminId: string) {
+    return this.invoicesService.resetInvoiceCounter(adminId);
   }
 
   @Get(':id')

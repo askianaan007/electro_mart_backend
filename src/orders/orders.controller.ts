@@ -53,6 +53,16 @@ export class OrdersController {
       : this.ordersService.findAllForDealer(user.sub, query);
   }
 
+  @Post('reset-counter')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      "Realign the order-number counter with what's actually in the table (next order = highest remaining orderNumber + 1, or 1 if none) — for after a bulk data clear left it stuck high",
+  })
+  resetCounter(@CurrentUser('sub') adminId: string) {
+    return this.ordersService.resetOrderCounter(adminId);
+  }
+
   @Get(':id')
   @Roles(Role.ADMIN, Role.DEALER)
   @ApiOperation({ summary: 'Get order details' })

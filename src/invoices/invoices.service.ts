@@ -5,9 +5,12 @@ import {
 } from '@nestjs/common';
 import { PaymentStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ActivityLogService } from '../activity-log/activity-log.service';
 import { QueryInvoiceDto } from './dto/query-invoice.dto';
 import { paginate } from '../common/utils/paginate';
 import { computeReturnedAmount } from '../common/utils/invoice-financials';
+import { resetSequenceCounter } from '../common/utils/sequence';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -24,7 +27,10 @@ export class InvoicesService {
     payments: true,
   } satisfies Prisma.InvoiceInclude;
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private activityLogService: ActivityLogService,
+  ) {}
 
   /**
    * OVERDUE isn't a stored value — an invoice is overdue whenever it's still
@@ -174,5 +180,31 @@ export class InvoicesService {
       returnedAmount,
       netGrandTotal: invoice.grandTotal.sub(returnedAmount),
     });
+  }
+
+  /**
+   * Realigns the invoice-number counter with what's actually in the table —
+   * for after a bulk clear (e.g. clearing a dealer's data) leaves it stuck
+   * high with no invoices left to justify it. Next invoice issued will be
+   * one past the highest invoiceNumber still on record, or 1 if there are
+   * none.
+   */
+  async resetInvoiceCounter(adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const invoices = await tx.invoice.findMany({ select: { invoiceNumber: true } });
+      const newValue = await resetSequenceCounter(
+        tx,
+        'invoice',
+        invoices.map((i) => i.invoiceNumber),
+      );
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RESET_INVOICE_COUNTER',
+        details: `Reset invoice counter — next invoice will be INV-${new Date().getFullYear()}-${String(newValue + 1).padStart(5, '0')}`,
+      });
+
+      return { message: 'Invoice counter reset', nextSerial: newValue + 1 };
+    }, TRANSACTION_OPTIONS);
   }
 }

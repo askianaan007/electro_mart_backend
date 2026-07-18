@@ -26,6 +26,7 @@ import {
   isLatestSequenceNumber,
   nextSequenceNumber,
   releaseSequenceNumberIfLatest,
+  resetSequenceCounter,
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
@@ -1005,5 +1006,31 @@ export class OrdersService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Realigns the order-number counter with what's actually in the table —
+   * for after a bulk clear (e.g. clearing a dealer's data) leaves it stuck
+   * high with no orders left to justify it. Next order issued will be one
+   * past the highest orderNumber still on record, or ORD-<year>-00001 if
+   * there are none.
+   */
+  async resetOrderCounter(adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const orders = await tx.order.findMany({ select: { orderNumber: true } });
+      const newValue = await resetSequenceCounter(
+        tx,
+        'order',
+        orders.map((o) => o.orderNumber),
+      );
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RESET_ORDER_COUNTER',
+        details: `Reset order counter — next order will be ORD-${new Date().getFullYear()}-${String(newValue + 1).padStart(5, '0')}`,
+      });
+
+      return { message: 'Order counter reset', nextSerial: newValue + 1 };
+    }, TRANSACTION_OPTIONS);
   }
 }

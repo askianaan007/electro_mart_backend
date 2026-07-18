@@ -59,3 +59,31 @@ export async function releaseSequenceNumberIfLatest(
   await tx.counter.update({ where: { key }, data: { value: { decrement: 1 } } });
   return true;
 }
+
+/**
+ * Realigns a counter with what's actually in the table — for after a bulk
+ * clear (e.g. clearing a dealer's data) leaves the counter stuck high with
+ * no records left to justify it. Sets the counter to the highest serial
+ * found among `sequenceValues`, or 0 if there are none, so the next
+ * `nextSequenceNumber` call issues exactly one past the current max —
+ * never colliding with an existing number, never skipping unnecessarily.
+ */
+export async function resetSequenceCounter(
+  tx: TransactionClient,
+  key: string,
+  sequenceValues: string[],
+): Promise<number> {
+  const maxSerial = sequenceValues.reduce((max, value) => {
+    const match = value.match(/-(\d+)$/);
+    const parsed = match ? parseInt(match[1], 10) : 0;
+    return Math.max(max, parsed);
+  }, 0);
+
+  await tx.counter.upsert({
+    where: { key },
+    create: { key, value: maxSerial },
+    update: { value: maxSerial },
+  });
+
+  return maxSerial;
+}
