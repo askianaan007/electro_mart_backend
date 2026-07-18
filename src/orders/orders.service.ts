@@ -80,6 +80,7 @@ export class OrdersService {
     items: { include: { product: true } },
     dealer: { omit: { password: true } },
     invoice: true,
+    salesReturns: { select: { totalAmount: true } },
   } satisfies Prisma.OrderInclude;
 
   private async buildItemsAndSubtotal(
@@ -118,10 +119,44 @@ export class OrdersService {
         quantity: item.quantity,
         unitPrice: product.wholesalePrice,
         lineTotal,
+        // Placeholder until the order's discount is finalized (see
+        // allocateItemDiscounts) — no discount is known yet at this point
+        // for a dealer-submitted order still awaiting approval.
+        allocatedDiscount: new Prisma.Decimal(0),
+        netLineTotal: lineTotal,
+        netUnitPrice: product.wholesalePrice,
       };
     });
 
     return { itemsData, subtotal };
+  }
+
+  /**
+   * Distributes an order's total discount across its items proportionally
+   * by each line's share of the subtotal, and derives the net (post-discount)
+   * unit price a returned unit is actually refunded from. Called once,
+   * whenever an order's discount is finalized (order creation/approval, or a
+   * full edit) — per the "store it, never recompute" rule sales returns rely
+   * on. Rounds each line to 2 decimal places independently, matching how the
+   * discount itself is entered.
+   */
+  private allocateItemDiscounts<
+    T extends { lineTotal: Prisma.Decimal; quantity: number },
+  >(items: T[], subtotal: Prisma.Decimal, discountTotal: Prisma.Decimal) {
+    const ratio =
+      subtotal.isZero() || discountTotal.isZero()
+        ? new Prisma.Decimal(0)
+        : discountTotal.div(subtotal);
+
+    return items.map((item) => {
+      const allocatedDiscount = item.lineTotal.mul(ratio).toDecimalPlaces(2);
+      const netLineTotal = item.lineTotal.sub(allocatedDiscount);
+      const netUnitPrice =
+        item.quantity > 0
+          ? netLineTotal.div(item.quantity).toDecimalPlaces(2)
+          : netLineTotal;
+      return { ...item, allocatedDiscount, netLineTotal, netUnitPrice };
+    });
   }
 
   /**
@@ -142,7 +177,12 @@ export class OrdersService {
       orderNumber: string;
       dealerId: string;
       subtotal: Prisma.Decimal;
-      items: { productId: string; quantity: number }[];
+      items: {
+        id: string;
+        productId: string;
+        quantity: number;
+        lineTotal: Prisma.Decimal;
+      }[];
     },
     adminId: string,
     options: {
@@ -159,6 +199,25 @@ export class OrdersService {
         type: InventoryLogType.RESERVE,
         quantityOut: item.quantity,
         reference: order.id,
+      });
+    }
+
+    // The discount is only known now — allocate each item's share and
+    // persist it, since sales returns will refund from these stored figures
+    // rather than ever recomputing them.
+    const allocatedItems = this.allocateItemDiscounts(
+      order.items,
+      order.subtotal,
+      options.discountTotal,
+    );
+    for (const item of allocatedItems) {
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: {
+          allocatedDiscount: item.allocatedDiscount,
+          netLineTotal: item.netLineTotal,
+          netUnitPrice: item.netUnitPrice,
+        },
       });
     }
 
@@ -543,6 +602,11 @@ export class OrdersService {
         dto,
       );
       const grandTotal = subtotal.sub(discountTotal);
+      const allocatedItemsData = this.allocateItemDiscounts(
+        itemsData,
+        subtotal,
+        discountTotal,
+      );
 
       const dealerForCheck = await tx.dealer.findUniqueOrThrow({
         where: { id: dto.dealerId },
@@ -592,7 +656,7 @@ export class OrdersService {
           subtotal,
           discount: discountTotal,
           totalAmount: grandTotal,
-          items: { create: itemsData },
+          items: { create: allocatedItemsData },
           ...(saleDate && {
             approvedAt: saleDate,
             packedAt: saleDate,

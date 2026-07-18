@@ -517,6 +517,12 @@ async function main() {
       return { productId: product.id, quantity: item.qty, unitPrice: item.price, sheetTotal: item.sheetTotal };
     });
     const { subtotal, totalAmount, discount } = orderTotals(g);
+    // Same proportional-by-lineTotal-share allocation the app uses when an
+    // order is finalized — historical imported orders get real net figures
+    // too, instead of defaulting to gross (see allocateItemDiscounts in
+    // orders.service.ts).
+    const discountRatio = subtotal > 0 ? discount / subtotal : 0;
+    const round2 = (n: number) => Math.round(n * 100) / 100;
 
     const result = await prisma.$transaction(async (tx) => {
       const orderNumber = await nextSeq(tx, 'order', 'ORD', year);
@@ -535,12 +541,21 @@ async function main() {
           completedAt: new Date(g.date),
           createdAt: new Date(g.date),
           items: {
-            create: items.map((i) => ({
-              productId: i.productId,
-              quantity: i.quantity,
-              unitPrice: i.unitPrice,
-              lineTotal: i.quantity * i.unitPrice,
-            })),
+            create: items.map((i) => {
+              const lineTotal = i.quantity * i.unitPrice;
+              const allocatedDiscount = round2(lineTotal * discountRatio);
+              const netLineTotal = lineTotal - allocatedDiscount;
+              const netUnitPrice = i.quantity > 0 ? round2(netLineTotal / i.quantity) : netLineTotal;
+              return {
+                productId: i.productId,
+                quantity: i.quantity,
+                unitPrice: i.unitPrice,
+                lineTotal,
+                allocatedDiscount,
+                netLineTotal,
+                netUnitPrice,
+              };
+            }),
           },
         },
         include: { items: true },

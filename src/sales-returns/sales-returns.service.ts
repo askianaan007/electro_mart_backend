@@ -321,15 +321,25 @@ export class SalesReturnsService {
   /**
    * Validates requested return quantities against what's still returnable
    * (order quantity minus what other returns already took), and prices the
-   * line items off the order's own unit prices. Shared by create() and
-   * update() — update() passes excludeReturnId so the return being edited
-   * doesn't count against its own remaining allowance.
+   * refund off the order item's stored netUnitPrice — never the original
+   * unitPrice. A discounted sale means the customer never actually paid
+   * unitPrice for these units, so refunding it would hand back more than
+   * they paid; netUnitPrice already has this order's discount allocated
+   * into it (see OrdersService.allocateItemDiscounts) and is never
+   * recomputed here. Shared by create() and update() — update() passes
+   * excludeReturnId so the return being edited doesn't count against its
+   * own remaining allowance.
    */
   private async computeItemsData(
     client: PrismaService | TransactionClient,
     order: {
       id: string;
-      items: { productId: string; quantity: number; unitPrice: Prisma.Decimal }[];
+      items: {
+        productId: string;
+        quantity: number;
+        unitPrice: Prisma.Decimal;
+        netUnitPrice: Prisma.Decimal;
+      }[];
     },
     dtoItems: SalesReturnItemDto[],
     excludeReturnId?: string,
@@ -364,13 +374,16 @@ export class SalesReturnsService {
         );
       }
 
-      const lineTotal = orderItem.unitPrice.mul(item.quantity);
+      const perUnitDiscount = orderItem.unitPrice.sub(orderItem.netUnitPrice);
+      const allocatedDiscount = perUnitDiscount.mul(item.quantity);
+      const lineTotal = orderItem.netUnitPrice.mul(item.quantity);
       totalAmount = totalAmount.add(lineTotal);
 
       return {
         productId: item.productId,
         quantity: item.quantity,
         unitPrice: orderItem.unitPrice,
+        allocatedDiscount,
         lineTotal,
       };
     });

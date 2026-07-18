@@ -284,6 +284,14 @@ model OrderItem {
   unitPrice Decimal
   lineTotal Decimal
 
+  // This line's share of the order's total discount, allocated proportionally
+  // by lineTotal share once the order is finalized (approved/completed) —
+  // never recomputed after. Returns always refund from netUnitPrice, since
+  // the customer never actually paid the pre-discount unitPrice.
+  allocatedDiscount Decimal @default(0)
+  netLineTotal      Decimal
+  netUnitPrice      Decimal
+
   @@index([orderId])
   @@index([productId])
 }
@@ -414,7 +422,13 @@ model SalesReturnItem {
   productId     String
   product       Product     @relation(fields: [productId], references: [id])
   quantity      Int
+  // The order item's original (pre-discount) unit price — kept for display
+  // only. lineTotal (the actual refund) is always computed from the order
+  // item's netUnitPrice, never from this.
   unitPrice     Decimal
+  // This return line's share of the discount the customer already received
+  // on these units — informational, mirrors OrderItem.allocatedDiscount.
+  allocatedDiscount Decimal @default(0)
   lineTotal     Decimal
 
   @@index([salesReturnId])
