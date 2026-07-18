@@ -29,8 +29,16 @@ const FULFILLMENT_STATUSES: OrderStatus[] = [
   OrderStatus.COMPLETED,
 ];
 
-function pctChange(curr: number, prev: number): number {
-  if (prev === 0) return curr === 0 ? 0 : 100;
+// A percentage-change ratio only means something when the previous period
+// was non-negative and the two periods share the same sign — e.g.
+// pctChange(500, -1000) would naively compute -150%, reading as "profit
+// down 150%" in a month that actually swung from a 1000 loss to a 500
+// profit. Returns null (frontend renders "N/A") for any base/sign
+// combination where the ratio wouldn't be a meaningful comparison.
+function pctChange(curr: number, prev: number): number | null {
+  if (prev < 0) return null;
+  if (prev === 0) return curr > 0 ? 100 : curr === 0 ? 0 : null;
+  if (curr < 0) return null;
   return ((curr - prev) / prev) * 100;
 }
 
@@ -45,6 +53,41 @@ export class DashboardService {
     private creditsService: CreditsService,
     private salesAnalysisService: SalesAnalysisService,
   ) {}
+
+  /**
+   * The five headline financial figures shared by computeMonthlyFinancials
+   * and computeAllTimeFinancials — factored out so the two can never drift
+   * into slightly different formulas for the same numbers (which is exactly
+   * the class of bug a prior fix addressed for dashboard/sales-analysis
+   * agreement).
+   */
+  private deriveFinancials(
+    salesAnalysis: {
+      totalSales: Prisma.Decimal;
+      totalExpenses: Prisma.Decimal;
+      netProfit: Prisma.Decimal;
+    },
+    salesReturnTotal: Prisma.Decimal | null,
+    purchaseTotal: Prisma.Decimal | null,
+    purchaseReturnTotal: Prisma.Decimal | null,
+  ) {
+    const netSales = toNumber(salesAnalysis.totalSales);
+    const totalSalesReturn = toNumber(salesReturnTotal);
+    const grossPurchase = toNumber(purchaseTotal);
+    const totalPurchaseReturn = toNumber(purchaseReturnTotal);
+    const netPurchase = grossPurchase - totalPurchaseReturn;
+    const totalExpenses = toNumber(salesAnalysis.totalExpenses);
+    const profit = toNumber(salesAnalysis.netProfit);
+
+    return {
+      netSales,
+      totalSalesReturn,
+      totalPurchaseReturn,
+      netPurchase,
+      totalExpenses,
+      profit,
+    };
+  }
 
   private async computeMonthlyFinancials(rangeStart: Date, rangeEnd: Date) {
     const [
@@ -89,28 +132,18 @@ export class DashboardService {
       }),
     ]);
 
-    const netSales = toNumber(salesAnalysis.totalSales);
-    const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
-    const grossPurchase = toNumber(purchaseAgg._sum.totalValue);
-    const totalPurchaseReturn = toNumber(purchaseReturnAgg._sum.totalAmount);
-    const netPurchase = grossPurchase - totalPurchaseReturn;
-    const totalExpenses = toNumber(salesAnalysis.totalExpenses);
+    const shared = this.deriveFinancials(
+      salesAnalysis,
+      salesReturnAgg._sum.totalAmount,
+      purchaseAgg._sum.totalValue,
+      purchaseReturnAgg._sum.totalAmount,
+    );
     const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
     const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
+    const netCashFlow =
+      invoiceDuePayments - supplierPayments - shared.totalExpenses;
 
-    const netCashFlow = invoiceDuePayments - supplierPayments - totalExpenses;
-    const profit = toNumber(salesAnalysis.netProfit);
-
-    return {
-      netSales,
-      totalSalesReturn,
-      totalPurchaseReturn,
-      netPurchase,
-      totalExpenses,
-      invoiceDuePayments,
-      netCashFlow,
-      profit,
-    };
+    return { ...shared, invoiceDuePayments, netCashFlow };
   }
 
   /**
@@ -131,22 +164,12 @@ export class DashboardService {
         this.prisma.purchaseReturn.aggregate({ _sum: { totalAmount: true } }),
       ]);
 
-    const netSales = toNumber(salesAnalysis.totalSales);
-    const totalSalesReturn = toNumber(salesReturnAgg._sum.totalAmount);
-    const grossPurchase = toNumber(purchaseAgg._sum.totalValue);
-    const totalPurchaseReturn = toNumber(purchaseReturnAgg._sum.totalAmount);
-    const netPurchase = grossPurchase - totalPurchaseReturn;
-    const totalExpenses = toNumber(salesAnalysis.totalExpenses);
-    const profit = toNumber(salesAnalysis.netProfit);
-
-    return {
-      netSales,
-      totalSalesReturn,
-      totalPurchaseReturn,
-      netPurchase,
-      totalExpenses,
-      profit,
-    };
+    return this.deriveFinancials(
+      salesAnalysis,
+      salesReturnAgg._sum.totalAmount,
+      purchaseAgg._sum.totalValue,
+      purchaseReturnAgg._sum.totalAmount,
+    );
   }
 
   /**
@@ -250,7 +273,11 @@ export class DashboardService {
     const earliestCompletedAt = earliestCompleted._min.completedAt;
     const revenueChartStart =
       earliestCompletedAt && earliestCompletedAt < sixMonthsAgo
-        ? new Date(earliestCompletedAt.getFullYear(), earliestCompletedAt.getMonth(), 1)
+        ? new Date(
+            earliestCompletedAt.getFullYear(),
+            earliestCompletedAt.getMonth(),
+            1,
+          )
         : sixMonthsAgo;
 
     const [
@@ -324,7 +351,9 @@ export class DashboardService {
     const netTopProducts = topProductsGrouped
       .map((row) => ({
         productId: row.productId,
-        quantitySold: (row._sum.quantity ?? 0) - (returnedQtyByProduct.get(row.productId) ?? 0),
+        quantitySold:
+          (row._sum.quantity ?? 0) -
+          (returnedQtyByProduct.get(row.productId) ?? 0),
       }))
       .sort((a, b) => b.quantitySold - a.quantitySold)
       .slice(0, 5);
@@ -342,7 +371,8 @@ export class DashboardService {
     }));
 
     const todaysSales =
-      Number(todaysSalesAgg._sum.totalAmount ?? 0) - Number(todaysReturnsAgg._sum.totalAmount ?? 0);
+      Number(todaysSalesAgg._sum.totalAmount ?? 0) -
+      Number(todaysReturnsAgg._sum.totalAmount ?? 0);
 
     return {
       todaysSales,

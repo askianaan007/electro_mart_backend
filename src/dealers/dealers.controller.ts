@@ -10,12 +10,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { AccountStatus, Role } from '@prisma/client';
+import { Role } from '@prisma/client';
 import { DealersService } from './dealers.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
 import { ClearDealerDataDto } from './dto/clear-dealer-data.dto';
+import { SetStatusDto } from '../common/dto/set-status.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -69,7 +70,8 @@ export class DealersController {
 
   @Delete(':id')
   @ApiOperation({
-    summary: 'Delete a dealer account (only if it has no orders or related records)',
+    summary:
+      'Delete a dealer account (only if it has no orders or related records)',
   })
   remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
     return this.dealersService.remove(id, adminId);
@@ -92,9 +94,9 @@ export class DealersController {
   @ApiOperation({ summary: 'Activate or deactivate a dealer account' })
   setStatus(
     @Param('id') id: string,
-    @Body('status') status: AccountStatus,
+    @Body() dto: SetStatusDto,
     @CurrentUser('sub') adminId: string,
   ) {
-    return this.dealersService.setStatus(id, status, adminId);
+    return this.dealersService.setStatus(id, dto.status, adminId);
   }
 }

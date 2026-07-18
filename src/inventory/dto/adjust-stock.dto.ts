@@ -1,8 +1,8 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiProperty } from '@nestjs/swagger';
 import {
   IsIn,
   IsInt,
-  IsOptional,
+  IsNotEmpty,
   IsString,
   IsUUID,
   Min,
@@ -22,8 +22,11 @@ export class AdjustStockDto {
   @Min(1)
   quantity: number;
 
-  @ApiPropertyOptional()
-  @IsOptional()
+  @ApiProperty({
+    description:
+      'Why this manual correction is being made — required for the audit trail.',
+  })
   @IsString()
-  reason?: string;
+  @IsNotEmpty()
+  reason: string;
 }

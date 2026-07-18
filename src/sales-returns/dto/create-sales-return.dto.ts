@@ -4,7 +4,8 @@ import {
   ArrayMinSize,
   IsArray,
   IsDateString,
-  IsNumber,
+  IsInt,
+  IsNotEmpty,
   IsString,
   IsUUID,
   Min,
@@ -17,7 +18,7 @@ export class SalesReturnItemDto {
   productId: string;
 
   @ApiProperty({ minimum: 1 })
-  @IsNumber()
+  @IsInt()
   @Min(1)
   quantity: number;
 }
@@ -29,6 +30,7 @@ export class CreateSalesReturnDto {
 
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   reason: string;
 
   @ApiProperty()

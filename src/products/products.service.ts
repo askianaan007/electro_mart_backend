@@ -4,11 +4,11 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InventoryLogType, Prisma } from '@prisma/client';
+import { AccountStatus, InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { InventoryService } from '../inventory/inventory.service';
-import { UploadsService } from '../uploads/uploads.service';
+import { UploadedImage, UploadsService } from '../uploads/uploads.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
@@ -155,7 +155,7 @@ export class ProductsService {
     return withStockFlag(product);
   }
 
-  async setStatus(id: string, status: 'ACTIVE' | 'INACTIVE', adminId: string) {
+  async setStatus(id: string, status: AccountStatus, adminId: string) {
     await this.findOne(id);
 
     const product = await this.prisma.$transaction(async (tx) => {
@@ -204,17 +204,15 @@ export class ProductsService {
     }
 
     await Promise.all(
-      product.images.map((image) => this.uploadsService.deleteImage(image.publicId)),
+      product.images.map((image) =>
+        this.uploadsService.deleteImage(image.publicId),
+      ),
     );
 
     return result;
   }
 
-  async addImages(
-    id: string,
-    files: Express.Multer.File[],
-    adminId: string,
-  ) {
+  async addImages(id: string, files: Express.Multer.File[], adminId: string) {
     const product = await this.prisma.product.findUnique({
       where: { id },
       include: this.imagesInclude,
@@ -229,43 +227,75 @@ export class ProductsService {
       );
     }
 
-    const uploaded = await Promise.all(
+    const results = await Promise.allSettled(
       files.map((file) =>
         this.uploadsService.uploadImage(file.buffer, 'products'),
       ),
     );
+    const uploaded = results
+      .filter(
+        (r): r is PromiseFulfilledResult<UploadedImage> =>
+          r.status === 'fulfilled',
+      )
+      .map((r) => r.value);
+    const failedCount = results.length - uploaded.length;
 
-    const startOrder = product.images.length;
-    return this.prisma.$transaction(async (tx) => {
-      const created = await Promise.all(
-        uploaded.map((image, index) =>
-          tx.productImage.create({
-            data: {
-              productId: id,
-              url: image.url,
-              publicId: image.publicId,
-              sortOrder: startOrder + index,
-            },
-          }),
+    if (failedCount > 0) {
+      // Don't leave the sibling uploads that DID succeed orphaned in
+      // Cloudinary with no corresponding DB row and no way to find them
+      // again — an all-or-nothing batch is much easier to reason about.
+      await Promise.all(
+        uploaded.map((image) =>
+          this.uploadsService.deleteImage(image.publicId),
         ),
       );
+      throw new BadRequestException(
+        `Failed to upload ${failedCount} of ${files.length} image(s) — none were saved`,
+      );
+    }
 
-      if (!product.imageUrl) {
-        await tx.product.update({
-          where: { id },
-          data: { imageUrl: uploaded[0].url },
+    const startOrder = product.images.length;
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const created = await Promise.all(
+          uploaded.map((image, index) =>
+            tx.productImage.create({
+              data: {
+                productId: id,
+                url: image.url,
+                publicId: image.publicId,
+                sortOrder: startOrder + index,
+              },
+            }),
+          ),
+        );
+
+        if (!product.imageUrl) {
+          await tx.product.update({
+            where: { id },
+            data: { imageUrl: uploaded[0].url },
+          });
+        }
+
+        await this.activityLogService.log(tx, {
+          adminId,
+          action: 'ADDED_PRODUCT_IMAGES',
+          targetId: id,
+          details: `Added ${files.length} image(s) to product ${product.name}`,
         });
-      }
 
-      await this.activityLogService.log(tx, {
-        adminId,
-        action: 'ADDED_PRODUCT_IMAGES',
-        targetId: id,
-        details: `Added ${files.length} image(s) to product ${product.name}`,
-      });
-
-      return created;
-    }, TRANSACTION_OPTIONS);
+        return created;
+      }, TRANSACTION_OPTIONS);
+    } catch (error) {
+      // The uploads succeeded but the DB write didn't — same orphan risk
+      // as above, so clean them up here too before propagating the error.
+      await Promise.all(
+        uploaded.map((image) =>
+          this.uploadsService.deleteImage(image.publicId),
+        ),
+      );
+      throw error;
+    }
   }
 
   async removeImage(id: string, imageId: string, adminId: string) {

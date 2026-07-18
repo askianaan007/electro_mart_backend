@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Request, Response } from 'express';
+import { MulterError } from 'multer';
 import { isForeignKeyViolation } from '../utils/prisma-errors';
 
 interface ErrorBody {
@@ -22,6 +23,7 @@ const REASON_PHRASE: Partial<Record<HttpStatus, string>> = {
   [HttpStatus.FORBIDDEN]: 'Forbidden',
   [HttpStatus.NOT_FOUND]: 'Not Found',
   [HttpStatus.CONFLICT]: 'Conflict',
+  [HttpStatus.PAYLOAD_TOO_LARGE]: 'Payload Too Large',
   [HttpStatus.UNPROCESSABLE_ENTITY]: 'Unprocessable Entity',
   [HttpStatus.INTERNAL_SERVER_ERROR]: 'Internal Server Error',
 };
@@ -81,6 +83,21 @@ function fromPrismaError(
   }
 }
 
+function fromMulterError(exception: MulterError): ErrorBody {
+  if (exception.code === 'LIMIT_FILE_SIZE') {
+    return {
+      status: HttpStatus.PAYLOAD_TOO_LARGE,
+      error: reasonPhrase(HttpStatus.PAYLOAD_TOO_LARGE),
+      message: 'File is too large',
+    };
+  }
+  return {
+    status: HttpStatus.BAD_REQUEST,
+    error: reasonPhrase(HttpStatus.BAD_REQUEST),
+    message: exception.message,
+  };
+}
+
 function fromUnknownPrismaError(
   exception: Prisma.PrismaClientUnknownRequestError,
 ): ErrorBody {
@@ -115,6 +132,18 @@ export class HttpExceptionFilter implements ExceptionFilter {
       body = fromPrismaError(exception);
     } else if (exception instanceof Prisma.PrismaClientUnknownRequestError) {
       body = fromUnknownPrismaError(exception);
+    } else if (exception instanceof Prisma.PrismaClientValidationError) {
+      // A malformed value reached the ORM layer (e.g. an unvalidated raw
+      // @Body() extraction bypassing the DTO pipeline) — this is a client
+      // input problem, not a server fault, so it should map to 400 rather
+      // than falling through to the generic 500 below.
+      body = {
+        status: HttpStatus.BAD_REQUEST,
+        error: reasonPhrase(HttpStatus.BAD_REQUEST),
+        message: 'Invalid request data',
+      };
+    } else if (exception instanceof MulterError) {
+      body = fromMulterError(exception);
     } else {
       body = {
         status: HttpStatus.INTERNAL_SERVER_ERROR,

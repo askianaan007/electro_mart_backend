@@ -8,9 +8,9 @@ import {
   IsString,
   ValidateNested,
 } from 'class-validator';
-import { SalesReturnItemDto } from './create-sales-return.dto';
+import { PurchaseReturnItemDto } from './create-purchase-return.dto';
 
-export class UpdateSalesReturnDto {
+export class UpdatePurchaseReturnDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
@@ -20,10 +20,10 @@ export class UpdateSalesReturnDto {
   @IsDateString()
   returnDate: string;
 
-  @ApiProperty({ type: [SalesReturnItemDto] })
+  @ApiProperty({ type: [PurchaseReturnItemDto] })
   @IsArray()
   @ArrayMinSize(1)
   @ValidateNested({ each: true })
-  @Type(() => SalesReturnItemDto)
-  items: SalesReturnItemDto[];
+  @Type(() => PurchaseReturnItemDto)
+  items: PurchaseReturnItemDto[];
 }

@@ -55,8 +55,13 @@ export class CreditsController {
   }
 
   @Get(':supplierId/settlements')
-  @ApiOperation({ summary: 'Paginated, filterable settlement history for a supplier' })
-  getSettlements(@Param('supplierId') supplierId: string, @Query() query: QuerySettlementsDto) {
+  @ApiOperation({
+    summary: 'Paginated, filterable settlement history for a supplier',
+  })
+  getSettlements(
+    @Param('supplierId') supplierId: string,
+    @Query() query: QuerySettlementsDto,
+  ) {
     return this.creditsService.getSettlements(supplierId, query);
   }
 

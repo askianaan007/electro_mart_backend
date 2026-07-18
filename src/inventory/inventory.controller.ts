@@ -43,7 +43,10 @@ export class InventoryController {
 
   @Post('adjustment')
   @ApiOperation({ summary: 'Manually adjust stock for a product' })
-  adjustStock(@Body() dto: AdjustStockDto, @CurrentUser('sub') adminId: string) {
+  adjustStock(
+    @Body() dto: AdjustStockDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
     return this.inventoryService.adjustStock(dto, adminId);
   }
 }

@@ -3,6 +3,7 @@ import { AccountStatus } from '@prisma/client';
 import {
   IsEnum,
   IsInt,
+  IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
@@ -12,20 +13,24 @@ import {
 export class CreateProductDto {
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   productCode: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @IsNotEmpty()
   sku?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @IsNotEmpty()
   barcode?: string;
 
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   name: string;
 
   @ApiPropertyOptional()

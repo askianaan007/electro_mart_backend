@@ -13,6 +13,7 @@ import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { QueryCreditsDto } from './dto/query-credits.dto';
 import { QuerySettlementsDto } from './dto/query-settlements.dto';
 import { paginate } from '../common/utils/paginate';
+import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 
 const ZERO = new Prisma.Decimal(0);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -48,22 +49,25 @@ export class CreditsService {
     private mailer: MailerService,
   ) {}
 
-  private async computeCreditBalance(supplierId: string) {
+  private async computeCreditBalance(
+    supplierId: string,
+    client: PrismaService | Prisma.TransactionClient = this.prisma,
+  ) {
     const [purchaseAgg, transportAgg, returnAgg, paymentAgg] =
       await Promise.all([
-        this.prisma.purchase.aggregate({
+        client.purchase.aggregate({
           where: { supplierId },
           _sum: { totalValue: true },
         }),
-        this.prisma.purchase.aggregate({
+        client.purchase.aggregate({
           where: { supplierId },
           _sum: { transportCharges: true },
         }),
-        this.prisma.purchaseReturn.aggregate({
+        client.purchaseReturn.aggregate({
           where: { supplierId },
           _sum: { totalAmount: true },
         }),
-        this.prisma.supplierPayment.aggregate({
+        client.supplierPayment.aggregate({
           where: { supplierId, ...EFFECTIVE_PAYMENT_FILTER },
           _sum: { amount: true },
         }),
@@ -237,7 +241,10 @@ export class CreditsService {
     const sortOrder = query.sortOrder ?? 'desc';
     const orderBy: Prisma.SupplierPaymentOrderByWithRelationInput[] =
       query.sortBy === 'chequeDepositDate'
-        ? [{ chequeDepositDate: { sort: sortOrder, nulls: 'last' } }, { paymentDate: 'desc' }]
+        ? [
+            { chequeDepositDate: { sort: sortOrder, nulls: 'last' } },
+            { paymentDate: 'desc' },
+          ]
         : [{ paymentDate: sortOrder }, { createdAt: 'desc' }];
 
     const [data, total] = await this.prisma.$transaction([
@@ -269,15 +276,21 @@ export class CreditsService {
       );
     }
 
-    const { creditBalance } = await this.computeCreditBalance(supplierId);
     const amount = new Prisma.Decimal(dto.amount);
-    if (amount.greaterThan(creditBalance)) {
-      throw new BadRequestException(
-        'Settlement amount exceeds the outstanding credit balance',
-      );
-    }
 
     return this.prisma.$transaction(async (tx) => {
+      // Lock the supplier row so a second concurrent settlement against the
+      // same supplier can't read the same pre-write credit balance and also
+      // pass the guard below — jointly over-settling beyond what's owed.
+      await tx.$queryRaw`SELECT id FROM "Supplier" WHERE id = ${supplierId} FOR UPDATE`;
+
+      const { creditBalance } = await this.computeCreditBalance(supplierId, tx);
+      if (amount.greaterThan(creditBalance)) {
+        throw new BadRequestException(
+          'Settlement amount exceeds the outstanding credit balance',
+        );
+      }
+
       const payment = await tx.supplierPayment.create({
         data: {
           supplierId,
@@ -304,7 +317,7 @@ export class CreditsService {
       });
 
       return payment;
-    });
+    }, TRANSACTION_OPTIONS);
   }
 
   async updateChequeStatus(
@@ -359,7 +372,7 @@ export class CreditsService {
       });
 
       return updated;
-    });
+    }, TRANSACTION_OPTIONS);
   }
 
   async deleteSettlement(paymentId: string, adminId: string) {
@@ -385,7 +398,7 @@ export class CreditsService {
       });
 
       return { message: 'Settlement deleted' };
-    });
+    }, TRANSACTION_OPTIONS);
   }
 
   /**
@@ -431,7 +444,7 @@ export class CreditsService {
     return {
       cheques: rows,
       dueCount: due.length,
-      dueTotal: due.reduce((sum, row) => sum + Number(row.amount), 0),
+      dueTotal: due.reduce((sum, row) => sum.add(row.amount), ZERO).toNumber(),
       upcomingCount: rows.length - due.length,
     };
   }

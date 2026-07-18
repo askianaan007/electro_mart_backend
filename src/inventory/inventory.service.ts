@@ -35,21 +35,34 @@ export class InventoryService {
     const quantityOut = params.quantityOut ?? 0;
     const netDelta = quantityIn - quantityOut;
 
-    const product = await tx.product.findUnique({
-      where: { id: params.productId },
-    });
-    if (!product)
-      throw new NotFoundException(`Product ${params.productId} not found`);
+    // Single atomic conditional UPDATE (check-and-write in one statement)
+    // instead of a separate read-then-validate-then-write — two concurrent
+    // movements against the same product can no longer both read the same
+    // stale currentStock, both pass the non-negative guard, and both commit
+    // (which would otherwise let currentStock go negative under Postgres's
+    // default read-committed isolation). The WHERE clause re-checks the
+    // invariant against the row Postgres is actually about to write, under
+    // that row's lock, so a second concurrent update genuinely waits for the
+    // first to commit before it can even evaluate the condition.
+    const affected = await tx.$executeRaw`
+      UPDATE "Product"
+      SET "currentStock" = "currentStock" + ${netDelta}, "updatedAt" = NOW()
+      WHERE id = ${params.productId} AND "currentStock" + ${netDelta} >= 0
+    `;
 
-    if (netDelta < 0 && product.currentStock + netDelta < 0) {
+    if (affected === 0) {
+      const product = await tx.product.findUnique({
+        where: { id: params.productId },
+      });
+      if (!product)
+        throw new NotFoundException(`Product ${params.productId} not found`);
       throw new BadRequestException(
         `Insufficient stock for product "${product.name}"`,
       );
     }
 
-    const updated = await tx.product.update({
+    const updated = await tx.product.findUniqueOrThrow({
       where: { id: params.productId },
-      data: { currentStock: { increment: netDelta } },
     });
 
     await tx.inventoryLog.create({

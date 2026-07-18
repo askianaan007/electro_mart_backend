@@ -4,6 +4,8 @@ import {
   ArrayMinSize,
   IsArray,
   IsDateString,
+  IsInt,
+  IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
@@ -18,7 +20,7 @@ export class PurchaseItemDto {
   productId: string;
 
   @ApiProperty({ minimum: 1 })
-  @IsNumber()
+  @IsInt()
   @Min(1)
   quantity: number;
 
@@ -35,6 +37,7 @@ export class CreatePurchaseDto {
 
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   invoiceNumber: string;
 
   @ApiProperty()

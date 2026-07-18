@@ -8,7 +8,10 @@ export class QueryEquityHistoryDto extends PaginationQueryDto {
   @IsIn(['INVESTMENT', 'WITHDRAWAL', 'EXPENSE'])
   type?: 'INVESTMENT' | 'WITHDRAWAL' | 'EXPENSE';
 
-  @ApiPropertyOptional({ description: 'Only investment/withdrawal rows for this investor (expenses have no investor)' })
+  @ApiPropertyOptional({
+    description:
+      'Only investment/withdrawal rows for this investor (expenses have no investor)',
+  })
   @IsOptional()
   @IsUUID()
   investorId?: string;

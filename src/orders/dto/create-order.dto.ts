@@ -27,7 +27,7 @@ export class OrderItemDto {
 export class CreateOrderDto {
   @ApiPropertyOptional({
     description:
-      'Admin-only: the dealer to place this order for. Required when an admin creates the order, ignored (the caller\'s own id is used) when a dealer creates it.',
+      "Admin-only: the dealer to place this order for. Required when an admin creates the order, ignored (the caller's own id is used) when a dealer creates it.",
   })
   @IsOptional()
   @IsUUID()
@@ -44,7 +44,7 @@ export class CreateOrderDto {
     minimum: 0,
     maximum: 100,
     description:
-      "Admin-only: discount percentage off the order subtotal, applied immediately since admin-created orders are pre-approved. Mutually exclusive with discountAmount. Ignored for dealer callers.",
+      'Admin-only: discount percentage off the order subtotal, applied immediately since admin-created orders are pre-approved. Mutually exclusive with discountAmount. Ignored for dealer callers.',
   })
   @IsOptional()
   @IsNumber()
@@ -64,7 +64,7 @@ export class CreateOrderDto {
 
   @ApiPropertyOptional({
     description:
-      "Admin-only: the date this sale actually happened. When provided, the order is created directly as COMPLETED " +
+      'Admin-only: the date this sale actually happened. When provided, the order is created directly as COMPLETED ' +
       '(approved, packed, delivered, and completed all on this date) instead of sitting at APPROVED — for recording ' +
       'a walk-in/offline sale after the fact. Ignored for dealer callers.',
   })

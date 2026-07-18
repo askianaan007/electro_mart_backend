@@ -12,6 +12,7 @@ import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { resetSequenceCounter } from '../common/utils/sequence';
 
 @Injectable()
 export class PurchasesService {
@@ -21,12 +22,42 @@ export class PurchasesService {
     private activityLogService: ActivityLogService,
   ) {}
 
+  private async assertSupplierAndProductsExist(
+    supplierId: string,
+    items: { productId: string }[],
+  ) {
+    const supplier = await this.prisma.supplier.findUnique({
+      where: { id: supplierId },
+    });
+    if (!supplier) throw new NotFoundException('Supplier not found');
+
+    const productIds = items.map((item) => item.productId);
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: productIds } },
+    });
+    const foundIds = new Set(products.map((p) => p.id));
+    for (const productId of productIds) {
+      if (!foundIds.has(productId)) {
+        throw new NotFoundException(`Product ${productId} not found`);
+      }
+    }
+  }
+
   async create(dto: CreatePurchaseDto, adminId: string) {
+    await this.assertSupplierAndProductsExist(dto.supplierId, dto.items);
+
     return this.prisma.$transaction(async (tx) => {
-      const totalValue = dto.items.reduce(
-        (sum, item) => sum + item.quantity * item.unitCost,
-        0,
-      );
+      let totalValue = new Prisma.Decimal(0);
+      const itemsData = dto.items.map((item) => {
+        const lineTotal = new Prisma.Decimal(item.unitCost).mul(item.quantity);
+        totalValue = totalValue.add(lineTotal);
+        return {
+          productId: item.productId,
+          quantity: item.quantity,
+          unitCost: item.unitCost,
+          lineTotal,
+        };
+      });
       const transportCharges = dto.transportCharges ?? 0;
 
       const purchase = await tx.purchase.create({
@@ -37,14 +68,7 @@ export class PurchasesService {
           totalValue,
           transportCharges,
           adminId,
-          items: {
-            create: dto.items.map((item) => ({
-              productId: item.productId,
-              quantity: item.quantity,
-              unitCost: item.unitCost,
-              lineTotal: item.quantity * item.unitCost,
-            })),
-          },
+          items: { create: itemsData },
         },
         include: { items: true, supplier: true },
       });
@@ -63,7 +87,7 @@ export class PurchasesService {
         action: 'RECORDED_PURCHASE',
         targetId: purchase.id,
         details:
-          `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue} (${purchase.items.length} item(s))` +
+          `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue.toString()} (${purchase.items.length} item(s))` +
           (transportCharges > 0
             ? `, transport charges ${transportCharges} deducted from supplier credit`
             : ''),
@@ -142,6 +166,8 @@ export class PurchasesService {
       );
     }
 
+    await this.assertSupplierAndProductsExist(dto.supplierId, dto.items);
+
     return this.prisma.$transaction(async (tx) => {
       for (const item of purchase.items) {
         await this.inventoryService.recordMovement(tx, {
@@ -153,10 +179,17 @@ export class PurchasesService {
       }
       await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
 
-      const totalValue = dto.items.reduce(
-        (sum, item) => sum + item.quantity * item.unitCost,
-        0,
-      );
+      let totalValue = new Prisma.Decimal(0);
+      const itemsData = dto.items.map((item) => {
+        const lineTotal = new Prisma.Decimal(item.unitCost).mul(item.quantity);
+        totalValue = totalValue.add(lineTotal);
+        return {
+          productId: item.productId,
+          quantity: item.quantity,
+          unitCost: item.unitCost,
+          lineTotal,
+        };
+      });
       const transportCharges = dto.transportCharges ?? 0;
 
       const updated = await tx.purchase.update({
@@ -167,14 +200,7 @@ export class PurchasesService {
           purchaseDate: new Date(dto.purchaseDate),
           totalValue,
           transportCharges,
-          items: {
-            create: dto.items.map((item) => ({
-              productId: item.productId,
-              quantity: item.quantity,
-              unitCost: item.unitCost,
-              lineTotal: item.quantity * item.unitCost,
-            })),
-          },
+          items: { create: itemsData },
         },
         include: { items: true, supplier: true },
       });
@@ -193,7 +219,7 @@ export class PurchasesService {
         action: 'UPDATED_PURCHASE',
         targetId: id,
         details:
-          `Updated purchase ${updated.invoiceNumber} from ${updated.supplier.name} (${updated.items.length} item(s), total ${totalValue})` +
+          `Updated purchase ${updated.invoiceNumber} from ${updated.supplier.name} (${updated.items.length} item(s), total ${totalValue.toString()})` +
           (transportCharges > 0
             ? `, transport charges ${transportCharges} deducted from supplier credit`
             : ''),
@@ -235,6 +261,17 @@ export class PurchasesService {
           where: { purchaseReturnId: purchaseReturn.id },
         });
         await tx.purchaseReturn.delete({ where: { id: purchaseReturn.id } });
+      }
+
+      if (purchase.purchaseReturns.length > 0) {
+        const remainingReturns = await tx.purchaseReturn.findMany({
+          select: { returnNumber: true },
+        });
+        await resetSequenceCounter(
+          tx,
+          'purchaseReturn',
+          remainingReturns.map((r) => r.returnNumber),
+        );
       }
 
       for (const item of purchase.items) {

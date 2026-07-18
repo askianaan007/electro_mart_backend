@@ -13,7 +13,12 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiConsumes,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import {
   MAX_IMAGE_SIZE_BYTES,
@@ -23,6 +28,7 @@ import {
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
+import { SetStatusDto } from '../common/dto/set-status.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -104,10 +110,10 @@ export class ProductsController {
   @ApiOperation({ summary: 'Activate or deactivate a product' })
   setStatus(
     @Param('id') id: string,
-    @Body('status') status: 'ACTIVE' | 'INACTIVE',
+    @Body() dto: SetStatusDto,
     @CurrentUser('sub') adminId: string,
   ) {
-    return this.productsService.setStatus(id, status, adminId);
+    return this.productsService.setStatus(id, dto.status, adminId);
   }
 
   @Delete(':id')

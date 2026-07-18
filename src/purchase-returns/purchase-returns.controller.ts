@@ -1,8 +1,10 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -11,6 +13,7 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { PurchaseReturnsService } from './purchase-returns.service';
 import { CreatePurchaseReturnDto } from './dto/create-purchase-return.dto';
+import { UpdatePurchaseReturnDto } from './dto/update-purchase-return.dto';
 import { QueryPurchaseReturnsDto } from './dto/query-purchase-returns.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -53,5 +56,25 @@ export class PurchaseReturnsController {
   @ApiOperation({ summary: 'Get purchase return details' })
   findOne(@Param('id') id: string) {
     return this.purchaseReturnsService.findOne(id);
+  }
+
+  @Patch(':id')
+  @ApiOperation({
+    summary: 'Correct a mistaken return — only within 1 day of recording it',
+  })
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdatePurchaseReturnDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.purchaseReturnsService.update(id, dto, adminId);
+  }
+
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Delete a mistaken return — only within 1 day of recording it',
+  })
+  remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.purchaseReturnsService.remove(id, adminId);
   }
 }

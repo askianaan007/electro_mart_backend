@@ -9,7 +9,10 @@ export class QueryPaymentDto extends PaginationQueryDto {
   @IsEnum(PaymentMode)
   mode?: PaymentMode;
 
-  @ApiPropertyOptional({ enum: ChequeStatus, description: 'Filter cheque payments by status' })
+  @ApiPropertyOptional({
+    enum: ChequeStatus,
+    description: 'Filter cheque payments by status',
+  })
   @IsOptional()
   @IsEnum(ChequeStatus)
   chequeStatus?: ChequeStatus;

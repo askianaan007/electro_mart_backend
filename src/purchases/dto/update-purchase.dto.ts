@@ -4,6 +4,7 @@ import {
   ArrayMinSize,
   IsArray,
   IsDateString,
+  IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
@@ -20,6 +21,7 @@ export class UpdatePurchaseDto {
 
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   invoiceNumber: string;
 
   @ApiProperty()

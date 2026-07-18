@@ -3,6 +3,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  MinLength,
   validateSync,
 } from 'class-validator';
 
@@ -21,8 +22,13 @@ class EnvironmentVariables {
   @IsNotEmpty()
   DIRECT_URL: string;
 
+  // Signs every access token issued for both roles — a short/guessable
+  // secret is brute-forceable offline, letting an attacker forge tokens
+  // (including admin ones) for full account takeover. 32 chars is a floor,
+  // not a target; generate this with something like `openssl rand -hex 32`.
   @IsString()
   @IsNotEmpty()
+  @MinLength(32)
   JWT_SECRET: string;
 
   @IsOptional()

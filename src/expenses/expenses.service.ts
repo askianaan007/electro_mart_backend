@@ -42,7 +42,9 @@ export class ExpensesService {
     const limit = query.limit ?? 20;
 
     const where: Prisma.ExpenseWhereInput = {
-      ...(query.search && { description: { contains: query.search, mode: 'insensitive' } }),
+      ...(query.search && {
+        description: { contains: query.search, mode: 'insensitive' },
+      }),
       ...((query.dateFrom || query.dateTo) && {
         expenseDate: {
           ...(query.dateFrom && { gte: new Date(query.dateFrom) }),

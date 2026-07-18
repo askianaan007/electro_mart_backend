@@ -26,7 +26,8 @@ export class EquityController {
 
   @Get('history')
   @ApiOperation({
-    summary: 'Every investment, withdrawal, and expense affecting equity, merged and paginated',
+    summary:
+      'Every investment, withdrawal, and expense affecting equity, merged and paginated',
   })
   getHistory(@Query() query: QueryEquityHistoryDto) {
     return this.equityService.getHistory(query);

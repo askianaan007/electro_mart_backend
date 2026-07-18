@@ -8,12 +8,18 @@ export class QueryPurchaseReturnsDto extends PaginationQueryDto {
   @IsUUID()
   supplierId?: string;
 
-  @ApiPropertyOptional({ description: 'Start of date range (inclusive), matches PurchaseReturn.returnDate' })
+  @ApiPropertyOptional({
+    description:
+      'Start of date range (inclusive), matches PurchaseReturn.returnDate',
+  })
   @IsOptional()
   @IsDateString()
   dateFrom?: string;
 
-  @ApiPropertyOptional({ description: 'End of date range (inclusive), matches PurchaseReturn.returnDate' })
+  @ApiPropertyOptional({
+    description:
+      'End of date range (inclusive), matches PurchaseReturn.returnDate',
+  })
   @IsOptional()
   @IsDateString()
   dateTo?: string;

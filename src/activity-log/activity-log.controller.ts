@@ -1,8 +1,16 @@
-import { Controller, Delete, Get, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
 import { ActivityLogService } from './activity-log.service';
 import { QueryActivityLogDto } from './dto/query-activity-log.dto';
+import { ClearActivityLogDto } from './dto/clear-activity-log.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -30,9 +38,13 @@ export class ActivityLogController {
 
   @Delete()
   @ApiOperation({
-    summary: 'Permanently clear the entire activity log (writes one final entry recording the clear)',
+    summary:
+      "Permanently clear the entire activity log (writes one final entry recording the clear). Requires the admin's password to confirm.",
   })
-  clearAll(@CurrentUser('sub') adminId: string) {
-    return this.activityLogService.clearAll(adminId);
+  clearAll(
+    @Body() dto: ClearActivityLogDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.activityLogService.clearAll(adminId, dto.password);
   }
 }

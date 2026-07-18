@@ -25,7 +25,13 @@ export class UploadsService {
         { folder, resource_type: 'image' },
         (error, result) => {
           if (error || !result) {
-            reject(error ?? new Error('Cloudinary upload returned no result'));
+            reject(
+              error instanceof Error
+                ? error
+                : new Error(
+                    error?.message ?? 'Cloudinary upload returned no result',
+                  ),
+            );
             return;
           }
           resolve({ url: result.secure_url, publicId: result.public_id });

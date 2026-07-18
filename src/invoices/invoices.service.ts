@@ -38,15 +38,17 @@ export class InvoicesService {
    * it's always accurate and there's no window where a passed-due invoice
    * still reads as PENDING.
    */
-  private withComputedStatus<T extends { paymentStatus: PaymentStatus; dueDate: Date | null }>(
-    invoice: T,
-  ): T {
+  private withComputedStatus<
+    T extends { paymentStatus: PaymentStatus; dueDate: Date | null },
+  >(invoice: T): T {
     const isPastDue =
       (invoice.paymentStatus === PaymentStatus.PENDING ||
         invoice.paymentStatus === PaymentStatus.PARTIAL) &&
       invoice.dueDate !== null &&
       invoice.dueDate < new Date();
-    return isPastDue ? { ...invoice, paymentStatus: PaymentStatus.OVERDUE } : invoice;
+    return isPastDue
+      ? { ...invoice, paymentStatus: PaymentStatus.OVERDUE }
+      : invoice;
   }
 
   /**
@@ -58,14 +60,20 @@ export class InvoicesService {
    */
   private async withReturnedAmounts<
     T extends { orderId: string; grandTotal: Prisma.Decimal },
-  >(invoices: T[]): Promise<(T & { returnedAmount: Prisma.Decimal; netGrandTotal: Prisma.Decimal })[]> {
+  >(
+    invoices: T[],
+  ): Promise<
+    (T & { returnedAmount: Prisma.Decimal; netGrandTotal: Prisma.Decimal })[]
+  > {
     if (invoices.length === 0) return [];
     const sums = await this.prisma.salesReturn.groupBy({
       by: ['orderId'],
       where: { orderId: { in: invoices.map((i) => i.orderId) } },
       _sum: { totalAmount: true },
     });
-    const map = new Map(sums.map((s) => [s.orderId, s._sum.totalAmount ?? ZERO]));
+    const map = new Map(
+      sums.map((s) => [s.orderId, s._sum.totalAmount ?? ZERO]),
+    );
     return invoices.map((invoice) => {
       const returnedAmount = map.get(invoice.orderId) ?? ZERO;
       return {
@@ -129,7 +137,12 @@ export class InvoicesService {
     ]);
 
     const withReturns = await this.withReturnedAmounts(data);
-    return paginate(withReturns.map((i) => this.withComputedStatus(i)), total, page, limit);
+    return paginate(
+      withReturns.map((i) => this.withComputedStatus(i)),
+      total,
+      page,
+      limit,
+    );
   }
 
   async findAllForDealer(dealerId: string, query: QueryInvoiceDto) {
@@ -159,7 +172,12 @@ export class InvoicesService {
     ]);
 
     const withReturns = await this.withReturnedAmounts(data);
-    return paginate(withReturns.map((i) => this.withComputedStatus(i)), total, page, limit);
+    return paginate(
+      withReturns.map((i) => this.withComputedStatus(i)),
+      total,
+      page,
+      limit,
+    );
   }
 
   async findOne(
@@ -174,7 +192,10 @@ export class InvoicesService {
     if (requester.role === 'DEALER' && invoice.dealerId !== requester.id) {
       throw new ForbiddenException('You do not have access to this invoice');
     }
-    const returnedAmount = await computeReturnedAmount(this.prisma, invoice.orderId);
+    const returnedAmount = await computeReturnedAmount(
+      this.prisma,
+      invoice.orderId,
+    );
     return this.withComputedStatus({
       ...invoice,
       returnedAmount,
@@ -191,7 +212,9 @@ export class InvoicesService {
    */
   async resetInvoiceCounter(adminId: string) {
     return this.prisma.$transaction(async (tx) => {
-      const invoices = await tx.invoice.findMany({ select: { invoiceNumber: true } });
+      const invoices = await tx.invoice.findMany({
+        select: { invoiceNumber: true },
+      });
       const newValue = await resetSequenceCounter(
         tx,
         'invoice',

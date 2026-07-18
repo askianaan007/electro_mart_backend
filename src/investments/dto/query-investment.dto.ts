@@ -17,12 +17,18 @@ export class QueryInvestmentDto extends PaginationQueryDto {
   @IsIn(['DEPOSIT', 'WITHDRAWAL'])
   type?: 'DEPOSIT' | 'WITHDRAWAL';
 
-  @ApiPropertyOptional({ description: 'Start of date range (inclusive), matches Investment.investmentDate' })
+  @ApiPropertyOptional({
+    description:
+      'Start of date range (inclusive), matches Investment.investmentDate',
+  })
   @IsOptional()
   @IsDateString()
   dateFrom?: string;
 
-  @ApiPropertyOptional({ description: 'End of date range (inclusive), matches Investment.investmentDate' })
+  @ApiPropertyOptional({
+    description:
+      'End of date range (inclusive), matches Investment.investmentDate',
+  })
   @IsOptional()
   @IsDateString()
   dateTo?: string;

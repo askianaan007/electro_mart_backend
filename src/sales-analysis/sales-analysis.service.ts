@@ -7,7 +7,7 @@ import { paginate } from '../common/utils/paginate';
 const ZERO = new Prisma.Decimal(0);
 
 const ORDER_INCLUDE = {
-  items: { include: { product: true } },
+  items: { include: { product: { select: { costPrice: true } } } },
   dealer: { select: { id: true, businessName: true } },
   invoice: { select: { invoiceNumber: true } },
 } satisfies Prisma.OrderInclude;

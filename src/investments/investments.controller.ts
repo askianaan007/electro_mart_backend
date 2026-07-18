@@ -30,7 +30,10 @@ export class InvestmentsController {
 
   @Post()
   @ApiOperation({ summary: 'Record an investor contribution or withdrawal' })
-  create(@Body() dto: CreateInvestmentDto, @CurrentUser('sub') adminId: string) {
+  create(
+    @Body() dto: CreateInvestmentDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
     return this.investmentsService.create(dto, adminId);
   }
 

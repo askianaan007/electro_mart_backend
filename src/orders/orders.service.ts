@@ -29,10 +29,22 @@ import {
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
+import { derivePaymentStatus } from '../common/utils/invoice-financials';
 
 type TransactionClient = Prisma.TransactionClient;
 
 const INVOICE_DUE_DAYS = 15;
+
+// Orders in any of these statuses already have (or are about to get) real
+// financial weight against the dealer's credit line, even before they
+// reach COMPLETED (the only point outstandingBalance itself is touched) —
+// so credit-limit checks must count them, not just outstandingBalance.
+const IN_FLIGHT_ORDER_STATUSES: OrderStatus[] = [
+  OrderStatus.PENDING_APPROVAL,
+  OrderStatus.APPROVED,
+  OrderStatus.PACKED,
+  OrderStatus.DELIVERED,
+];
 
 const NEXT_STATUS: Record<string, OrderStatus> = {
   PACKED: OrderStatus.APPROVED,
@@ -87,6 +99,16 @@ export class OrdersService {
     items: OrderItemDto[],
     client: TransactionClient | PrismaService = this.prisma,
   ) {
+    const seenProductIds = new Set<string>();
+    for (const item of items) {
+      if (seenProductIds.has(item.productId)) {
+        throw new BadRequestException(
+          `Product ${item.productId} appears more than once in this order — combine it into a single line`,
+        );
+      }
+      seenProductIds.add(item.productId);
+    }
+
     const productIds = items.map((item) => item.productId);
     const products = await client.product.findMany({
       where: { id: { in: productIds } },
@@ -321,6 +343,69 @@ export class OrdersService {
     return { discountTotal, discountDescription };
   }
 
+  /**
+   * Sums the totalAmount of every order still "in flight" for a dealer —
+   * i.e. not yet completed (which is when outstandingBalance itself picks
+   * it up) but also not rejected. A dealer can have several such orders at
+   * once, none of which show up in outstandingBalance yet, so a credit-limit
+   * check that only looks at outstandingBalance can be satisfied by every
+   * one of them individually while their combined total blows past the
+   * limit once they're all approved.
+   */
+  private async sumInFlightOrderTotals(
+    tx: TransactionClient,
+    dealerId: string,
+    excludeOrderId?: string,
+  ): Promise<Prisma.Decimal> {
+    const agg = await tx.order.aggregate({
+      where: {
+        dealerId,
+        status: { in: IN_FLIGHT_ORDER_STATUSES },
+        ...(excludeOrderId && { id: { not: excludeOrderId } }),
+      },
+      _sum: { totalAmount: true },
+    });
+    return agg._sum.totalAmount ?? new Prisma.Decimal(0);
+  }
+
+  /**
+   * The single credit-limit gate used by every order-creating/-editing path.
+   * Locks the dealer row for the rest of this transaction first — without
+   * it, two concurrent orders against the same dealer could both read the
+   * same pre-write outstanding/in-flight totals and both pass, jointly
+   * exceeding the limit (the same TOCTOU shape as the stock-reservation
+   * race). `excludeOrderId` lets an edit path exclude the order being
+   * edited from its own "already in flight" total before adding its new
+   * amount back in.
+   */
+  private async assertWithinCreditLimit(
+    tx: TransactionClient,
+    dealerId: string,
+    additionalAmount: Prisma.Decimal,
+    excludeOrderId: string | undefined,
+    errorMessage: string,
+  ) {
+    await tx.$queryRaw`SELECT id FROM "Dealer" WHERE id = ${dealerId} FOR UPDATE`;
+
+    const dealer = await tx.dealer.findUniqueOrThrow({
+      where: { id: dealerId },
+    });
+    if (dealer.unlimitedCredit) return dealer;
+
+    const inFlightTotal = await this.sumInFlightOrderTotals(
+      tx,
+      dealerId,
+      excludeOrderId,
+    );
+    const projectedOutstanding = dealer.outstandingBalance
+      .add(inFlightTotal)
+      .add(additionalAmount);
+    if (projectedOutstanding.greaterThan(dealer.creditLimit)) {
+      throw new BadRequestException(errorMessage);
+    }
+    return dealer;
+  }
+
   private async checkAndNotifyOutOfStock(productIds: string[]) {
     const productsAfterReserve = await this.prisma.product.findMany({
       where: { id: { in: productIds } },
@@ -342,10 +427,7 @@ export class OrdersService {
     );
   }
 
-  async create(
-    requester: { role: Role; id: string },
-    dto: CreateOrderDto,
-  ) {
+  async create(requester: { role: Role; id: string }, dto: CreateOrderDto) {
     const dealerId =
       requester.role === Role.ADMIN ? dto.dealerId : requester.id;
     if (requester.role === Role.ADMIN && !dealerId) {
@@ -361,9 +443,7 @@ export class OrdersService {
     if (dealer.status !== AccountStatus.ACTIVE)
       throw new ForbiddenException('Dealer account is inactive');
 
-    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(
-      dto.items,
-    );
+    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(dto.items);
 
     const { discountTotal, discountDescription } =
       requester.role === Role.ADMIN
@@ -371,17 +451,10 @@ export class OrdersService {
         : { discountTotal: new Prisma.Decimal(0), discountDescription: null };
 
     const totalAmount = subtotal.sub(discountTotal);
-    const projectedOutstanding = dealer.outstandingBalance.add(totalAmount);
-    if (
-      !dealer.unlimitedCredit &&
-      projectedOutstanding.greaterThan(dealer.creditLimit)
-    ) {
-      throw new BadRequestException(
-        requester.role === Role.ADMIN
-          ? "This order exceeds the dealer's available credit limit"
-          : 'This order exceeds your available credit limit',
-      );
-    }
+    const creditLimitErrorMessage =
+      requester.role === Role.ADMIN
+        ? "This order exceeds the dealer's available credit limit"
+        : 'This order exceeds your available credit limit';
 
     if (requester.role === Role.ADMIN) {
       const completionDate = dto.saleDate ? new Date(dto.saleDate) : undefined;
@@ -394,6 +467,14 @@ export class OrdersService {
         : undefined;
 
       const { savedOrder } = await this.prisma.$transaction(async (tx) => {
+        await this.assertWithinCreditLimit(
+          tx,
+          dealerId as string,
+          totalAmount,
+          undefined,
+          creditLimitErrorMessage,
+        );
+
         const orderNumber = await nextSequenceNumber(tx, 'order', 'ORD');
         const order = await tx.order.create({
           data: {
@@ -436,6 +517,14 @@ export class OrdersService {
     }
 
     const order = await this.prisma.$transaction(async (tx) => {
+      await this.assertWithinCreditLimit(
+        tx,
+        dealerId as string,
+        totalAmount,
+        undefined,
+        creditLimitErrorMessage,
+      );
+
       const orderNumber = await nextSequenceNumber(tx, 'order', 'ORD');
       return tx.order.create({
         data: {
@@ -478,23 +567,17 @@ export class OrdersService {
       );
     }
 
-    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(
-      dto.items,
-    );
-
-    const projectedOutstanding = order.dealer.outstandingBalance.add(
-      subtotal,
-    );
-    if (
-      !order.dealer.unlimitedCredit &&
-      projectedOutstanding.greaterThan(order.dealer.creditLimit)
-    ) {
-      throw new BadRequestException(
-        "This change exceeds the dealer's available credit limit",
-      );
-    }
+    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
+      await this.assertWithinCreditLimit(
+        tx,
+        order.dealerId,
+        subtotal,
+        id,
+        "This change exceeds the dealer's available credit limit",
+      );
+
       await tx.orderItem.deleteMany({ where: { orderId: id } });
       const savedOrder = await tx.order.update({
         where: { id },
@@ -513,15 +596,6 @@ export class OrdersService {
     }, TRANSACTION_OPTIONS);
   }
 
-  /**
-   * Edits an order an admin recorded directly (a walk-in/offline sale via
-   * the New Order form) — for fixing a mistake after the fact: wrong
-   * product/quantity, wrong dealer, wrong discount, or wrong sale date.
-   * Reverses the stock reservation and dealer balance impact of the
-   * original recording, then re-applies both for the corrected version.
-   * Blocked if a sales return or an invoice payment has already been
-   * recorded against it, since those reference the original figures.
-   */
   /**
    * Edits any order that already has an invoice (Approved and beyond),
    * fixing a mistake in its dealer/items/discount/date. Reverses and
@@ -579,7 +653,7 @@ export class OrdersService {
       for (const item of order.items) {
         await this.inventoryService.recordMovement(tx, {
           productId: item.productId,
-          type: InventoryLogType.ADJUSTMENT,
+          type: InventoryLogType.RELEASE,
           quantityIn: item.quantity,
           reference: `Reversed for edit of order ${order.orderNumber}`,
         });
@@ -608,19 +682,13 @@ export class OrdersService {
         discountTotal,
       );
 
-      const dealerForCheck = await tx.dealer.findUniqueOrThrow({
-        where: { id: dto.dealerId },
-      });
-      const projectedOutstanding =
-        dealerForCheck.outstandingBalance.add(grandTotal);
-      if (
-        !dealerForCheck.unlimitedCredit &&
-        projectedOutstanding.greaterThan(dealerForCheck.creditLimit)
-      ) {
-        throw new BadRequestException(
-          "This change exceeds the dealer's available credit limit",
-        );
-      }
+      await this.assertWithinCreditLimit(
+        tx,
+        dto.dealerId,
+        grandTotal,
+        id,
+        "This change exceeds the dealer's available credit limit",
+      );
 
       // Re-apply: reserve stock for the corrected items.
       for (const item of itemsData) {
@@ -646,6 +714,11 @@ export class OrdersService {
           subtotal,
           discountTotal,
           grandTotal,
+          // Only reachable with zero payments recorded (checked above), so
+          // effectivePaid is always 0 here — but a 100%-discount edit should
+          // still resolve to PAID for a ₹0 balance rather than staying
+          // PENDING forever.
+          paymentStatus: derivePaymentStatus(new Prisma.Decimal(0), grandTotal),
         },
       });
 
@@ -1025,7 +1098,7 @@ export class OrdersService {
           for (const item of order.items) {
             await this.inventoryService.recordMovement(tx, {
               productId: item.productId,
-              type: InventoryLogType.ADJUSTMENT,
+              type: InventoryLogType.RELEASE,
               quantityIn: item.quantity,
               reference: `Reversal of deleted order ${order.orderNumber}`,
             });
@@ -1034,7 +1107,9 @@ export class OrdersService {
           if (order.status === OrderStatus.COMPLETED) {
             await tx.dealer.update({
               where: { id: order.dealerId },
-              data: { outstandingBalance: { decrement: order.invoice.grandTotal } },
+              data: {
+                outstandingBalance: { decrement: order.invoice.grandTotal },
+              },
             });
           }
 
@@ -1053,7 +1128,9 @@ export class OrdersService {
         await tx.orderItem.deleteMany({ where: { orderId: id } });
         await tx.order.delete({ where: { id } });
 
-        const remainingOrders = await tx.order.findMany({ select: { orderNumber: true } });
+        const remainingOrders = await tx.order.findMany({
+          select: { orderNumber: true },
+        });
         await resetSequenceCounter(
           tx,
           'order',

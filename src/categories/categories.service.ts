@@ -79,6 +79,17 @@ export class CategoriesService {
     return this.prisma.$transaction(async (tx) => {
       const category = await tx.category.update({ where: { id }, data: dto });
 
+      // Product.category is a denormalized free-text copy of the name, not
+      // a foreign key — without this, a rename would silently orphan every
+      // product still tagged with the old name (they'd drop out of
+      // category filtering/browsing with no error and no way to find them).
+      if (dto.name && dto.name !== existingCategory.name) {
+        await tx.product.updateMany({
+          where: { category: existingCategory.name },
+          data: { category: dto.name },
+        });
+      }
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'UPDATED_CATEGORY',
@@ -95,6 +106,19 @@ export class CategoriesService {
 
   async remove(id: string, adminId: string) {
     const category = await this.findOne(id);
+
+    // category is a free-text field on Product, not a foreign key, so this
+    // delete would otherwise always "succeed" even with hundreds of
+    // products still tagged with it — leaving them orphaned (unreachable
+    // via category navigation) with no warning.
+    const referencingCount = await this.prisma.product.count({
+      where: { category: category.name },
+    });
+    if (referencingCount > 0) {
+      throw new ConflictException(
+        `${referencingCount} product(s) are still tagged with this category — reassign or clear their category before deleting it`,
+      );
+    }
 
     return this.prisma.$transaction(async (tx) => {
       await tx.category.delete({ where: { id } });

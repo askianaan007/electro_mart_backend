@@ -14,12 +14,18 @@ export class QuerySettlementsDto extends PaginationQueryDto {
   @IsEnum(ChequeStatus)
   chequeStatus?: ChequeStatus;
 
-  @ApiPropertyOptional({ description: 'Start of date range (inclusive), matches SupplierPayment.paymentDate' })
+  @ApiPropertyOptional({
+    description:
+      'Start of date range (inclusive), matches SupplierPayment.paymentDate',
+  })
   @IsOptional()
   @IsDateString()
   dateFrom?: string;
 
-  @ApiPropertyOptional({ description: 'End of date range (inclusive), matches SupplierPayment.paymentDate' })
+  @ApiPropertyOptional({
+    description:
+      'End of date range (inclusive), matches SupplierPayment.paymentDate',
+  })
   @IsOptional()
   @IsDateString()
   dateTo?: string;
@@ -32,7 +38,10 @@ export class QuerySettlementsDto extends PaginationQueryDto {
   @IsIn(['paymentDate', 'chequeDepositDate'])
   sortBy?: 'paymentDate' | 'chequeDepositDate';
 
-  @ApiPropertyOptional({ enum: ['asc', 'desc'], description: 'Sort direction. Defaults to desc.' })
+  @ApiPropertyOptional({
+    enum: ['asc', 'desc'],
+    description: 'Sort direction. Defaults to desc.',
+  })
   @IsOptional()
   @IsIn(['asc', 'desc'])
   sortOrder?: 'asc' | 'desc';

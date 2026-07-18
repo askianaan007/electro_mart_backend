@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Role } from '@prisma/client';
-import { IsEnum, IsString, MinLength } from 'class-validator';
+import { IsEnum, IsString, MaxLength, MinLength } from 'class-validator';
 
 export class ResetPasswordDto {
   @ApiProperty()
@@ -14,5 +14,6 @@ export class ResetPasswordDto {
   @ApiProperty({ minLength: 6 })
   @IsString()
   @MinLength(6)
+  @MaxLength(72)
   newPassword: string;
 }

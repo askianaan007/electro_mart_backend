@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { AccountStatus, Role } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
@@ -15,6 +16,15 @@ import { hashToken } from '../common/utils/hash-token';
 const RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
 const PASSWORD_SALT_ROUNDS = 10;
 const REFRESH_TOKEN_BYTES = 48;
+// Compared against when an account isn't found, so a login/forgot-password
+// attempt against a nonexistent account takes roughly as long as one
+// against a real one — without this, the extra bcrypt.compare (or DB
+// write + email) the "found" branch does is a timing side-channel that
+// lets an attacker enumerate valid emails/usernames.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
+  'no-such-account-timing-parity',
+  PASSWORD_SALT_ROUNDS,
+);
 
 @Injectable()
 export class AuthService {
@@ -49,10 +59,12 @@ export class AuthService {
 
   async adminLogin(email: string, password: string) {
     const admin = await this.prisma.admin.findUnique({ where: { email } });
-    if (!admin) throw new UnauthorizedException('Invalid credentials');
-
-    const valid = await bcrypt.compare(password, admin.password);
-    if (!valid) throw new UnauthorizedException('Invalid credentials');
+    const valid = await bcrypt.compare(
+      password,
+      admin?.password ?? DUMMY_PASSWORD_HASH,
+    );
+    if (!admin || !valid)
+      throw new UnauthorizedException('Invalid credentials');
 
     const tokens = await this.issueTokens(Role.ADMIN, admin.id, {
       email: admin.email,
@@ -70,11 +82,13 @@ export class AuthService {
 
   async dealerLogin(username: string, password: string) {
     const dealer = await this.prisma.dealer.findUnique({ where: { username } });
+    const valid = await bcrypt.compare(
+      password,
+      dealer?.password ?? DUMMY_PASSWORD_HASH,
+    );
     if (!dealer) throw new UnauthorizedException('Invalid credentials');
     if (dealer.status !== AccountStatus.ACTIVE)
       throw new UnauthorizedException('Account is inactive');
-
-    const valid = await bcrypt.compare(password, dealer.password);
     if (!valid) throw new UnauthorizedException('Invalid credentials');
 
     const tokens = await this.issueTokens(Role.DEALER, dealer.id, {
@@ -151,6 +165,10 @@ export class AuthService {
           data: { resetToken, resetTokenExpiry },
         });
         await this.mailer.notifyPasswordReset(admin.email, resetToken);
+      } else {
+        // Equivalent-cost dummy work so a nonexistent email doesn't
+        // resolve measurably faster than a real one — see DUMMY_PASSWORD_HASH.
+        await bcrypt.compare(identifier, DUMMY_PASSWORD_HASH);
       }
     } else {
       const dealer = await this.prisma.dealer.findUnique({
@@ -162,6 +180,8 @@ export class AuthService {
           data: { resetToken, resetTokenExpiry },
         });
         await this.mailer.notifyPasswordReset(dealer.email, resetToken);
+      } else {
+        await bcrypt.compare(identifier, DUMMY_PASSWORD_HASH);
       }
     }
 
@@ -173,8 +193,9 @@ export class AuthService {
     role: Role,
     newPassword: string,
   ): Promise<{ message: string }> {
-    const hashed = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
-
+    // Validate the token BEFORE paying bcrypt's cost — otherwise every
+    // request with a garbage/expired token (which the 5/60s throttle on
+    // this route doesn't fully rule out) still burns a full hash cycle.
     if (role === Role.ADMIN) {
       const admin = await this.prisma.admin.findUnique({
         where: { resetToken: token },
@@ -186,6 +207,7 @@ export class AuthService {
       ) {
         throw new BadRequestException('Invalid or expired reset token');
       }
+      const hashed = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
       await this.prisma.admin.update({
         where: { id: admin.id },
         data: { password: hashed, resetToken: null, resetTokenExpiry: null },
@@ -201,6 +223,7 @@ export class AuthService {
       ) {
         throw new BadRequestException('Invalid or expired reset token');
       }
+      const hashed = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
       await this.prisma.dealer.update({
         where: { id: dealer.id },
         data: { password: hashed, resetToken: null, resetTokenExpiry: null },
@@ -208,5 +231,22 @@ export class AuthService {
     }
 
     return { message: 'Password has been reset. You can now log in.' };
+  }
+
+  /**
+   * Revoked/expired refresh tokens are never queried again once they're
+   * unusable, but every login adds a permanent row — with nothing pruning
+   * them, the table grows without bound. Runs daily; keeps a 30-day tail
+   * past expiry so recently-expired tokens are still around briefly for
+   * incident investigation.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_3AM)
+  async cleanupExpiredRefreshTokens() {
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    await this.prisma.refreshToken.deleteMany({
+      where: {
+        OR: [{ revokedAt: { not: null } }, { expiresAt: { lt: cutoff } }],
+      },
+    });
   }
 }

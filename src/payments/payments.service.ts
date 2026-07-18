@@ -15,11 +15,9 @@ import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import {
   computeEffectivePaid,
   computeReturnedAmount,
-  derivePaymentStatus,
   isEffectivePayment,
+  recomputeInvoicePaymentStatus,
 } from '../common/utils/invoice-financials';
-
-type TransactionClient = Prisma.TransactionClient;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -38,7 +36,12 @@ export class PaymentsService {
     collectedDate?: string;
   }) {
     if (dto.mode !== 'CHEQUE') return;
-    if (!dto.bankName || !dto.chequeNumber || !dto.chequeDate || !dto.collectedDate) {
+    if (
+      !dto.bankName ||
+      !dto.chequeNumber ||
+      !dto.chequeDate ||
+      !dto.collectedDate
+    ) {
       throw new BadRequestException(
         'Bank name, cheque number, cheque date, and collected date are all required for cheque payments',
       );
@@ -48,51 +51,34 @@ export class PaymentsService {
     }
   }
 
-  /**
-   * Recomputes an invoice's paymentStatus from its current payment rows —
-   * safe to call after any create/edit/delete/status-change since it reads
-   * the post-change state directly rather than applying a delta. Compares
-   * against grandTotal minus any returned goods, not the raw grandTotal —
-   * a return lowers what's actually still owed on this invoice.
-   */
-  private async recomputeInvoicePaymentStatus(
-    tx: TransactionClient,
-    invoiceId: string,
-  ) {
-    const invoice = await tx.invoice.findUniqueOrThrow({
-      where: { id: invoiceId },
-    });
-    const payments = await tx.payment.findMany({ where: { invoiceId } });
-    const effectivePaid = computeEffectivePaid(payments);
-    const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
-    const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
-
-    const paymentStatus = derivePaymentStatus(effectivePaid, netGrandTotal);
-
-    await tx.invoice.update({ where: { id: invoiceId }, data: { paymentStatus } });
-    return paymentStatus;
-  }
-
   async create(dto: CreatePaymentDto, adminId: string) {
     this.validateChequeFields(dto);
 
-    const invoice = await this.prisma.invoice.findUnique({
-      where: { id: dto.invoiceId },
-      include: { payments: true },
-    });
-    if (!invoice) throw new NotFoundException('Invoice not found');
-
     const amount = new Prisma.Decimal(dto.amount);
-    const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
-    const returnedAmount = await computeReturnedAmount(this.prisma, invoice.orderId);
-    const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
-    if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
-      throw new BadRequestException(
-        'Payment amount exceeds the outstanding invoice balance',
-      );
-    }
 
     return this.prisma.$transaction(async (tx) => {
+      // Lock the invoice row for the duration of this transaction so a
+      // second concurrent payment against the same invoice can't read the
+      // same pre-write "amount remaining" snapshot and also pass the
+      // overpayment guard below — it blocks here until this transaction
+      // commits, then sees this payment already counted.
+      await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${dto.invoiceId} FOR UPDATE`;
+
+      const invoice = await tx.invoice.findUnique({
+        where: { id: dto.invoiceId },
+        include: { payments: true },
+      });
+      if (!invoice) throw new NotFoundException('Invoice not found');
+
+      const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
+      const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
+      const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
+      if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
+        throw new BadRequestException(
+          'Payment amount exceeds the outstanding invoice balance',
+        );
+      }
+
       const payment = await tx.payment.create({
         data: {
           invoiceId: dto.invoiceId,
@@ -101,18 +87,24 @@ export class PaymentsService {
           mode: dto.mode,
           reference: dto.reference,
           paymentDate: new Date(dto.paymentDate),
-          chequeStatus: dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
+          chequeStatus:
+            dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
           chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : undefined,
           bankName: dto.mode === 'CHEQUE' ? dto.bankName : undefined,
           chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : undefined,
-          chequeDate: dto.mode === 'CHEQUE' && dto.chequeDate ? new Date(dto.chequeDate) : undefined,
+          chequeDate:
+            dto.mode === 'CHEQUE' && dto.chequeDate
+              ? new Date(dto.chequeDate)
+              : undefined,
           collectedDate:
-            dto.mode === 'CHEQUE' && dto.collectedDate ? new Date(dto.collectedDate) : undefined,
+            dto.mode === 'CHEQUE' && dto.collectedDate
+              ? new Date(dto.collectedDate)
+              : undefined,
           remarks: dto.remarks,
         },
       });
 
-      await this.recomputeInvoicePaymentStatus(tx, invoice.id);
+      await recomputeInvoicePaymentStatus(tx, invoice.id);
 
       // Not clamped to zero — a payment recorded while the dealer already
       // has a return credit correctly pushes their balance further negative
@@ -148,26 +140,36 @@ export class PaymentsService {
   async update(id: string, dto: UpdatePaymentDto, adminId: string) {
     this.validateChequeFields(dto);
 
-    const payment = await this.prisma.payment.findUnique({
-      where: { id },
-      include: { invoice: { include: { payments: true } } },
-    });
-    if (!payment) throw new NotFoundException('Payment not found');
-    this.assertEditable(payment);
+    const existing = await this.prisma.payment.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Payment not found');
 
     const amount = new Prisma.Decimal(dto.amount);
-    const otherEffectivePaid = computeEffectivePaid(
-      payment.invoice.payments.filter((p) => p.id !== id),
-    );
-    const returnedAmount = await computeReturnedAmount(this.prisma, payment.invoice.orderId);
-    const netGrandTotal = payment.invoice.grandTotal.sub(returnedAmount);
-    if (otherEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
-      throw new BadRequestException(
-        'Payment amount exceeds the outstanding invoice balance',
-      );
-    }
 
     return this.prisma.$transaction(async (tx) => {
+      // Same row-lock pattern as create() — see comment there.
+      await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${existing.invoiceId} FOR UPDATE`;
+
+      const payment = await tx.payment.findUnique({
+        where: { id },
+        include: { invoice: { include: { payments: true } } },
+      });
+      if (!payment) throw new NotFoundException('Payment not found');
+      this.assertEditable(payment);
+
+      const otherEffectivePaid = computeEffectivePaid(
+        payment.invoice.payments.filter((p) => p.id !== id),
+      );
+      const returnedAmount = await computeReturnedAmount(
+        tx,
+        payment.invoice.orderId,
+      );
+      const netGrandTotal = payment.invoice.grandTotal.sub(returnedAmount);
+      if (otherEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
+        throw new BadRequestException(
+          'Payment amount exceeds the outstanding invoice balance',
+        );
+      }
+
       const updated = await tx.payment.update({
         where: { id },
         data: {
@@ -179,21 +181,28 @@ export class PaymentsService {
           chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : null,
           bankName: dto.mode === 'CHEQUE' ? dto.bankName : null,
           chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : null,
-          chequeDate: dto.mode === 'CHEQUE' && dto.chequeDate ? new Date(dto.chequeDate) : null,
+          chequeDate:
+            dto.mode === 'CHEQUE' && dto.chequeDate
+              ? new Date(dto.chequeDate)
+              : null,
           collectedDate:
-            dto.mode === 'CHEQUE' && dto.collectedDate ? new Date(dto.collectedDate) : null,
+            dto.mode === 'CHEQUE' && dto.collectedDate
+              ? new Date(dto.collectedDate)
+              : null,
           remarks: dto.remarks,
         },
       });
 
-      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+      await recomputeInvoicePaymentStatus(tx, payment.invoiceId);
 
       const dealer = await tx.dealer.findUniqueOrThrow({
         where: { id: payment.dealerId },
       });
       // The old amount was fully effective (edits are blocked once a cheque
       // moves past PENDING), so reverse it and apply the new one.
-      const rebalanced = dealer.outstandingBalance.add(payment.amount).sub(amount);
+      const rebalanced = dealer.outstandingBalance
+        .add(payment.amount)
+        .sub(amount);
       await tx.dealer.update({
         where: { id: payment.dealerId },
         data: { outstandingBalance: rebalanced },
@@ -226,7 +235,7 @@ export class PaymentsService {
     return this.prisma.$transaction(async (tx) => {
       await tx.payment.delete({ where: { id } });
 
-      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+      await recomputeInvoicePaymentStatus(tx, payment.invoiceId);
 
       if (isEffectivePayment(payment)) {
         const dealer = await tx.dealer.findUniqueOrThrow({
@@ -234,7 +243,9 @@ export class PaymentsService {
         });
         await tx.dealer.update({
           where: { id: payment.dealerId },
-          data: { outstandingBalance: dealer.outstandingBalance.add(payment.amount) },
+          data: {
+            outstandingBalance: dealer.outstandingBalance.add(payment.amount),
+          },
         });
       }
 
@@ -280,7 +291,9 @@ export class PaymentsService {
     });
     if (!payment) throw new NotFoundException('Payment not found');
     if (payment.mode !== 'CHEQUE') {
-      throw new BadRequestException('Only cheque payments have a cheque status');
+      throw new BadRequestException(
+        'Only cheque payments have a cheque status',
+      );
     }
 
     let details: string;
@@ -312,7 +325,7 @@ export class PaymentsService {
         data: { chequeStatus: status, chequeStatusUpdatedAt: new Date() },
       });
 
-      await this.recomputeInvoicePaymentStatus(tx, payment.invoiceId);
+      await recomputeInvoicePaymentStatus(tx, payment.invoiceId);
 
       // Only the RETURNED <-> (PENDING/CLEARED) boundary changes whether
       // this payment counts against the dealer's balance.
@@ -366,7 +379,10 @@ export class PaymentsService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.payment.findMany({
         where,
-        include: { invoice: { include: { payments: true } }, dealer: { omit: { password: true } } },
+        include: {
+          invoice: { include: { payments: true } },
+          dealer: { omit: { password: true } },
+        },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -407,7 +423,10 @@ export class PaymentsService {
   ) {
     const payment = await this.prisma.payment.findUnique({
       where: { id },
-      include: { invoice: { include: { payments: true } }, dealer: true },
+      include: {
+        invoice: { include: { payments: true } },
+        dealer: { omit: { password: true } },
+      },
     });
     if (!payment) throw new NotFoundException('Payment not found');
     if (requester.role === 'DEALER' && payment.dealerId !== requester.id) {

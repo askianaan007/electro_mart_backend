@@ -20,7 +20,38 @@ export class InvestorsService {
     private activityLogService: ActivityLogService,
   ) {}
 
-  create(dto: CreateInvestorDto, adminId: string) {
+  /**
+   * Each investor's profitSharePercentage is individually capped at 0-100
+   * by the DTO, but nothing stopped the *sum* across investors from
+   * exceeding 100% — which double-counts profit/expense allocation in
+   * equity.service.ts (e.g. three investors at 40% each = 120%, so 20% of
+   * profit gets attributed twice). Under 100% is left valid — a company can
+   * legitimately keep a remainder unallocated — only the over-100 direction
+   * is an actual bug.
+   */
+  private async assertProfitShareWithinLimit(
+    newPercentage: number,
+    excludeId?: string,
+  ) {
+    const others = await this.prisma.investor.findMany({
+      where: excludeId ? { id: { not: excludeId } } : {},
+      select: { profitSharePercentage: true },
+    });
+    const othersTotal = others.reduce(
+      (sum, inv) => sum.add(inv.profitSharePercentage),
+      new Prisma.Decimal(0),
+    );
+    const projected = othersTotal.add(newPercentage);
+    if (projected.greaterThan(100)) {
+      throw new ConflictException(
+        `This would bring total investor profit share to ${projected.toString()}%, which exceeds 100%`,
+      );
+    }
+  }
+
+  async create(dto: CreateInvestorDto, adminId: string) {
+    await this.assertProfitShareWithinLimit(dto.profitSharePercentage);
+
     return this.prisma.$transaction(async (tx) => {
       const investor = await tx.investor.create({ data: dto });
 
@@ -64,6 +95,9 @@ export class InvestorsService {
 
   async update(id: string, dto: UpdateInvestorDto, adminId: string) {
     await this.findOne(id);
+    if (dto.profitSharePercentage !== undefined) {
+      await this.assertProfitShareWithinLimit(dto.profitSharePercentage, id);
+    }
 
     return this.prisma.$transaction(async (tx) => {
       const investor = await tx.investor.update({ where: { id }, data: dto });

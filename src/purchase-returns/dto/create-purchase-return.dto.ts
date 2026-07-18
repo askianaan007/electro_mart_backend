@@ -4,6 +4,8 @@ import {
   ArrayMinSize,
   IsArray,
   IsDateString,
+  IsInt,
+  IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
@@ -18,7 +20,7 @@ export class PurchaseReturnItemDto {
   productId: string;
 
   @ApiProperty({ minimum: 1 })
-  @IsNumber()
+  @IsInt()
   @Min(1)
   quantity: number;
 
@@ -44,7 +46,8 @@ export class CreatePurchaseReturnDto {
   purchaseId?: string;
 
   @ApiPropertyOptional({
-    description: 'Required when purchaseId is omitted; ignored otherwise (derived from the purchase).',
+    description:
+      'Required when purchaseId is omitted; ignored otherwise (derived from the purchase).',
   })
   @IsOptional()
   @IsUUID()
@@ -52,6 +55,7 @@ export class CreatePurchaseReturnDto {
 
   @ApiProperty()
   @IsString()
+  @IsNotEmpty()
   reason: string;
 
   @ApiProperty()

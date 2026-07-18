@@ -87,7 +87,8 @@ export class OrdersController {
   @Patch(':id/items')
   @Roles(Role.ADMIN)
   @ApiOperation({
-    summary: "Replace a pending order's line items (only while PENDING_APPROVAL)",
+    summary:
+      "Replace a pending order's line items (only while PENDING_APPROVAL)",
   })
   updateItems(
     @Param('id') id: string,
@@ -141,7 +142,10 @@ export class OrdersController {
     summary:
       'Fast-forward an approved order straight to Completed, applying any skipped Packed/Delivered steps along the way',
   })
-  completeDirectly(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+  completeDirectly(
+    @Param('id') id: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
     return this.ordersService.completeDirectly(id, adminId);
   }
 

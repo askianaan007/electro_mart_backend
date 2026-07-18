@@ -1,5 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryActivityLogDto } from './dto/query-activity-log.dto';
 import { paginate } from '../common/utils/paginate';
@@ -77,9 +82,21 @@ export class ActivityLogService {
   /**
    * Wipes every existing entry, then writes one fresh entry recording the
    * clear itself (who did it and how many were removed) — so the audit
-   * trail isn't left with zero evidence that a clear happened.
+   * trail isn't left with zero evidence that a clear happened. Requires the
+   * admin's own password, same as the dealer-data wipe — a bare valid
+   * access token shouldn't be enough to erase the one record that would
+   * reveal what was done with a stolen token.
    */
-  async clearAll(adminId: string) {
+  async clearAll(adminId: string, password: string) {
+    const admin = await this.prisma.admin.findUnique({
+      where: { id: adminId },
+    });
+    if (!admin) throw new NotFoundException('Admin not found');
+    const passwordValid = await bcrypt.compare(password, admin.password);
+    if (!passwordValid) {
+      throw new UnauthorizedException('Incorrect password');
+    }
+
     return this.prisma.$transaction(async (tx) => {
       const { count } = await tx.activityLog.deleteMany({});
       await this.log(tx, {
