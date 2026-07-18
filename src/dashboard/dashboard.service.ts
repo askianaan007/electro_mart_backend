@@ -239,6 +239,20 @@ export class DashboardService {
     sixMonthsAgo.setDate(1);
     sixMonthsAgo.setHours(0, 0, 0, 0);
 
+    // Extend the revenue chart's window back far enough to include any
+    // admin-recorded sale with a backdated sale date older than 6 months —
+    // otherwise it silently drops off the trend the same way Profit/Net
+    // Sales used to when they were scoped to the current calendar month.
+    const earliestCompleted = await this.prisma.order.aggregate({
+      where: { status: OrderStatus.COMPLETED },
+      _min: { completedAt: true },
+    });
+    const earliestCompletedAt = earliestCompleted._min.completedAt;
+    const revenueChartStart =
+      earliestCompletedAt && earliestCompletedAt < sixMonthsAgo
+        ? new Date(earliestCompletedAt.getFullYear(), earliestCompletedAt.getMonth(), 1)
+        : sixMonthsAgo;
+
     const [
       todaysSalesAgg,
       todaysReturnsAgg,
@@ -282,7 +296,7 @@ export class DashboardService {
       this.prisma.$queryRaw<{ month: string; revenue: Prisma.Decimal }[]>`
         SELECT to_char(date_trunc('month', "completedAt"), 'YYYY-MM') as month, SUM("totalAmount") as revenue
         FROM "Order"
-        WHERE status = 'COMPLETED' AND "completedAt" >= ${sixMonthsAgo}
+        WHERE status = 'COMPLETED' AND "completedAt" >= ${revenueChartStart}
         GROUP BY 1 ORDER BY 1
       `,
       // Over-fetch by gross quantity, then net against returns and re-rank
