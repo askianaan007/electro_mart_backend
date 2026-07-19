@@ -22,6 +22,28 @@ export class OrderItemDto {
   @IsInt()
   @Min(1)
   quantity: number;
+
+  @ApiPropertyOptional({
+    minimum: 0,
+    maximum: 100,
+    description:
+      "Admin-only: discount percentage off this line only. Mutually exclusive with this item's discountAmount, and with the order-wide discount — an order uses either a single overall discount or per-product discounts, never both. Ignored for dealer callers.",
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(100)
+  discountPercentage?: number;
+
+  @ApiPropertyOptional({
+    minimum: 0,
+    description:
+      "Admin-only: fixed discount amount off this line only. Mutually exclusive with this item's discountPercentage, and with the order-wide discount. Ignored for dealer callers.",
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  discountAmount?: number;
 }
 
 export class CreateOrderDto {

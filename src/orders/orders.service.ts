@@ -182,6 +182,78 @@ export class OrdersService {
   }
 
   /**
+   * Admin-only alternative to a single order-wide discount: lets each line
+   * carry its own discount (e.g. one product marked down, the rest at full
+   * price) instead of one discount spread across the whole order. Returns
+   * null when no item carries a discount, so callers fall back to the
+   * order-wide resolveDiscount()/allocateItemDiscounts() path — the two
+   * modes are mutually exclusive, enforced by the caller. Unlike
+   * allocateItemDiscounts (which derives each line's share from an
+   * already-known total), this derives the total from each line's own
+   * explicit discount — the definitive figures are computed here, once, and
+   * never recomputed, per the same "store it, never recompute" rule sales
+   * returns rely on.
+   */
+  private applyItemLevelDiscounts<
+    T extends { lineTotal: Prisma.Decimal; quantity: number },
+  >(itemsData: T[], items: OrderItemDto[]) {
+    const usesItemDiscounts = items.some(
+      (item) =>
+        item.discountPercentage !== undefined ||
+        item.discountAmount !== undefined,
+    );
+    if (!usesItemDiscounts) return null;
+
+    let discountTotal = new Prisma.Decimal(0);
+    let discountedLineCount = 0;
+
+    const discountedItems = itemsData.map((itemData, index) => {
+      const dto = items[index];
+      if (
+        dto.discountPercentage !== undefined &&
+        dto.discountAmount !== undefined
+      ) {
+        throw new BadRequestException(
+          'Provide either a discount percentage or a fixed discount amount for a product, not both',
+        );
+      }
+
+      let allocatedDiscount = new Prisma.Decimal(0);
+      if (dto.discountAmount !== undefined) {
+        allocatedDiscount = new Prisma.Decimal(dto.discountAmount);
+        if (allocatedDiscount.greaterThan(itemData.lineTotal)) {
+          throw new BadRequestException(
+            "A product's discount cannot exceed its own line total",
+          );
+        }
+      } else if (dto.discountPercentage !== undefined) {
+        allocatedDiscount = itemData.lineTotal
+          .mul(dto.discountPercentage)
+          .div(100)
+          .toDecimalPlaces(2);
+      }
+
+      if (allocatedDiscount.greaterThan(0)) discountedLineCount += 1;
+      discountTotal = discountTotal.add(allocatedDiscount);
+
+      const netLineTotal = itemData.lineTotal.sub(allocatedDiscount);
+      const netUnitPrice =
+        itemData.quantity > 0
+          ? netLineTotal.div(itemData.quantity).toDecimalPlaces(2)
+          : netLineTotal;
+
+      return { ...itemData, allocatedDiscount, netLineTotal, netUnitPrice };
+    });
+
+    const discountDescription =
+      discountedLineCount > 0
+        ? `product-level discounts on ${discountedLineCount} item${discountedLineCount > 1 ? 's' : ''}`
+        : null;
+
+    return { itemsData: discountedItems, discountTotal, discountDescription };
+  }
+
+  /**
    * Shared by approve() and the admin-create-order path: reserves stock,
    * generates the invoice, marks the order APPROVED, and logs the action.
    *
@@ -213,6 +285,11 @@ export class OrdersService {
       activityAction: string;
       completionDate?: Date;
       createdAt?: Date;
+      // Set when the items already carry their own explicit per-product
+      // discounts (applyItemLevelDiscounts), persisted at creation — the
+      // proportional order-wide allocation below would overwrite them
+      // incorrectly, so it's skipped entirely in that case.
+      skipItemDiscountAllocation?: boolean;
     },
   ) {
     for (const item of order.items) {
@@ -224,23 +301,25 @@ export class OrdersService {
       });
     }
 
-    // The discount is only known now — allocate each item's share and
-    // persist it, since sales returns will refund from these stored figures
-    // rather than ever recomputing them.
-    const allocatedItems = this.allocateItemDiscounts(
-      order.items,
-      order.subtotal,
-      options.discountTotal,
-    );
-    for (const item of allocatedItems) {
-      await tx.orderItem.update({
-        where: { id: item.id },
-        data: {
-          allocatedDiscount: item.allocatedDiscount,
-          netLineTotal: item.netLineTotal,
-          netUnitPrice: item.netUnitPrice,
-        },
-      });
+    if (!options.skipItemDiscountAllocation) {
+      // The discount is only known now — allocate each item's share and
+      // persist it, since sales returns will refund from these stored
+      // figures rather than ever recomputing them.
+      const allocatedItems = this.allocateItemDiscounts(
+        order.items,
+        order.subtotal,
+        options.discountTotal,
+      );
+      for (const item of allocatedItems) {
+        await tx.orderItem.update({
+          where: { id: item.id },
+          data: {
+            allocatedDiscount: item.allocatedDiscount,
+            netLineTotal: item.netLineTotal,
+            netUnitPrice: item.netUnitPrice,
+          },
+        });
+      }
     }
 
     const invoiceNumber = await nextSequenceNumber(tx, 'invoice', 'INV');
@@ -443,12 +522,36 @@ export class OrdersService {
     if (dealer.status !== AccountStatus.ACTIVE)
       throw new ForbiddenException('Dealer account is inactive');
 
-    const { itemsData, subtotal } = await this.buildItemsAndSubtotal(dto.items);
+    const { itemsData: builtItems, subtotal } =
+      await this.buildItemsAndSubtotal(dto.items);
 
-    const { discountTotal, discountDescription } =
-      requester.role === Role.ADMIN
-        ? this.resolveDiscount(subtotal, dto)
-        : { discountTotal: new Prisma.Decimal(0), discountDescription: null };
+    let itemsData = builtItems;
+    let discountTotal = new Prisma.Decimal(0);
+    let discountDescription: string | null = null;
+    let usesItemLevelDiscount = false;
+
+    if (requester.role === Role.ADMIN) {
+      const itemLevel = this.applyItemLevelDiscounts(builtItems, dto.items);
+      if (itemLevel) {
+        if (
+          dto.discountPercentage !== undefined ||
+          dto.discountAmount !== undefined
+        ) {
+          throw new BadRequestException(
+            'Provide either a per-product discount or an order-wide discount, not both',
+          );
+        }
+        itemsData = itemLevel.itemsData;
+        discountTotal = itemLevel.discountTotal;
+        discountDescription = itemLevel.discountDescription;
+        usesItemLevelDiscount = true;
+      } else {
+        ({ discountTotal, discountDescription } = this.resolveDiscount(
+          subtotal,
+          dto,
+        ));
+      }
+    }
 
     const totalAmount = subtotal.sub(discountTotal);
     const creditLimitErrorMessage =
@@ -496,6 +599,7 @@ export class OrdersService {
           activityAction: 'ADMIN_CREATED_ORDER',
           completionDate,
           createdAt,
+          skipItemDiscountAllocation: usesItemLevelDiscount,
         });
       }, TRANSACTION_OPTIONS);
 
@@ -671,16 +775,34 @@ export class OrdersService {
         dto.items,
         tx,
       );
-      const { discountTotal, discountDescription } = this.resolveDiscount(
-        subtotal,
-        dto,
-      );
+      const itemLevel = this.applyItemLevelDiscounts(itemsData, dto.items);
+      let discountTotal: Prisma.Decimal;
+      let discountDescription: string | null;
+      let allocatedItemsData: typeof itemsData;
+      if (itemLevel) {
+        if (
+          dto.discountPercentage !== undefined ||
+          dto.discountAmount !== undefined
+        ) {
+          throw new BadRequestException(
+            'Provide either a per-product discount or an order-wide discount, not both',
+          );
+        }
+        discountTotal = itemLevel.discountTotal;
+        discountDescription = itemLevel.discountDescription;
+        allocatedItemsData = itemLevel.itemsData;
+      } else {
+        ({ discountTotal, discountDescription } = this.resolveDiscount(
+          subtotal,
+          dto,
+        ));
+        allocatedItemsData = this.allocateItemDiscounts(
+          itemsData,
+          subtotal,
+          discountTotal,
+        );
+      }
       const grandTotal = subtotal.sub(discountTotal);
-      const allocatedItemsData = this.allocateItemDiscounts(
-        itemsData,
-        subtotal,
-        discountTotal,
-      );
 
       await this.assertWithinCreditLimit(
         tx,
