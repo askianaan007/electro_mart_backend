@@ -6,9 +6,9 @@
 | **Document type** | Solution Architecture Proposal |
 | **Prepared for** | Electro Mart |
 | **Prepared by** | Backend/Platform Architecture (Claude Code) |
-| **Version** | 2.0 — full rewrite, supersedes the v1 draft in its entirety |
+| **Version** | 2.1 — extended additively with the Representative Operations, Commission & Collections layer; the v2.0 architecture below is unchanged and still authoritative for everything it covers |
 | **Status** | Proposal for review — **nothing described here has been implemented** |
-| **Companion document** | `current_backend.md` — the as-built reference this proposal is designed against |
+| **Companion documents** | `current_backend.md` — the as-built reference this proposal is designed against · `version2_changes_backend.md` — full backend spec for the v2.1 additions (Representative Management, commission engine, collections, cheque handling, activity logging, reporting) · `additional_requirement_changes_rep_portal.md` — the `electromart_rep` frontend requirements against those v2.1 additions |
 | **Compatibility guarantee** | 100% additive. Admin Panel and Dealer Portal require zero code or schema changes to keep working exactly as they do today. |
 
 > **A note on this revision.** The v1 draft covered the mechanics of "a rep places an order for a shop."
@@ -17,6 +17,12 @@
 > and Grainger — while holding the same non-negotiable constraint the business set from day one: the
 > existing Order → Invoice → Payment → Inventory pipeline, and everything the Admin and Dealer rely on
 > today, does not move. Every new capability below is designed to sit *beside* that pipeline, not inside it.
+
+> **v2.1 note.** Everything from here through §30 is the original v2.0 proposal, unchanged. A second wave of
+> requirements — representative staff management, per-product commission, field payment collection, and
+> the reporting/notification layer that goes with them — is specified in full in the two companion documents
+> named above, and summarized in §31 at the end of this document. The same non-negotiable safety framework
+> below applies to every line of that work; §31 and its companions hold themselves to it explicitly.
 
 ---
 
@@ -81,6 +87,7 @@ existing client needs to change.*
 28. [Performance & Scalability](#28-performance--scalability)
 29. [Appendix A — Business Decisions Required](#29-appendix-a--business-decisions-required)
 30. [Appendix B — Compatibility Guarantee, In Detail](#30-appendix-b--compatibility-guarantee-in-detail)
+31. [Version 2.1 — Representative Operations, Commission & Collections Layer](#31-version-21--representative-operations-commission--collections-layer)
 
 ---
 
@@ -1737,3 +1744,82 @@ alongside untouched ones. No existing sequence, calculation, or report definitio
 architecture, restated one final time in the most falsifiable form this document offers: every claim above
 names the exact file, table, or method it depends on, so it can be checked against the codebase directly
 rather than taken on faith.
+
+---
+
+## 31. Version 2.1 — Representative Operations, Commission & Collections Layer
+
+A second wave of requirements turns the Representative Portal from an ordering tool into a full staff
+operations surface: reps are now managed as first-class Admin Panel entities (alongside Dealers), their
+catalog and homepage are individually curated, they earn tracked commission, and they participate directly
+in payment collection — all specified in exhaustive, per-feature detail (business flow, UI flow, database
+design, backend architecture, API endpoints, permission model, admin/rep screens, notifications, security,
+and compatibility justification, for each of fifteen feature areas) in `version2_changes_backend.md`, with
+the corresponding `electromart_rep` frontend requirements in `additional_requirement_changes_rep_portal.md`.
+This section is the executive summary; those two documents are authoritative for implementation.
+
+### 31.1 What's added
+
+| Capability | One-line summary |
+|---|---|
+| Representative Management | A full Admin Panel module — list/detail/create/edit/suspend/activate/block, mirroring Dealer Management |
+| Account Creation & Login | Email-as-username, generated temp password, welcome email, forced first-login password change, rolling lockout after failed attempts |
+| Product Assignment | Reps see only admin-assigned categories/products/brands/campaigns — not the full catalog by default |
+| Banner Assignment | Per-rep homepage banner targeting with schedule/priority, falling back to the existing global list when unassigned |
+| Inventory Visibility | Reps see only In Stock/Out of Stock, never a quantity — with an admin-controlled override independent of real stock |
+| Commission Engine | Per-product percentage or fixed commission rules, date-ranged, with standing vs. campaign rates |
+| Earnings Dashboard | A self-scoped "My Earnings" view — sales figures, commission earned/pending/paid, settlement history, statement export |
+| Admin Commission Management | Settlement approval/rejection, recording how a settlement was paid, receipts |
+| Accounting Integration | A paid settlement becomes a real `Expense` row — automatically included in Liquid Cash, Sales Analysis, and Equity with no changes to any of those calculations |
+| Representative Activity Log | A dedicated, richer (IP/device) audit trail — rep read-only, admin read+delete |
+| Customer Collection Management | Reps record what they collected in the field; only an admin's confirmation ever creates a real payment |
+| Cheque Management | Reuses the existing cheque-status lifecycle as-is; adds an automatic rep-facing email when a cheque bounces |
+| Collection Reminders | A grace-period-driven scheduled reminder email, reusing the existing invoice-overdue derivation |
+| Reporting | Ten new admin reports — representative/collection/commission/settlement/cheque/product/category performance |
+
+### 31.2 The architectural decisions that make this additive
+
+Three decisions carry the whole safety argument, each made explicit and defended in full in
+`version2_changes_backend.md` §2, §8, and §14 respectively — restated briefly here because they're the
+parts most worth an architect double-checking before implementation begins:
+
+1. **Commission is computed outside the order pipeline, not inside it.** `OrdersService.applyApproval()` —
+   already guaranteed untouched in §30's compatibility audit — stays untouched. A new, independent scheduled
+   job reads already-approved orders after the fact and writes commission ledger entries; it never calls
+   into, and cannot affect, order approval itself. The cost is a few minutes of lag between approval and a
+   commission line appearing; the benefit is a hard, provable zero-change guarantee on the highest-scrutiny
+   code in the system.
+2. **A representative's collection submission cannot move money.** It is a staging record an admin reviews;
+   only the admin's confirmation action calls the existing, completely unmodified `PaymentsService.create()`
+   — the same guarded function (row-locking, overpayment checks, balance updates) that already governs every
+   payment in production. There is no new way for money to move in this system, only a new front door onto
+   the same, unmodified door that already exists.
+3. **Stock visibility is a response-serialization rule, not a data change.** `Product.currentStock` is never
+   renamed, reinterpreted, or touched by any new write path — a representative's response simply never
+   contains it, the same way `costPrice` is already stripped from every dealer-facing response today.
+
+### 31.3 Schema footprint
+
+Fourteen new tables, six new enums, and reverse-relation-only additions to `Dealer`, `Order`, `Invoice`,
+`Payment`, `Product`, `Banner`, and `Expense` — zero existing columns added, renamed, or removed on any of
+them. Full DDL in `version2_changes_backend.md` §1. This also revises two details of the not-yet-built
+`Representative`/`ActivityLog.repId` sketch from §23 above — `Representative.status` becomes a dedicated
+`RepresentativeStatus` enum rather than a reuse of `AccountStatus`, and representative auditing gets its own
+dedicated `RepresentativeActivityLog` table rather than the shared `ActivityLog` — both explained in
+`version2_changes_backend.md` §3.3 and §13.3, and both zero-risk because neither table has been built yet.
+
+### 31.4 Migration phasing
+
+Follows the same additive-DDL-first, independently-deployable discipline as §25: **Phase 0** (schema only,
+deployable before any application code) → **Phase 1** (representative lifecycle: management, login, product
+assignment, inventory visibility) → **Phase 2** (money: commission, settlements, accounting integration,
+collections) → **Phase 3** (banner assignment, rich activity log, cheque-return email, reminders, reporting,
+earnings dashboard UI). Full detail in `version2_changes_backend.md` §19.
+
+### 31.5 The same guarantee, once more
+
+Every claim in `version2_changes_backend.md` §20's safety audit reduces to the same sentence this whole
+document keeps returning to: **new things are added beside the existing system, or they call into it exactly
+the way an admin already does today — never inside it, never around it.** Zero production data loss, zero
+historical data touched, zero breaking API changes, zero downtime migration, full backward compatibility —
+proven per-feature in the companion document, not merely asserted here.
