@@ -317,9 +317,14 @@ model Invoice {
 }
 
 model Payment {
-  id          String      @id @default(uuid())
-  invoiceId   String
-  invoice     Invoice     @relation(fields: [invoiceId], references: [id])
+  id        String  @id @default(uuid())
+  // Null means this isn't a payment against any specific invoice — it's a
+  // standalone credit added directly to the dealer's account (e.g. an
+  // advance/prepayment). Everything else about it (mode, cheque lifecycle,
+  // edit/reverse window, activity log) works exactly like a normal payment;
+  // only the invoice-balance cap and paymentStatus recompute don't apply.
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
   dealerId    String
   dealer      Dealer      @relation(fields: [dealerId], references: [id])
   amount      Decimal
