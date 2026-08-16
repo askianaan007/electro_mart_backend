@@ -82,6 +82,11 @@ class EnvironmentVariables {
   @IsString()
   @IsNotEmpty()
   CLOUDINARY_API_SECRET: string;
+
+  // Representative Portal — optional, only used in welcome emails.
+  @IsOptional()
+  @IsString()
+  REP_PORTAL_URL?: string;
 }
 
 export function validate(config: Record<string, unknown>) {

@@ -12,6 +12,7 @@ import { UploadedImage, UploadsService } from '../uploads/uploads.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
+import { SetAvailabilityOverrideDto } from './dto/set-availability-override.dto';
 import { paginate } from '../common/utils/paginate';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
@@ -91,11 +92,18 @@ export class ProductsService {
     return withStockFlag(product);
   }
 
-  async findAll(query: QueryProductDto) {
+  /**
+   * `extraWhere` is layered on with AND (never merged into the top-level
+   * object) so it composes safely with the `search` OR-clause below rather
+   * than silently overwriting it. Only the Representative read path passes
+   * one (product-assignment scoping, version2_changes_backend.md §6.4) — every
+   * existing Admin/Dealer caller omits it and gets byte-identical behavior.
+   */
+  async findAll(query: QueryProductDto, extraWhere?: Prisma.ProductWhereInput) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
 
-    const where: Prisma.ProductWhereInput = {
+    const baseWhere: Prisma.ProductWhereInput = {
       category: query.category,
       status: query.status,
       ...(query.outOfStockOnly && { currentStock: { lte: 0 } }),
@@ -105,9 +113,13 @@ export class ProductsService {
           { productCode: { contains: query.search, mode: 'insensitive' } },
           { sku: { contains: query.search, mode: 'insensitive' } },
           { brand: { contains: query.search, mode: 'insensitive' } },
+          { model: { contains: query.search, mode: 'insensitive' } },
         ],
       }),
     };
+    const where: Prisma.ProductWhereInput = extraWhere
+      ? { AND: [baseWhere, extraWhere] }
+      : baseWhere;
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.product.findMany({
@@ -123,11 +135,17 @@ export class ProductsService {
     return paginate(data.map(withStockFlag), total, page, limit);
   }
 
-  async findOne(id: string) {
-    const product = await this.prisma.product.findUnique({
-      where: { id },
-      include: this.imagesInclude,
-    });
+  /** `extraWhere` — see findAll(); used by the Representative read path to 404 out-of-scope products. */
+  async findOne(id: string, extraWhere?: Prisma.ProductWhereInput) {
+    const product = extraWhere
+      ? await this.prisma.product.findFirst({
+          where: { id, AND: [extraWhere] },
+          include: this.imagesInclude,
+        })
+      : await this.prisma.product.findUnique({
+          where: { id },
+          include: this.imagesInclude,
+        });
     if (!product) throw new NotFoundException('Product not found');
     return withStockFlag(product);
   }
@@ -328,5 +346,74 @@ export class ProductsService {
     await this.uploadsService.deleteImage(image.publicId);
 
     return { message: 'Image removed' };
+  }
+
+  // -------------------------------------------------------------------
+  // Representative availability override (version2_changes_backend.md §8) —
+  // never touches currentStock itself, only a satellite row consulted
+  // exclusively by RepCatalogVisibilityService for the REPRESENTATIVE read
+  // path. Admin/Dealer stock reads are entirely unaffected.
+  // -------------------------------------------------------------------
+
+  async setAvailabilityOverride(
+    id: string,
+    dto: SetAvailabilityOverrideDto,
+    adminId: string,
+  ) {
+    await this.findOne(id);
+
+    return this.prisma.$transaction(async (tx) => {
+      const override = await tx.productAvailabilityOverride.upsert({
+        where: { productId: id },
+        create: {
+          productId: id,
+          forceAvailable: dto.forceAvailable,
+          reason: dto.reason,
+          setByAdminId: adminId,
+        },
+        update: {
+          forceAvailable: dto.forceAvailable,
+          reason: dto.reason,
+          setByAdminId: adminId,
+        },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'SET_PRODUCT_AVAILABILITY_OVERRIDE',
+        targetId: id,
+        details: `Forced representative-visible availability to ${dto.forceAvailable ? 'In Stock' : 'Out of Stock'}${dto.reason ? ` (${dto.reason})` : ''}`,
+      });
+
+      return override;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  async removeAvailabilityOverride(id: string, adminId: string) {
+    await this.findOne(id);
+    const existing = await this.prisma.productAvailabilityOverride.findUnique({
+      where: { productId: id },
+    });
+    if (!existing)
+      return {
+        message:
+          'No override was set; representatives already see the real stock status',
+      };
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.productAvailabilityOverride.delete({ where: { productId: id } });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'REMOVED_PRODUCT_AVAILABILITY_OVERRIDE',
+        targetId: id,
+        details:
+          'Reverted representative-visible availability to the real stock status',
+      });
+    }, TRANSACTION_OPTIONS);
+
+    return {
+      message:
+        'Availability override removed; representatives now see the real stock status',
+    };
   }
 }

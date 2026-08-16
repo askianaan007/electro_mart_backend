@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ChequeStatus, Payment, Prisma } from '@prisma/client';
+import { ChequeStatus, Invoice, Payment, Prisma, Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
@@ -155,6 +155,7 @@ export class PaymentsService {
       });
       if (!payment) throw new NotFoundException('Payment not found');
       this.assertEditable(payment);
+      this.assertHasInvoice(payment);
 
       const otherEffectivePaid = computeEffectivePaid(
         payment.invoice.payments.filter((p) => p.id !== id),
@@ -231,6 +232,7 @@ export class PaymentsService {
     });
     if (!payment) throw new NotFoundException('Payment not found');
     this.assertEditable(payment);
+    this.assertHasInvoice(payment);
 
     return this.prisma.$transaction(async (tx) => {
       await tx.payment.delete({ where: { id } });
@@ -258,6 +260,25 @@ export class PaymentsService {
 
       return { message: 'Payment returned' };
     }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * invoiceId/invoice are nullable in the schema for a not-yet-exposed
+   * standalone-credit case (see the Payment model's own comment) — every
+   * payment CreatePaymentDto can actually produce today always has one,
+   * since invoiceId is a required field there. This just makes that
+   * existing guarantee explicit for the type checker rather than assuming it.
+   */
+  private assertHasInvoice<
+    T extends { invoiceId: string | null; invoice: Invoice | null },
+  >(
+    payment: T,
+  ): asserts payment is T & { invoiceId: string; invoice: Invoice } {
+    if (!payment.invoice || !payment.invoiceId) {
+      throw new BadRequestException(
+        'This payment is not associated with an invoice',
+      );
+    }
   }
 
   private assertEditable(payment: Payment) {
@@ -295,6 +316,7 @@ export class PaymentsService {
         'Only cheque payments have a cheque status',
       );
     }
+    this.assertHasInvoice(payment);
 
     let details: string;
 
@@ -417,10 +439,7 @@ export class PaymentsService {
     return paginate(data, total, page, limit);
   }
 
-  async findOne(
-    id: string,
-    requester: { role: 'ADMIN' | 'DEALER'; id: string },
-  ) {
+  async findOne(id: string, requester: { role: Role; id: string }) {
     const payment = await this.prisma.payment.findUnique({
       where: { id },
       include: {

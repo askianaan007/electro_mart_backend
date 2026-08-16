@@ -28,6 +28,13 @@ import { SalesReturnsModule } from './sales-returns/sales-returns.module';
 import { PurchaseReturnsModule } from './purchase-returns/purchase-returns.module';
 import { CreditsModule } from './credits/credits.module';
 import { SalesAnalysisModule } from './sales-analysis/sales-analysis.module';
+import { RepresentativesModule } from './representatives/representatives.module';
+import { RepPortalModule } from './rep-portal/rep-portal.module';
+import { BrandsModule } from './brands/brands.module';
+import { BannersModule } from './banners/banners.module';
+import { CommissionModule } from './commission/commission.module';
+import { CollectionsModule } from './collections/collections.module';
+import { ReportsModule } from './reports/reports.module';
 
 @Module({
   imports: [
@@ -56,6 +63,13 @@ import { SalesAnalysisModule } from './sales-analysis/sales-analysis.module';
     PurchaseReturnsModule,
     CreditsModule,
     SalesAnalysisModule,
+    RepresentativesModule,
+    RepPortalModule,
+    BrandsModule,
+    BannersModule,
+    CommissionModule,
+    CollectionsModule,
+    ReportsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

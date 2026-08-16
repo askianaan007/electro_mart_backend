@@ -259,4 +259,200 @@ export class MailerService {
       `,
     });
   }
+
+  // ---------------------------------------------------------------------
+  // Representative Portal v2.1 — version2_changes_backend.md §4, §11, §14-§16.
+  // All additive methods; nothing above this line is modified.
+  // ---------------------------------------------------------------------
+
+  notifyRepWelcome(
+    repEmail: string,
+    name: string,
+    username: string,
+    temporaryPassword: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject:
+        'Welcome to Electro Mart — you are now an Official Sales Representative',
+      html: `
+        <p>Congratulations, ${name}.</p>
+        <p>You have been appointed as an Official Sales Representative of Electro Mart.</p>
+        <p>
+          <strong>Login URL:</strong> ${this.config.get<string>('REP_PORTAL_URL') ?? '(see your administrator)'}<br/>
+          <strong>Username:</strong> ${username}<br/>
+          <strong>Temporary Password:</strong> ${temporaryPassword}
+        </p>
+        <p>For your security, you will be required to set a new password the first time you log in.</p>
+        <p>If you did not expect this email, please contact Electro Mart support immediately.</p>
+      `,
+    });
+  }
+
+  notifyRepPasswordReset(
+    repEmail: string,
+    name: string,
+    username: string,
+    temporaryPassword: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: 'Your Electro Mart representative password has been reset',
+      html: `
+        <p>Hello ${name},</p>
+        <p>An administrator has reset your account password.</p>
+        <p><strong>Username:</strong> ${username}<br/><strong>New temporary password:</strong> ${temporaryPassword}</p>
+        <p>Please log in and change your password as soon as possible.</p>
+      `,
+    });
+  }
+
+  notifyRepStatusChanged(
+    repEmail: string,
+    name: string,
+    status: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Your Electro Mart account status has changed: ${status}`,
+      html: `<p>Hello ${name},</p><p>Your representative account status has been updated to <strong>${status}</strong>. Contact your administrator with any questions.</p>`,
+    });
+  }
+
+  notifyRepOrderApproved(
+    repEmail: string,
+    orderNumber: string,
+    customerName: string,
+    invoiceNumber: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Order ${orderNumber} approved`,
+      html: `<p>The order <strong>${orderNumber}</strong> you placed for ${customerName} has been approved. Invoice <strong>${invoiceNumber}</strong> is ready.</p>`,
+    });
+  }
+
+  notifyRepOrderRejected(
+    repEmail: string,
+    orderNumber: string,
+    customerName: string,
+    reason: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Order ${orderNumber} rejected`,
+      html: `<p>The order <strong>${orderNumber}</strong> you placed for ${customerName} was rejected.</p><p>Reason: ${reason}</p>`,
+    });
+  }
+
+  notifyRepSettlementPaid(
+    repEmail: string,
+    name: string,
+    settlementNumber: string,
+    amount: string,
+    mode: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Commission settlement ${settlementNumber} paid`,
+      html: `<p>Hello ${name},</p><p>Your commission settlement <strong>${settlementNumber}</strong> of <strong>${amount}</strong> has been paid via ${mode}.</p>`,
+    });
+  }
+
+  notifyRepSettlementRejected(
+    repEmail: string,
+    name: string,
+    settlementNumber: string,
+    reason: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Commission settlement ${settlementNumber} rejected`,
+      html: `<p>Hello ${name},</p><p>Your commission settlement <strong>${settlementNumber}</strong> was rejected.</p><p>Reason: ${reason}</p>`,
+    });
+  }
+
+  notifyRepCollectionConfirmed(
+    repEmail: string,
+    customerName: string,
+    amount: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Collection confirmed — ${customerName}`,
+      html: `<p>Your collection of <strong>${amount}</strong> from ${customerName} has been verified and recorded by an administrator.</p>`,
+    });
+  }
+
+  notifyRepCollectionRejected(
+    repEmail: string,
+    customerName: string,
+    amount: string,
+    reason: string,
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Collection rejected — ${customerName}`,
+      html: `<p>Your submitted collection of <strong>${amount}</strong> from ${customerName} was rejected.</p><p>Reason: ${reason}</p>`,
+    });
+  }
+
+  notifyRepChequeReturned(
+    repEmail: string,
+    data: {
+      customerName: string;
+      invoiceNumber: string;
+      chequeNumber: string;
+      chequeAmount: string;
+      bankName: string;
+      reason: string;
+      outstandingBalance: string;
+    },
+  ): Promise<void> {
+    return this.send({
+      to: repEmail,
+      subject: `Cheque returned — ${data.customerName} (${data.invoiceNumber})`,
+      html: `
+        <p>A cheque from <strong>${data.customerName}</strong> against invoice <strong>${data.invoiceNumber}</strong> has bounced.</p>
+        <table style="border-collapse:collapse;">
+          <tr><td style="padding:4px 10px;">Cheque Number</td><td style="padding:4px 10px;"><strong>${data.chequeNumber}</strong></td></tr>
+          <tr><td style="padding:4px 10px;">Bank</td><td style="padding:4px 10px;">${data.bankName}</td></tr>
+          <tr><td style="padding:4px 10px;">Amount</td><td style="padding:4px 10px;">${data.chequeAmount}</td></tr>
+          <tr><td style="padding:4px 10px;">Reason</td><td style="padding:4px 10px;">${data.reason}</td></tr>
+          <tr><td style="padding:4px 10px;">Outstanding Balance</td><td style="padding:4px 10px;"><strong>${data.outstandingBalance}</strong></td></tr>
+        </table>
+        <p><strong>Required next action:</strong> Follow up with the customer to arrange an alternative payment.</p>
+      `,
+    });
+  }
+
+  notifyRepCollectionReminder(
+    repEmail: string,
+    data: {
+      customerName: string;
+      invoiceNumber: string;
+      outstandingAmount: string;
+      daysRemaining: number;
+      overdueDays: number;
+      priority: 'NORMAL' | 'HIGH' | 'OVERDUE';
+    },
+  ): Promise<void> {
+    const statusLine =
+      data.priority === 'OVERDUE'
+        ? `<strong style="color:#c0392b;">${data.overdueDays} day(s) overdue</strong>`
+        : `${data.daysRemaining} day(s) remaining in the grace period`;
+    return this.send({
+      to: repEmail,
+      subject: `Collection reminder — ${data.customerName} (${data.invoiceNumber})`,
+      html: `
+        <p>This is a reminder that a collection is still outstanding:</p>
+        <table style="border-collapse:collapse;">
+          <tr><td style="padding:4px 10px;">Customer</td><td style="padding:4px 10px;"><strong>${data.customerName}</strong></td></tr>
+          <tr><td style="padding:4px 10px;">Invoice</td><td style="padding:4px 10px;">${data.invoiceNumber}</td></tr>
+          <tr><td style="padding:4px 10px;">Outstanding Amount</td><td style="padding:4px 10px;"><strong>${data.outstandingAmount}</strong></td></tr>
+          <tr><td style="padding:4px 10px;">Status</td><td style="padding:4px 10px;">${statusLine}</td></tr>
+        </table>
+      `,
+    });
+  }
 }

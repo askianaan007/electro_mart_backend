@@ -6,6 +6,7 @@ import {
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
+import { UploadsService } from '../uploads/uploads.service';
 import { CreateCategoryDto } from './dto/create-category.dto';
 import { UpdateCategoryDto } from './dto/update-category.dto';
 import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
@@ -17,6 +18,7 @@ export class CategoriesService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private uploadsService: UploadsService,
   ) {}
 
   async create(dto: CreateCategoryDto, adminId: string) {
@@ -120,7 +122,7 @@ export class CategoriesService {
       );
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    await this.prisma.$transaction(async (tx) => {
       await tx.category.delete({ where: { id } });
 
       await this.activityLogService.log(tx, {
@@ -129,8 +131,65 @@ export class CategoriesService {
         targetId: id,
         details: `Deleted category ${category.name}`,
       });
-
-      return { message: 'Category deleted' };
     }, TRANSACTION_OPTIONS);
+
+    if (category.imagePublicId)
+      await this.uploadsService.deleteImage(category.imagePublicId);
+    if (category.iconPublicId)
+      await this.uploadsService.deleteImage(category.iconPublicId);
+
+    return { message: 'Category deleted' };
+  }
+
+  async uploadImage(id: string, file: Express.Multer.File, adminId: string) {
+    const category = await this.findOne(id);
+    const uploaded = await this.uploadsService.uploadImage(
+      file.buffer,
+      'categories',
+    );
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.category.update({
+        where: { id },
+        data: { imageUrl: uploaded.url, imagePublicId: uploaded.publicId },
+      });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_CATEGORY_IMAGE',
+        targetId: id,
+        details: `Updated image for category ${category.name}`,
+      });
+      return result;
+    }, TRANSACTION_OPTIONS);
+
+    if (category.imagePublicId)
+      await this.uploadsService.deleteImage(category.imagePublicId);
+    return updated;
+  }
+
+  async uploadIcon(id: string, file: Express.Multer.File, adminId: string) {
+    const category = await this.findOne(id);
+    const uploaded = await this.uploadsService.uploadImage(
+      file.buffer,
+      'categories',
+    );
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.category.update({
+        where: { id },
+        data: { iconUrl: uploaded.url, iconPublicId: uploaded.publicId },
+      });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_CATEGORY_ICON',
+        targetId: id,
+        details: `Updated icon for category ${category.name}`,
+      });
+      return result;
+    }, TRANSACTION_OPTIONS);
+
+    if (category.iconPublicId)
+      await this.uploadsService.deleteImage(category.iconPublicId);
+    return updated;
   }
 }

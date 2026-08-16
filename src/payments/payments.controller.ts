@@ -21,13 +21,22 @@ import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
+import { PrismaService } from '../prisma/prisma.service';
+import { MailerService } from '../mailer/mailer.service';
 
 @ApiTags('Payments')
 @ApiBearerAuth('access-token')
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('payments')
 export class PaymentsController {
-  constructor(private paymentsService: PaymentsService) {}
+  constructor(
+    private paymentsService: PaymentsService,
+    // Only used for the post-commit rep-notification hook below
+    // (version2_changes_backend.md §15.4) — PaymentsService itself is not
+    // touched by this addition.
+    private prisma: PrismaService,
+    private mailer: MailerService,
+  ) {}
 
   @Post()
   @Roles(Role.ADMIN)
@@ -84,11 +93,48 @@ export class PaymentsController {
     summary:
       'Mark a pending cheque payment as cleared or returned (bounced), or revert a cleared/returned cheque back to pending within 1 day of that change',
   })
-  updateChequeStatus(
+  async updateChequeStatus(
     @Param('id') id: string,
     @Body() dto: UpdatePaymentChequeStatusDto,
     @CurrentUser('sub') adminId: string,
   ) {
-    return this.paymentsService.updateChequeStatus(id, dto.status, adminId);
+    const result = await this.paymentsService.updateChequeStatus(
+      id,
+      dto.status,
+      adminId,
+    );
+
+    if (dto.status === 'RETURNED') {
+      // Fire-and-forget, strictly after the update above has already
+      // committed — a failure here can never affect the cheque-status
+      // transition that already happened (§15.4/§15.11).
+      this.notifyRepIfChequeReturned(id).catch(() => undefined);
+    }
+
+    return result;
+  }
+
+  /** version2_changes_backend.md §15.4 — the one place new code sits directly next to (not inside) existing payment logic. */
+  private async notifyRepIfChequeReturned(paymentId: string) {
+    const payment = await this.prisma.payment.findUnique({
+      where: { id: paymentId },
+      include: {
+        invoice: {
+          include: { order: { include: { createdByRep: true } }, dealer: true },
+        },
+      },
+    });
+    const rep = payment?.invoice?.order.createdByRep;
+    if (!payment || !payment.invoice || !rep) return;
+
+    await this.mailer.notifyRepChequeReturned(rep.email, {
+      customerName: payment.invoice.dealer.businessName,
+      invoiceNumber: payment.invoice.invoiceNumber,
+      chequeNumber: payment.chequeNumber ?? '—',
+      chequeAmount: payment.amount.toString(),
+      bankName: payment.bankName ?? '—',
+      reason: 'Cheque returned by bank',
+      outstandingBalance: payment.invoice.dealer.outstandingBalance.toString(),
+    });
   }
 }

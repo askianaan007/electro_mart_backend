@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { PaymentStatus, Prisma } from '@prisma/client';
+import { PaymentStatus, Prisma, Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { QueryInvoiceDto } from './dto/query-invoice.dto';
@@ -180,10 +180,7 @@ export class InvoicesService {
     );
   }
 
-  async findOne(
-    id: string,
-    requester: { role: 'ADMIN' | 'DEALER'; id: string },
-  ) {
+  async findOne(id: string, requester: { role: Role; id: string }) {
     const invoice = await this.prisma.invoice.findUnique({
       where: { id },
       include: this.invoiceDetailInclude,

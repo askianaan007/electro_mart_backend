@@ -7,8 +7,10 @@ import {
   IsInt,
   IsNumber,
   IsOptional,
+  IsString,
   IsUUID,
   Max,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -49,7 +51,7 @@ export class OrderItemDto {
 export class CreateOrderDto {
   @ApiPropertyOptional({
     description:
-      "Admin-only: the dealer to place this order for. Required when an admin creates the order, ignored (the caller's own id is used) when a dealer creates it.",
+      "Admin/Representative only: the dealer (or, for a representative, the customer/shop) to place this order for. Required for those two roles, ignored (the caller's own id is used) when a dealer creates it.",
   })
   @IsOptional()
   @IsUUID()
@@ -93,4 +95,21 @@ export class CreateOrderDto {
   @IsOptional()
   @IsDateString()
   saleDate?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Representative-only: special instructions for this order (Rep_Portal_DOCUMENTATION.md §14.4). Ignored for admin/dealer callers.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
+  notes?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Representative-only: the customer's requested delivery date. Ignored for admin/dealer callers.",
+  })
+  @IsOptional()
+  @IsDateString()
+  expectedDeliveryDate?: string;
 }

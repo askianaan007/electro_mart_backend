@@ -507,11 +507,16 @@ export class OrdersService {
   }
 
   async create(requester: { role: Role; id: string }, dto: CreateOrderDto) {
-    const dealerId =
-      requester.role === Role.ADMIN ? dto.dealerId : requester.id;
-    if (requester.role === Role.ADMIN && !dealerId) {
+    // Representative Portal (Rep_Portal_DOCUMENTATION.md §16.2) — a rep
+    // places an order on a shop's behalf, so (like an admin) it needs
+    // dto.dealerId rather than the requester's own id. The ADMIN and DEALER
+    // cases below are byte-for-byte what they were before this line widened.
+    const actsOnBehalfOfDealer =
+      requester.role === Role.ADMIN || requester.role === Role.REPRESENTATIVE;
+    const dealerId = actsOnBehalfOfDealer ? dto.dealerId : requester.id;
+    if (actsOnBehalfOfDealer && !dealerId) {
       throw new BadRequestException(
-        'dealerId is required when an admin creates an order',
+        'dealerId is required when an admin or representative creates an order',
       );
     }
 
@@ -555,7 +560,7 @@ export class OrdersService {
 
     const totalAmount = subtotal.sub(discountTotal);
     const creditLimitErrorMessage =
-      requester.role === Role.ADMIN
+      requester.role === Role.ADMIN || requester.role === Role.REPRESENTATIVE
         ? "This order exceeds the dealer's available credit limit"
         : 'This order exceeds your available credit limit';
 
@@ -620,6 +625,13 @@ export class OrdersService {
       return savedOrder;
     }
 
+    // Reached by DEALER (self-submission, unchanged) and now also by
+    // REPRESENTATIVE (Rep_Portal_DOCUMENTATION.md §16.2) — a rep-placed order
+    // gets exactly the same PENDING_APPROVAL, no-discount-authority treatment
+    // a dealer's own order already does; only createdByRepId (and the
+    // optional notes/expectedDeliveryDate) distinguish it.
+    const isRepOrder = requester.role === Role.REPRESENTATIVE;
+
     const order = await this.prisma.$transaction(async (tx) => {
       await this.assertWithinCreditLimit(
         tx,
@@ -638,6 +650,13 @@ export class OrdersService {
           discount: 0,
           totalAmount,
           items: { create: itemsData },
+          ...(isRepOrder && {
+            createdByRepId: requester.id,
+            notes: dto.notes,
+            expectedDeliveryDate: dto.expectedDeliveryDate
+              ? new Date(dto.expectedDeliveryDate)
+              : undefined,
+          }),
         },
         include: this.orderInclude,
       });
@@ -934,10 +953,7 @@ export class OrdersService {
     return paginate(data, total, page, limit);
   }
 
-  async findOne(
-    id: string,
-    requester: { role: 'ADMIN' | 'DEALER'; id: string },
-  ) {
+  async findOne(id: string, requester: { role: Role; id: string }) {
     const order = await this.prisma.order.findUnique({
       where: { id },
       include: this.orderInclude,
@@ -952,7 +968,11 @@ export class OrdersService {
   async approve(id: string, adminId: string, dto?: ApproveOrderDto) {
     const order = await this.prisma.order.findUnique({
       where: { id },
-      include: { items: true, dealer: { omit: { password: true } } },
+      include: {
+        items: true,
+        dealer: { omit: { password: true } },
+        createdByRep: { select: { email: true } },
+      },
     });
     if (!order) throw new NotFoundException('Order not found');
     if (order.status !== OrderStatus.PENDING_APPROVAL) {
@@ -983,6 +1003,17 @@ export class OrdersService {
       );
     }
 
+    // Additive — a rep-placed order's dealer is the shop, not the rep, so
+    // the rep gets their own notification (Rep_Portal_DOCUMENTATION.md §16.3).
+    if (order.createdByRep?.email) {
+      await this.mailer.notifyRepOrderApproved(
+        order.createdByRep.email,
+        order.orderNumber,
+        order.dealer.businessName,
+        invoice.invoiceNumber,
+      );
+    }
+
     await this.checkAndNotifyOutOfStock(
       order.items.map((item) => item.productId),
     );
@@ -993,7 +1024,10 @@ export class OrdersService {
   async reject(id: string, adminId: string, reason: string) {
     const order = await this.prisma.order.findUnique({
       where: { id },
-      include: { dealer: { omit: { password: true } } },
+      include: {
+        dealer: { omit: { password: true } },
+        createdByRep: { select: { email: true } },
+      },
     });
     if (!order) throw new NotFoundException('Order not found');
     if (order.status !== OrderStatus.PENDING_APPROVAL) {
@@ -1025,6 +1059,15 @@ export class OrdersService {
       await this.mailer.notifyDealerOrderRejected(
         order.dealer.email,
         order.orderNumber,
+        reason,
+      );
+    }
+
+    if (order.createdByRep?.email) {
+      await this.mailer.notifyRepOrderRejected(
+        order.createdByRep.email,
+        order.orderNumber,
+        order.dealer.businessName,
         reason,
       );
     }

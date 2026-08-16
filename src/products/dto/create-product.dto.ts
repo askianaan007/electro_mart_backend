@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AccountStatus } from '@prisma/client';
 import {
+  IsBoolean,
   IsEnum,
   IsInt,
   IsNotEmpty,
@@ -67,6 +68,33 @@ export class CreateProductDto {
   @IsNumber()
   @Min(0)
   wholesalePrice: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Representative Portal display price — falls back to wholesalePrice when unset',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  retailPrice?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Struck-through "was" price, for showing a discount on the Representative Portal',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  compareAtPrice?: number;
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Surfaces this product in Representative Portal featured rails',
+  })
+  @IsOptional()
+  @IsBoolean()
+  isFeatured?: boolean;
 
   @ApiPropertyOptional({ default: 0 })
   @IsOptional()

@@ -12,6 +12,7 @@ datasource db {
 enum Role {
   ADMIN
   DEALER
+  REPRESENTATIVE
 }
 
 enum AccountStatus {
@@ -55,6 +56,73 @@ enum ChequeStatus {
   RETURNED
 }
 
+// ---------------------------------------------------------------------------
+// Representative Portal — Rep_Portal_DOCUMENTATION.md §23 / version2_changes_backend.md §1
+// All enums/models below this line are additive (Rep_Portal_DOCUMENTATION.md
+// v2.0 + v2.1). Nothing above this line is modified in type or meaning.
+// ---------------------------------------------------------------------------
+
+enum DealerSource {
+  DEALER_PORTAL
+  REP_PORTAL
+}
+
+enum CustomerStatus {
+  LEAD
+  NEW
+  REGULAR
+  VIP
+  BLOCKED
+  INACTIVE
+}
+
+enum BannerLinkType {
+  NONE
+  CATEGORY
+  PRODUCT
+  BRAND
+  EXTERNAL_URL
+}
+
+enum RepresentativeStatus {
+  ACTIVE
+  SUSPENDED
+  BLOCKED
+  INACTIVE
+}
+
+enum AssignmentScopeType {
+  CATEGORY
+  PRODUCT
+  BRAND
+  CAMPAIGN
+}
+
+enum CommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+enum CommissionLineStatus {
+  PENDING
+  APPROVED
+  SETTLED
+  REVERSED
+}
+
+enum SettlementStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+}
+
+enum CollectionStatus {
+  PENDING_VERIFICATION
+  CONFIRMED
+  REJECTED
+}
+
 model Admin {
   id               String    @id @default(uuid())
   email            String    @unique
@@ -68,8 +136,9 @@ model Admin {
 
   purchases      Purchase[]
   activityLogs   ActivityLog[]
-  approvedOrders Order[]       @relation("OrderApprovedBy")
-  createdOrders  Order[]       @relation("OrderCreatedBy")
+  approvedOrders Order[]        @relation("OrderApprovedBy")
+  createdOrders  Order[]        @relation("OrderCreatedBy")
+  customerNotes  CustomerNote[]
 }
 
 model Dealer {
@@ -91,18 +160,44 @@ model Dealer {
   createdAt          DateTime      @default(now())
   updatedAt          DateTime      @updatedAt
 
-  orders       Order[]
-  invoices     Invoice[]
-  payments     Payment[]
-  salesReturns SalesReturn[]
+  // Representative Portal (Rep_Portal_DOCUMENTATION.md §23.2) — every existing
+  // dealer implicitly defaults to DEALER_PORTAL; nothing about how the Admin's
+  // existing Dealer screens query or display dealers changes.
+  source         DealerSource    @default(DEALER_PORTAL)
+  createdByRepId String?
+  createdByRep   Representative? @relation("DealerCreatedByRep", fields: [createdByRepId], references: [id])
+
+  orders                Order[]
+  invoices              Invoice[]
+  payments              Payment[]
+  salesReturns          SalesReturn[]
+  customerProfile       CustomerProfile?
+  notes                 CustomerNote[]
+  drafts                RepOrderDraft[]
+  collectionSubmissions CollectionSubmission[]
 
   @@index([status])
+  @@index([source])
 }
 
 model Category {
   id        String   @id @default(uuid())
   name      String   @unique
   createdAt DateTime @default(now())
+
+  // Homepage/catalog CMS (Rep_Portal_DOCUMENTATION.md §9) — all additive,
+  // nullable/defaulted, so every existing category renders exactly as it does
+  // today until an admin opts into the new fields via the CMS screens.
+  imageUrl      String?
+  imagePublicId String?
+  iconUrl       String?
+  iconPublicId  String?
+  sortOrder     Int        @default(0)
+  isFeatured    Boolean    @default(false)
+  slug          String?    @unique
+  parentId      String?
+  parent        Category?  @relation("CategoryParent", fields: [parentId], references: [id])
+  children      Category[] @relation("CategoryParent")
 }
 
 model Product {
@@ -124,12 +219,24 @@ model Product {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
-  orderItems          OrderItem[]
-  purchaseItems       PurchaseItem[]
-  inventoryLogs       InventoryLog[]
-  salesReturnItems    SalesReturnItem[]
-  purchaseReturnItems PurchaseReturnItem[]
-  images              ProductImage[]
+  // Representative Portal pricing/merchandising (Rep_Portal_DOCUMENTATION.md
+  // §23.5) — retailPrice falls back to wholesalePrice when unset; every
+  // existing dealer/admin price read is unaffected, both read wholesalePrice
+  // exactly as before.
+  retailPrice    Decimal?
+  compareAtPrice Decimal?
+  isFeatured     Boolean  @default(false)
+
+  orderItems              OrderItem[]
+  purchaseItems           PurchaseItem[]
+  inventoryLogs           InventoryLog[]
+  salesReturnItems        SalesReturnItem[]
+  purchaseReturnItems     PurchaseReturnItem[]
+  images                  ProductImage[]
+  commissionRules         CommissionRule[]
+  commissionLedgerEntries CommissionLedgerEntry[]
+  availabilityOverride    ProductAvailabilityOverride?
+  draftItems              RepOrderDraftItem[]
 
   @@index([category])
   @@index([status])
@@ -263,15 +370,27 @@ model Order {
   createdByAdminId String?
   createdByAdmin   Admin?  @relation("OrderCreatedBy", fields: [createdByAdminId], references: [id])
 
+  // Representative Portal (Rep_Portal_DOCUMENTATION.md §23.7 / §16) — set only
+  // when a representative placed this order on a shop's behalf. notes/
+  // expectedDeliveryDate are generically-useful additive fields, not
+  // rep-exclusive; every existing order simply has them null.
+  createdByRepId       String?
+  createdByRep         Representative? @relation("OrderCreatedByRep", fields: [createdByRepId], references: [id])
+  notes                String?
+  expectedDeliveryDate DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  items        OrderItem[]
-  invoice      Invoice?
-  salesReturns SalesReturn[]
+  items               OrderItem[]
+  invoice             Invoice?
+  salesReturns        SalesReturn[]
+  commissionEntries   CommissionLedgerEntry[]
+  collectionReminders CollectionReminderLog[]
 
   @@index([dealerId])
   @@index([status])
+  @@index([createdByRepId])
 }
 
 model OrderItem {
@@ -310,21 +429,22 @@ model Invoice {
   dueDate       DateTime?
   createdAt     DateTime      @default(now())
 
-  payments Payment[]
+  payments              Payment[]
+  collectionSubmissions CollectionSubmission[]
 
   @@index([dealerId])
   @@index([paymentStatus])
 }
 
 model Payment {
-  id        String  @id @default(uuid())
+  id          String      @id @default(uuid())
   // Null means this isn't a payment against any specific invoice — it's a
   // standalone credit added directly to the dealer's account (e.g. an
   // advance/prepayment). Everything else about it (mode, cheque lifecycle,
   // edit/reverse window, activity log) works exactly like a normal payment;
   // only the invoice-balance cap and paymentStatus recompute don't apply.
-  invoiceId String?
-  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  invoiceId   String?
+  invoice     Invoice?    @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
   dealerId    String
   dealer      Dealer      @relation(fields: [dealerId], references: [id])
   amount      Decimal
@@ -345,6 +465,8 @@ model Payment {
   chequeDate            DateTime?
   collectedDate         DateTime?
   remarks               String?
+
+  collectionSubmission CollectionSubmission?
 
   @@index([invoiceId])
   @@index([dealerId])
@@ -400,6 +522,8 @@ model Expense {
   expenseDate DateTime
   remarks     String?
   createdAt   DateTime @default(now())
+
+  representativeSettlement RepresentativeSettlement?
 }
 
 model SalesReturn {
@@ -421,20 +545,20 @@ model SalesReturn {
 }
 
 model SalesReturnItem {
-  id            String      @id @default(uuid())
-  salesReturnId String
-  salesReturn   SalesReturn @relation(fields: [salesReturnId], references: [id])
-  productId     String
-  product       Product     @relation(fields: [productId], references: [id])
-  quantity      Int
+  id                String      @id @default(uuid())
+  salesReturnId     String
+  salesReturn       SalesReturn @relation(fields: [salesReturnId], references: [id])
+  productId         String
+  product           Product     @relation(fields: [productId], references: [id])
+  quantity          Int
   // The order item's original (pre-discount) unit price — kept for display
   // only. lineTotal (the actual refund) is always computed from the order
   // item's netUnitPrice, never from this.
-  unitPrice     Decimal
+  unitPrice         Decimal
   // This return line's share of the discount the customer already received
   // on these units — informational, mirrors OrderItem.allocatedDiscount.
-  allocatedDiscount Decimal @default(0)
-  lineTotal     Decimal
+  allocatedDiscount Decimal     @default(0)
+  lineTotal         Decimal
 
   @@index([salesReturnId])
   @@index([productId])
@@ -468,4 +592,373 @@ model RefreshToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Representative — Rep_Portal_DOCUMENTATION.md §23.4, revised per
+// version2_changes_backend.md §3.3/§4/§5 (dedicated RepresentativeStatus
+// enum, email-as-username, onboarding/lockout fields). Mirrors Admin/Dealer's
+// existing auth shape — same bcrypt/resetToken/RefreshToken pattern, nothing
+// new invented.
+// ---------------------------------------------------------------------------
+
+model Representative {
+  id                  String               @id @default(uuid())
+  name                String
+  phone               String
+  email               String               @unique
+  username            String               @unique
+  password            String
+  nicOrEmployeeId     String?              @unique
+  address             String?
+  joiningDate         DateTime?
+  status              RepresentativeStatus @default(ACTIVE)
+  mustChangePassword  Boolean              @default(true)
+  lastLoginAt         DateTime?
+  failedLoginAttempts Int                  @default(0)
+  lockedUntil         DateTime?
+  resetToken          String?              @unique
+  resetTokenExpiry    DateTime?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  customersCreated      Dealer[]                     @relation("DealerCreatedByRep")
+  customersAssigned     CustomerProfile[]            @relation("CustomerAssignedRep")
+  ordersCreated         Order[]                      @relation("OrderCreatedByRep")
+  notes                 CustomerNote[]
+  loginHistory          RepresentativeLoginHistory[]
+  activityLog           RepresentativeActivityLog[]
+  productAssignments    ProductAssignment[]
+  bannerAssignments     BannerAssignment[]
+  commissionLedger      CommissionLedgerEntry[]
+  settlements           RepresentativeSettlement[]
+  collectionSubmissions CollectionSubmission[]
+  draftsCreated         RepOrderDraft[]
+
+  @@index([status])
+}
+
+model RepresentativeLoginHistory {
+  id               String         @id @default(uuid())
+  representativeId String
+  representative   Representative @relation(fields: [representativeId], references: [id])
+  loginAt          DateTime       @default(now())
+  ipAddress        String?
+  userAgent        String?
+  success          Boolean
+  failureReason    String?
+
+  @@index([representativeId])
+}
+
+// Dedicated, richer audit trail for representatives (IP/device) — deliberately
+// separate from the shared, admin-scoped ActivityLog above rather than
+// extending it, so this table's extra columns never apply to admin-authored
+// rows (version2_changes_backend.md §13.3). ActivityLog itself is untouched.
+model RepresentativeActivityLog {
+  id               String         @id @default(uuid())
+  representativeId String
+  representative   Representative @relation(fields: [representativeId], references: [id])
+  action           String
+  targetId         String?
+  details          String?
+  ipAddress        String?
+  userAgent        String?
+  deviceType       String?
+  createdAt        DateTime       @default(now())
+
+  @@index([representativeId])
+  @@index([action])
+}
+
+// ---------------------------------------------------------------------------
+// Customer satellite — Rep_Portal_DOCUMENTATION.md §23.3. A 1:1 extension of
+// Dealer for rep-managed CRM data, kept off the transactional Dealer table
+// itself (see that document's §23.3 for the full "why a satellite table"
+// reasoning).
+// ---------------------------------------------------------------------------
+
+model CustomerProfile {
+  dealerId String @id
+  dealer   Dealer @relation(fields: [dealerId], references: [id], onDelete: Cascade)
+
+  whatsapp          String?
+  city              String?
+  province          String?
+  area              String?
+  latitude          Float?
+  longitude         Float?
+  shopPhotoUrl      String?
+  shopPhotoPublicId String?
+
+  status        CustomerStatus  @default(NEW)
+  assignedRepId String?
+  assignedRep   Representative? @relation("CustomerAssignedRep", fields: [assignedRepId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([assignedRepId])
+}
+
+model CustomerNote {
+  id            String          @id @default(uuid())
+  dealerId      String
+  dealer        Dealer          @relation(fields: [dealerId], references: [id])
+  authorRepId   String?
+  authorRep     Representative? @relation(fields: [authorRepId], references: [id])
+  authorAdminId String?
+  authorAdmin   Admin?          @relation(fields: [authorAdminId], references: [id])
+  note          String
+  createdAt     DateTime        @default(now())
+
+  @@index([dealerId])
+}
+
+// ---------------------------------------------------------------------------
+// Product & banner assignment, inventory visibility — version2_changes_backend.md §6-§8
+// ---------------------------------------------------------------------------
+
+model ProductAssignment {
+  id               String              @id @default(uuid())
+  representativeId String
+  representative   Representative      @relation(fields: [representativeId], references: [id])
+  scopeType        AssignmentScopeType
+  // productId / category name / brand name / campaign key, depending on
+  // scopeType — denormalized on purpose, mirroring the existing
+  // Product.category / Product.brand text-field convention.
+  scopeValue       String
+  createdAt        DateTime            @default(now())
+
+  @@unique([representativeId, scopeType, scopeValue])
+  @@index([representativeId])
+}
+
+model BannerAssignment {
+  id               String         @id @default(uuid())
+  representativeId String
+  representative   Representative @relation(fields: [representativeId], references: [id])
+  bannerId         String
+  banner           Banner         @relation(fields: [bannerId], references: [id])
+  priority         Int            @default(0)
+  startsAt         DateTime?
+  expiresAt        DateTime?
+  createdAt        DateTime       @default(now())
+
+  @@unique([representativeId, bannerId])
+  @@index([representativeId])
+}
+
+model ProductAvailabilityOverride {
+  productId      String   @id
+  product        Product  @relation(fields: [productId], references: [id])
+  // true  = show "In Stock" to reps even if currentStock <= 0
+  // false = show "Out of Stock" to reps even if currentStock > 0
+  // absent (no row) = fall back to the real currentStock > 0 check
+  forceAvailable Boolean
+  reason         String?
+  setByAdminId   String
+  updatedAt      DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Commission engine — version2_changes_backend.md §9-§12. Computed entirely
+// outside the Order approval pipeline (see that document's §2) — no table
+// here is ever written to by OrdersService.
+// ---------------------------------------------------------------------------
+
+model CommissionRule {
+  id               String         @id @default(uuid())
+  productId        String
+  product          Product        @relation(fields: [productId], references: [id])
+  type             CommissionType
+  // Percentage (0-100) or a fixed currency amount, depending on `type`.
+  value            Decimal
+  startDate        DateTime
+  endDate          DateTime?
+  isCampaign       Boolean        @default(false)
+  campaignName     String?
+  createdByAdminId String
+  createdAt        DateTime       @default(now())
+
+  ledgerEntries CommissionLedgerEntry[]
+
+  @@index([productId])
+  @@index([startDate, endDate])
+}
+
+model CommissionLedgerEntry {
+  id               String                    @id @default(uuid())
+  representativeId String
+  representative   Representative            @relation(fields: [representativeId], references: [id])
+  orderId          String
+  order            Order                     @relation(fields: [orderId], references: [id])
+  orderItemId      String
+  productId        String
+  product          Product                   @relation(fields: [productId], references: [id])
+  commissionRuleId String?
+  commissionRule   CommissionRule?           @relation(fields: [commissionRuleId], references: [id])
+  amount           Decimal
+  status           CommissionLineStatus      @default(PENDING)
+  settlementId     String?
+  settlement       RepresentativeSettlement? @relation(fields: [settlementId], references: [id])
+  createdAt        DateTime                  @default(now())
+
+  @@index([representativeId])
+  @@index([orderId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Settlements — the payout, and its one and only bridge into accounting.
+// version2_changes_backend.md §13-§14: expenseId points at a real Expense row
+// created through the exact same tx.expense.create() ExpensesService already
+// uses — no parallel accounting path.
+// ---------------------------------------------------------------------------
+
+model RepresentativeSettlement {
+  id                String           @id @default(uuid())
+  settlementNumber  String           @unique
+  representativeId  String
+  representative    Representative   @relation(fields: [representativeId], references: [id])
+  periodStart       DateTime
+  periodEnd         DateTime
+  totalCommission   Decimal
+  status            SettlementStatus @default(PENDING)
+  mode              PaymentMode?
+  chequeStatus      ChequeStatus?
+  chequeNumber      String?
+  bankName          String?
+  chequeDate        DateTime?
+  expenseId         String?          @unique
+  expense           Expense?         @relation(fields: [expenseId], references: [id])
+  approvedByAdminId String?
+  approvedAt        DateTime?
+  rejectedReason    String?
+  paidAt            DateTime?
+  createdAt         DateTime         @default(now())
+
+  lines CommissionLedgerEntry[]
+}
+
+// ---------------------------------------------------------------------------
+// Collections — a staging inbox, never a direct financial write.
+// version2_changes_backend.md §14: resultingPaymentId is only ever set after
+// an admin confirms, via the existing, unmodified PaymentsService.create().
+// ---------------------------------------------------------------------------
+
+model CollectionSubmission {
+  id                 String           @id @default(uuid())
+  representativeId   String
+  representative     Representative   @relation(fields: [representativeId], references: [id])
+  customerId         String
+  customer           Dealer           @relation(fields: [customerId], references: [id])
+  invoiceId          String?
+  invoice            Invoice?         @relation(fields: [invoiceId], references: [id])
+  amount             Decimal
+  mode               PaymentMode
+  chequeNumber       String?
+  bankName           String?
+  chequeDate         DateTime?
+  collectionDate     DateTime
+  notes              String?
+  chequeImageUrl     String?
+  status             CollectionStatus @default(PENDING_VERIFICATION)
+  verifiedByAdminId  String?
+  verifiedAt         DateTime?
+  rejectedReason     String?
+  resultingPaymentId String?          @unique
+  resultingPayment   Payment?         @relation(fields: [resultingPaymentId], references: [id])
+  createdAt          DateTime         @default(now())
+
+  @@index([representativeId])
+  @@index([customerId])
+  @@index([status])
+}
+
+model CollectionReminderLog {
+  id          String   @id @default(uuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id])
+  sentAt      DateTime @default(now())
+  daysOverdue Int
+
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Brand — mirrors the existing Category pattern exactly (Rep_Portal_DOCUMENTATION.md
+// §8.1). Product.brand stays a denormalized free-text string, never an FK, for
+// the same "reuse a proven additive pattern" reasoning already applied to Category.
+// ---------------------------------------------------------------------------
+
+model Brand {
+  id            String        @id @default(uuid())
+  name          String        @unique
+  logoUrl       String?
+  logoPublicId  String?
+  imageUrl      String?
+  imagePublicId String?
+  description   String?
+  status        AccountStatus @default(ACTIVE)
+  sortOrder     Int           @default(0)
+  isFeatured    Boolean       @default(false)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Banner — homepage CMS, Rep_Portal_DOCUMENTATION.md §10/§4.1.
+// ---------------------------------------------------------------------------
+
+model Banner {
+  id        String         @id @default(uuid())
+  imageUrl  String
+  publicId  String
+  title     String?
+  subtitle  String?
+  ctaLabel  String?
+  linkType  BannerLinkType @default(NONE)
+  linkValue String?
+  sortOrder Int            @default(0)
+  status    AccountStatus  @default(ACTIVE)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  assignments BannerAssignment[]
+}
+
+// ---------------------------------------------------------------------------
+// RepOrderDraft — the server-side cart, Rep_Portal_DOCUMENTATION.md §14/§23.9.
+// Deliberately not an Order row and has no interaction with OrderStatus,
+// stock reservation, or credit checks until explicitly submitted — see that
+// document's §14.2 for why.
+// ---------------------------------------------------------------------------
+
+model RepOrderDraft {
+  id                   String         @id @default(uuid())
+  repId                String
+  representative       Representative @relation(fields: [repId], references: [id])
+  dealerId             String?
+  dealer               Dealer?        @relation(fields: [dealerId], references: [id])
+  notes                String?
+  expectedDeliveryDate DateTime?
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  items RepOrderDraftItem[]
+
+  @@index([repId])
+}
+
+model RepOrderDraftItem {
+  id        String        @id @default(uuid())
+  draftId   String
+  draft     RepOrderDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product       @relation(fields: [productId], references: [id])
+  quantity  Int
+
+  @@index([draftId])
 }

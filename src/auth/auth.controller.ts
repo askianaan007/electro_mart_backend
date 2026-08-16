@@ -3,19 +3,26 @@ import {
   Controller,
   Post,
   Get,
+  Req,
   UseGuards,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { Role } from '@prisma/client';
 import { AuthService } from './auth.service';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { DealerLoginDto } from './dto/dealer-login.dto';
+import { RepLoginDto } from './dto/rep-login.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
 
@@ -38,6 +45,37 @@ export class AuthController {
   @ApiOperation({ summary: 'Dealer login' })
   dealerLogin(@Body() dto: DealerLoginDto) {
     return this.authService.dealerLogin(dto.username, dto.password);
+  }
+
+  @Post('rep-login')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Representative login' })
+  repLogin(@Body() dto: RepLoginDto, @Req() req: Request) {
+    return this.authService.repLogin(dto.username, dto.password, {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+  }
+
+  @Post('change-password')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(Role.REPRESENTATIVE)
+  @ApiBearerAuth('access-token')
+  @ApiOperation({
+    summary:
+      'Representative self-service password change — clears mustChangePassword',
+  })
+  changePassword(
+    @CurrentUser('sub') repId: string,
+    @Body() dto: ChangePasswordDto,
+  ) {
+    return this.authService.changePassword(
+      repId,
+      dto.currentPassword,
+      dto.newPassword,
+    );
   }
 
   @Post('forgot-password')

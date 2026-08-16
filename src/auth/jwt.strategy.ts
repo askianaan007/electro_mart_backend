@@ -1,7 +1,7 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
-import { AccountStatus, Role } from '@prisma/client';
+import { AccountStatus, RepresentativeStatus, Role } from '@prisma/client';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtPayload } from '../common/interfaces/jwt-payload.interface';
@@ -34,6 +34,18 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         select: { status: true },
       });
       if (!dealer || dealer.status !== AccountStatus.ACTIVE) {
+        throw new UnauthorizedException('Account is inactive');
+      }
+    }
+    // Same live-status re-check as the DEALER branch above, extended to
+    // REPRESENTATIVE — a suspended/blocked rep's already-issued token is
+    // invalidated within one request (version2_changes_backend.md §5.10).
+    if (payload.role === Role.REPRESENTATIVE) {
+      const rep = await this.prisma.representative.findUnique({
+        where: { id: payload.sub },
+        select: { status: true },
+      });
+      if (!rep || rep.status !== RepresentativeStatus.ACTIVE) {
         throw new UnauthorizedException('Account is inactive');
       }
     }

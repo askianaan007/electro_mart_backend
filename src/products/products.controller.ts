@@ -29,11 +29,13 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { QueryProductDto } from './dto/query-product.dto';
 import { SetStatusDto } from '../common/dto/set-status.dto';
+import { SetAvailabilityOverrideDto } from './dto/set-availability-override.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { JwtPayload } from '../common/interfaces/jwt-payload.interface';
+import { RepCatalogVisibilityService } from '../rep-catalog-visibility/rep-catalog-visibility.service';
 
 const IMAGE_MIME_TYPES = new Set([
   'image/jpeg',
@@ -42,11 +44,13 @@ const IMAGE_MIME_TYPES = new Set([
   'image/gif',
 ]);
 
-function hideCostPriceForDealer<T extends { costPrice?: unknown }>(
+// Renamed from hideCostPriceForDealer — costPrice is hidden from every
+// non-Admin channel, Dealer and Representative alike (Rep_Portal_DOCUMENTATION.md §5.3).
+function hideCostPrice<T extends { costPrice?: unknown }>(
   product: T,
   role: JwtPayload['role'],
 ) {
-  if (role !== Role.DEALER) return product;
+  if (role !== Role.DEALER && role !== Role.REPRESENTATIVE) return product;
   const rest: Partial<T> = { ...product };
   delete rest.costPrice;
   return rest;
@@ -57,7 +61,10 @@ function hideCostPriceForDealer<T extends { costPrice?: unknown }>(
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller('products')
 export class ProductsController {
-  constructor(private productsService: ProductsService) {}
+  constructor(
+    private productsService: ProductsService,
+    private repCatalogVisibility: RepCatalogVisibilityService,
+  ) {}
 
   @Post()
   @Roles(Role.ADMIN)
@@ -67,7 +74,7 @@ export class ProductsController {
   }
 
   @Get()
-  @Roles(Role.ADMIN, Role.DEALER)
+  @Roles(Role.ADMIN, Role.DEALER, Role.REPRESENTATIVE)
   @ApiOperation({
     summary:
       'List products with search, category, low-stock filter, and pagination',
@@ -75,23 +82,42 @@ export class ProductsController {
   async findAll(
     @Query() query: QueryProductDto,
     @CurrentUser('role') role: JwtPayload['role'],
+    @CurrentUser('sub') userId: string,
   ) {
+    if (role === Role.REPRESENTATIVE) {
+      const scope =
+        await this.repCatalogVisibility.buildAssignedProductWhereClause(userId);
+      const result = await this.productsService.findAll(query, scope);
+      return {
+        ...result,
+        data: await this.repCatalogVisibility.serializeManyForRep(result.data),
+      };
+    }
+
     const result = await this.productsService.findAll(query);
     return {
       ...result,
-      data: result.data.map((product) => hideCostPriceForDealer(product, role)),
+      data: result.data.map((product) => hideCostPrice(product, role)),
     };
   }
 
   @Get(':id')
-  @Roles(Role.ADMIN, Role.DEALER)
+  @Roles(Role.ADMIN, Role.DEALER, Role.REPRESENTATIVE)
   @ApiOperation({ summary: 'Get product details' })
   async findOne(
     @Param('id') id: string,
     @CurrentUser('role') role: JwtPayload['role'],
+    @CurrentUser('sub') userId: string,
   ) {
+    if (role === Role.REPRESENTATIVE) {
+      const scope =
+        await this.repCatalogVisibility.buildAssignedProductWhereClause(userId);
+      const product = await this.productsService.findOne(id, scope);
+      return this.repCatalogVisibility.serializeForRep(product);
+    }
+
     const product = await this.productsService.findOne(id);
-    return hideCostPriceForDealer(product, role);
+    return hideCostPrice(product, role);
   }
 
   @Patch(':id')
@@ -165,5 +191,31 @@ export class ProductsController {
     @CurrentUser('sub') adminId: string,
   ) {
     return this.productsService.removeImage(id, imageId, adminId);
+  }
+
+  @Post(':id/availability-override')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      'Force a product to appear In Stock / Out of Stock to representatives, independent of currentStock',
+  })
+  setAvailabilityOverride(
+    @Param('id') id: string,
+    @Body() dto: SetAvailabilityOverrideDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.productsService.setAvailabilityOverride(id, dto, adminId);
+  }
+
+  @Delete(':id/availability-override')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary: 'Revert a product to its real stock status for representatives',
+  })
+  removeAvailabilityOverride(
+    @Param('id') id: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.productsService.removeAvailabilityOverride(id, adminId);
   }
 }

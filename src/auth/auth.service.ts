@@ -6,7 +6,7 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { AccountStatus, Role } from '@prisma/client';
+import { AccountStatus, RepresentativeStatus, Role } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,6 +25,12 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync(
   'no-such-account-timing-parity',
   PASSWORD_SALT_ROUNDS,
 );
+
+// Representative login lockout (version2_changes_backend.md §5.4) — a rolling
+// window, distinct from the admin-driven SUSPENDED/BLOCKED status. Does not
+// apply to Admin or Dealer login, which are unmodified below.
+const REP_LOCKOUT_THRESHOLD = 5;
+const REP_LOCKOUT_DURATION_MS = 15 * 60 * 1000;
 
 @Injectable()
 export class AuthService {
@@ -105,6 +111,140 @@ export class AuthService {
     };
   }
 
+  /**
+   * Representative Portal login (version2_changes_backend.md §5.4) — a new,
+   * parallel method alongside adminLogin/dealerLogin, neither of which is
+   * modified. Tracks failed attempts with a rolling lockout, distinct from
+   * the admin-driven SUSPENDED/BLOCKED status check below, and records every
+   * attempt (success or failure) to RepresentativeLoginHistory.
+   */
+  async repLogin(
+    username: string,
+    password: string,
+    context?: { ipAddress?: string; userAgent?: string },
+  ) {
+    const rep = await this.prisma.representative.findUnique({
+      where: { username },
+    });
+
+    if (rep?.lockedUntil && rep.lockedUntil > new Date()) {
+      throw new UnauthorizedException(
+        'This account is temporarily locked due to repeated failed login attempts. Try again later or contact your administrator.',
+      );
+    }
+
+    const valid = await bcrypt.compare(
+      password,
+      rep?.password ?? DUMMY_PASSWORD_HASH,
+    );
+
+    if (!rep || !valid) {
+      if (rep) {
+        const failedLoginAttempts = rep.failedLoginAttempts + 1;
+        const lockedUntil =
+          failedLoginAttempts >= REP_LOCKOUT_THRESHOLD
+            ? new Date(Date.now() + REP_LOCKOUT_DURATION_MS)
+            : null;
+        await this.prisma.$transaction([
+          this.prisma.representative.update({
+            where: { id: rep.id },
+            data: { failedLoginAttempts, lockedUntil },
+          }),
+          this.prisma.representativeLoginHistory.create({
+            data: {
+              representativeId: rep.id,
+              success: false,
+              failureReason: 'Invalid password',
+              ipAddress: context?.ipAddress,
+              userAgent: context?.userAgent,
+            },
+          }),
+        ]);
+      }
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    if (rep.status !== RepresentativeStatus.ACTIVE) {
+      await this.prisma.representativeLoginHistory.create({
+        data: {
+          representativeId: rep.id,
+          success: false,
+          failureReason: `Account ${rep.status}`,
+          ipAddress: context?.ipAddress,
+          userAgent: context?.userAgent,
+        },
+      });
+      const message =
+        rep.status === RepresentativeStatus.SUSPENDED
+          ? 'This account is suspended. Contact your administrator.'
+          : rep.status === RepresentativeStatus.BLOCKED
+            ? 'This account has been blocked. Contact your administrator.'
+            : 'Account is inactive';
+      throw new UnauthorizedException(message);
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.representative.update({
+        where: { id: rep.id },
+        data: {
+          failedLoginAttempts: 0,
+          lockedUntil: null,
+          lastLoginAt: new Date(),
+        },
+      }),
+      this.prisma.representativeLoginHistory.create({
+        data: {
+          representativeId: rep.id,
+          success: true,
+          ipAddress: context?.ipAddress,
+          userAgent: context?.userAgent,
+        },
+      }),
+    ]);
+
+    const tokens = await this.issueTokens(Role.REPRESENTATIVE, rep.id, {
+      username: rep.username,
+    });
+    return {
+      ...tokens,
+      user: {
+        id: rep.id,
+        name: rep.name,
+        email: rep.email,
+        username: rep.username,
+        role: Role.REPRESENTATIVE,
+      },
+      mustChangePassword: rep.mustChangePassword,
+    };
+  }
+
+  /**
+   * Forced/self-service password change for a representative
+   * (version2_changes_backend.md §5) — a new, standalone method with no
+   * interaction with Admin/Dealer's existing password flows.
+   */
+  async changePassword(
+    repId: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<{ message: string }> {
+    const rep = await this.prisma.representative.findUnique({
+      where: { id: repId },
+    });
+    if (!rep) throw new UnauthorizedException('Account not found');
+
+    const valid = await bcrypt.compare(currentPassword, rep.password);
+    if (!valid)
+      throw new UnauthorizedException('Current password is incorrect');
+
+    const hashed = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
+    await this.prisma.representative.update({
+      where: { id: repId },
+      data: { password: hashed, mustChangePassword: false },
+    });
+    return { message: 'Password changed.' };
+  }
+
   async refresh(refreshToken: string) {
     const tokenHash = hashToken(refreshToken);
     const stored = await this.prisma.refreshToken.findUnique({
@@ -126,6 +266,18 @@ export class AuthService {
       });
       if (!admin) throw new UnauthorizedException('Account no longer exists');
       return this.issueTokens(Role.ADMIN, admin.id, { email: admin.email });
+    }
+
+    if (stored.role === Role.REPRESENTATIVE) {
+      const rep = await this.prisma.representative.findUnique({
+        where: { id: stored.userId },
+      });
+      if (!rep || rep.status !== RepresentativeStatus.ACTIVE) {
+        throw new UnauthorizedException('Account no longer active');
+      }
+      return this.issueTokens(Role.REPRESENTATIVE, rep.id, {
+        username: rep.username,
+      });
     }
 
     const dealer = await this.prisma.dealer.findUnique({
@@ -170,7 +322,7 @@ export class AuthService {
         // resolve measurably faster than a real one — see DUMMY_PASSWORD_HASH.
         await bcrypt.compare(identifier, DUMMY_PASSWORD_HASH);
       }
-    } else {
+    } else if (role === Role.DEALER) {
       const dealer = await this.prisma.dealer.findUnique({
         where: { username: identifier },
       });
@@ -180,6 +332,20 @@ export class AuthService {
           data: { resetToken, resetTokenExpiry },
         });
         await this.mailer.notifyPasswordReset(dealer.email, resetToken);
+      } else {
+        await bcrypt.compare(identifier, DUMMY_PASSWORD_HASH);
+      }
+    } else {
+      // Role.REPRESENTATIVE — username doubles as email (version2_changes_backend.md §4).
+      const rep = await this.prisma.representative.findUnique({
+        where: { username: identifier },
+      });
+      if (rep) {
+        await this.prisma.representative.update({
+          where: { id: rep.id },
+          data: { resetToken, resetTokenExpiry },
+        });
+        await this.mailer.notifyPasswordReset(rep.email, resetToken);
       } else {
         await bcrypt.compare(identifier, DUMMY_PASSWORD_HASH);
       }
@@ -212,7 +378,7 @@ export class AuthService {
         where: { id: admin.id },
         data: { password: hashed, resetToken: null, resetTokenExpiry: null },
       });
-    } else {
+    } else if (role === Role.DEALER) {
       const dealer = await this.prisma.dealer.findUnique({
         where: { resetToken: token },
       });
@@ -227,6 +393,23 @@ export class AuthService {
       await this.prisma.dealer.update({
         where: { id: dealer.id },
         data: { password: hashed, resetToken: null, resetTokenExpiry: null },
+      });
+    } else {
+      const rep = await this.prisma.representative.findUnique({
+        where: { resetToken: token },
+      });
+      if (!rep || !rep.resetTokenExpiry || rep.resetTokenExpiry < new Date()) {
+        throw new BadRequestException('Invalid or expired reset token');
+      }
+      const hashed = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
+      await this.prisma.representative.update({
+        where: { id: rep.id },
+        data: {
+          password: hashed,
+          resetToken: null,
+          resetTokenExpiry: null,
+          mustChangePassword: false,
+        },
       });
     }
 
