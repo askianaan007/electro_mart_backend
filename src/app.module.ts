@@ -24,6 +24,8 @@ import { InvestorsModule } from './investors/investors.module';
 import { InvestmentsModule } from './investments/investments.module';
 import { ExpensesModule } from './expenses/expenses.module';
 import { EquityModule } from './equity/equity.module';
+import { LiquidCashModule } from './liquid-cash/liquid-cash.module';
+import { CreditBalanceModule } from './credit-balance/credit-balance.module';
 import { SalesReturnsModule } from './sales-returns/sales-returns.module';
 import { PurchaseReturnsModule } from './purchase-returns/purchase-returns.module';
 import { CreditsModule } from './credits/credits.module';
@@ -59,6 +61,8 @@ import { ReportsModule } from './reports/reports.module';
     InvestmentsModule,
     ExpensesModule,
     EquityModule,
+    LiquidCashModule,
+    CreditBalanceModule,
     SalesReturnsModule,
     PurchaseReturnsModule,
     CreditsModule,

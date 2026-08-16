@@ -283,6 +283,7 @@ model Purchase {
   purchaseReturns PurchaseReturn[]
 
   @@index([supplierId])
+  @@index([purchaseDate])
 }
 
 model PurchaseReturn {
@@ -300,6 +301,7 @@ model PurchaseReturn {
 
   @@index([purchaseId])
   @@index([supplierId])
+  @@index([returnDate])
 }
 
 model PurchaseReturnItem {
@@ -470,6 +472,8 @@ model Payment {
 
   @@index([invoiceId])
   @@index([dealerId])
+  @@index([paymentDate])
+  @@index([chequeStatusUpdatedAt])
 }
 
 model SupplierPayment {
@@ -488,6 +492,8 @@ model SupplierPayment {
   createdAt             DateTime      @default(now())
 
   @@index([supplierId])
+  @@index([paymentDate])
+  @@index([chequeStatusUpdatedAt])
 }
 
 model Investor {
@@ -513,6 +519,7 @@ model Investment {
   createdAt      DateTime    @default(now())
 
   @@index([investorId])
+  @@index([investmentDate])
 }
 
 model Expense {
@@ -524,6 +531,8 @@ model Expense {
   createdAt   DateTime @default(now())
 
   representativeSettlement RepresentativeSettlement?
+
+  @@index([expenseDate])
 }
 
 model SalesReturn {

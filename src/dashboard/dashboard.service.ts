@@ -3,6 +3,8 @@ import { OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreditsService } from '../credits/credits.service';
 import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
+import { LiquidCashService } from '../liquid-cash/liquid-cash.service';
+import { CreditBalanceService } from '../credit-balance/credit-balance.service';
 
 // Liquid Cash tracks actual bank balance: cash/bank-transfer payments move
 // money immediately, but a cheque doesn't until it actually clears — while
@@ -52,6 +54,8 @@ export class DashboardService {
     private prisma: PrismaService,
     private creditsService: CreditsService,
     private salesAnalysisService: SalesAnalysisService,
+    private liquidCashService: LiquidCashService,
+    private creditBalanceService: CreditBalanceService,
   ) {}
 
   /**
@@ -172,41 +176,6 @@ export class DashboardService {
     );
   }
 
-  /**
-   * All-time cash-on-hand: investor contributions/withdrawals plus dealer
-   * payments collected, minus supplier payments and expenses actually paid
-   * out. Cheques on either side only count once they've actually cleared
-   * (see SUPPLIER_CLEARED_FILTER / DEALER_CLEARED_FILTER) — a pending cheque
-   * hasn't moved through the bank yet, and a returned one never will.
-   */
-  private async computeLiquidCash() {
-    const [investmentAgg, paymentAgg, supplierPaymentAgg, expenseAgg] =
-      await Promise.all([
-        this.prisma.investment.aggregate({ _sum: { amount: true } }),
-        this.prisma.payment.aggregate({
-          where: DEALER_CLEARED_FILTER,
-          _sum: { amount: true },
-        }),
-        this.prisma.supplierPayment.aggregate({
-          where: SUPPLIER_CLEARED_FILTER,
-          _sum: { amount: true },
-        }),
-        this.prisma.expense.aggregate({ _sum: { amount: true } }),
-      ]);
-
-    const totalInvestments = toNumber(investmentAgg._sum.amount);
-    const totalCollected = toNumber(paymentAgg._sum.amount);
-    const totalPaidToSuppliers = toNumber(supplierPaymentAgg._sum.amount);
-    const totalExpensesPaid = toNumber(expenseAgg._sum.amount);
-
-    return (
-      totalInvestments +
-      totalCollected -
-      totalPaidToSuppliers -
-      totalExpensesPaid
-    );
-  }
-
   private async getMonthlyKpis() {
     const now = new Date();
     const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -293,7 +262,7 @@ export class DashboardService {
       returnedQtyGrouped,
       monthlyKpis,
       liquidCash,
-      creditsSummary,
+      creditBalance,
       upcomingCheques,
     ] = await Promise.all([
       this.prisma.order.aggregate({
@@ -340,8 +309,8 @@ export class DashboardService {
         _sum: { quantity: true },
       }),
       this.getMonthlyKpis(),
-      this.computeLiquidCash(),
-      this.creditsService.getSummary(),
+      this.liquidCashService.getCurrentBalance(),
+      this.creditBalanceService.getCurrentBalance(),
       this.creditsService.getUpcomingCheques(),
     ]);
 
@@ -386,7 +355,7 @@ export class DashboardService {
       ...monthlyKpis,
       invoiceDue: outstandingAgg._sum.outstandingBalance ?? 0,
       liquidCash,
-      creditBalance: creditsSummary.totals.totalCreditBalance,
+      creditBalance,
       upcomingCheques: upcomingCheques.cheques,
       chequesDueCount: upcomingCheques.dueCount,
       chequesDueTotal: upcomingCheques.dueTotal,

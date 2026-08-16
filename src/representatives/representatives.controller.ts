@@ -17,7 +17,7 @@ import { UpdateRepresentativeDto } from './dto/update-representative.dto';
 import { QueryRepresentativeDto } from './dto/query-representative.dto';
 import { SetRepresentativeStatusDto } from './dto/set-representative-status.dto';
 import { AssignProductDto } from './dto/assign-product.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
+import { PaginationQueryDto } from '../common/dto/pagination-query.dto';  
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
