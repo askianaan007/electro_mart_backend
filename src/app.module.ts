@@ -37,6 +37,7 @@ import { BannersModule } from './banners/banners.module';
 import { CommissionModule } from './commission/commission.module';
 import { CollectionsModule } from './collections/collections.module';
 import { ReportsModule } from './reports/reports.module';
+import { BalanceSheetModule } from './balance-sheet/balance-sheet.module';
 
 @Module({
   imports: [
@@ -74,6 +75,7 @@ import { ReportsModule } from './reports/reports.module';
     CommissionModule,
     CollectionsModule,
     ReportsModule,
+    BalanceSheetModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

@@ -405,7 +405,12 @@ export class PaymentsService {
           invoice: { include: { payments: true } },
           dealer: { omit: { password: true } },
         },
-        orderBy: { createdAt: 'desc' },
+        // 'chequeDate' surfaces the soonest-to-deposit cheque first (upcoming
+        // deposit views); default stays most-recently-recorded first.
+        orderBy:
+          query.sortBy === 'chequeDate'
+            ? { chequeDate: 'asc' }
+            : { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
       }),

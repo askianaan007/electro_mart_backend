@@ -7,5 +7,6 @@ import { SalesAnalysisModule } from '../sales-analysis/sales-analysis.module';
   imports: [SalesAnalysisModule],
   providers: [EquityService],
   controllers: [EquityController],
+  exports: [EquityService],
 })
 export class EquityModule {}

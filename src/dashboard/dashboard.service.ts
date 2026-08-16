@@ -256,12 +256,13 @@ export class DashboardService {
       pendingApprovals,
       outOfStockItems,
       outstandingAgg,
+      outstandingByDealer,
       recentOrders,
       monthlyRevenue,
       topProductsGrouped,
       returnedQtyGrouped,
       monthlyKpis,
-      liquidCash,
+      liquidCashSummary,
       creditBalance,
       upcomingCheques,
     ] = await Promise.all([
@@ -284,6 +285,21 @@ export class DashboardService {
       }),
       this.prisma.product.count({ where: { currentStock: { lte: 0 } } }),
       this.prisma.dealer.aggregate({ _sum: { outstandingBalance: true } }),
+      // Per-dealer breakdown backing the "Outstanding Payments" drill-down —
+      // who actually owes money, not just the aggregate total.
+      this.prisma.dealer.findMany({
+        where: { outstandingBalance: { gt: 0 } },
+        orderBy: { outstandingBalance: 'desc' },
+        select: {
+          id: true,
+          businessName: true,
+          ownerName: true,
+          phone: true,
+          outstandingBalance: true,
+          creditLimit: true,
+          unlimitedCredit: true,
+        },
+      }),
       this.prisma.order.findMany({
         take: 10,
         orderBy: { createdAt: 'desc' },
@@ -309,7 +325,7 @@ export class DashboardService {
         _sum: { quantity: true },
       }),
       this.getMonthlyKpis(),
-      this.liquidCashService.getCurrentBalance(),
+      this.liquidCashService.getSummary(),
       this.creditBalanceService.getCurrentBalance(),
       this.creditsService.getUpcomingCheques(),
     ]);
@@ -349,12 +365,22 @@ export class DashboardService {
       pendingApprovals,
       outOfStockItems,
       outstandingPayments: outstandingAgg._sum.outstandingBalance ?? 0,
+      outstandingByDealer,
       recentOrders,
       monthlyRevenue,
       topProducts,
       ...monthlyKpis,
       invoiceDue: outstandingAgg._sum.outstandingBalance ?? 0,
-      liquidCash,
+      liquidCash: liquidCashSummary.balance,
+      // All-time cleared dealer collections (cash/bank-transfer immediately,
+      // cheque only once CLEARED) — same formula LiquidCashService already
+      // uses for the Liquid Cash page, reused here rather than recomputed so
+      // the two can never drift apart.
+      totalCollected: liquidCashSummary.totalCollected,
+      // Dealer cheques already recorded as payments (so no longer counted in
+      // Outstanding Payments) but not yet cleared by the bank, so not yet
+      // counted in Total Collected either — see LiquidCashService.getSummary.
+      pendingDealerCheques: liquidCashSummary.pendingDealerCheques,
       creditBalance,
       upcomingCheques: upcomingCheques.cheques,
       chequesDueCount: upcomingCheques.dueCount,

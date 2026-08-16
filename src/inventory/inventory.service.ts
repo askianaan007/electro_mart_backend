@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InventoryLogType, Prisma } from '@prisma/client';
+import { InventoryLog, InventoryLogType, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { paginate } from '../common/utils/paginate';
@@ -13,6 +13,14 @@ import { QueryInventoryDto } from './dto/query-inventory.dto';
 import { QueryLedgerDto } from './dto/query-ledger.dto';
 
 type TransactionClient = Prisma.TransactionClient;
+
+// `InventoryLog.reference` is heterogeneous by design (see recordMovement
+// call sites): sometimes a UUID pointing at the Purchase/Order/SalesReturn/
+// PurchaseReturn that caused the movement, sometimes an already-readable
+// string ('Opening stock', 'Reversed for edit of purchase INV-123', a
+// manual adjustment's admin-supplied reason). Only the UUID case needs a
+// lookup to become readable.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class InventoryService {
@@ -149,7 +157,157 @@ export class InventoryService {
       this.prisma.inventoryLog.count({ where }),
     ]);
 
-    return paginate(data, total, page, limit);
+    const enriched = await this.enrichLedgerEntries(data);
+
+    return paginate(enriched, total, page, limit);
+  }
+
+  /**
+   * Resolves each row's raw `reference` (and, where derivable, the admin/
+   * dealer/rep behind it) into display-ready fields, without needing a
+   * schema change: a UUID reference is looked up against whichever table
+   * that movement type could plausibly point to, and the actor for
+   * return-driven and manual rows is recovered from ActivityLog — which
+   * for returns records the exact same id as `targetId`, and for manual
+   * adjustments/opening stock shares the same transaction (hence the same
+   * DB-generated `createdAt`) as the InventoryLog row it explains.
+   */
+  private async enrichLedgerEntries(logs: InventoryLog[]) {
+    if (logs.length === 0) return [];
+
+    const uuidRefs = [
+      ...new Set(
+        logs
+          .map((l) => l.reference)
+          .filter((r): r is string => !!r && UUID_RE.test(r)),
+      ),
+    ];
+    const productIds = [...new Set(logs.map((l) => l.productId))];
+
+    const [purchases, orders, salesReturns, purchaseReturns, activityLogs] =
+      await this.prisma.$transaction([
+        this.prisma.purchase.findMany({
+          where: { id: { in: uuidRefs } },
+          select: {
+            id: true,
+            invoiceNumber: true,
+            supplier: { select: { name: true } },
+            admin: { select: { name: true } },
+          },
+        }),
+        this.prisma.order.findMany({
+          where: { id: { in: uuidRefs } },
+          select: {
+            id: true,
+            orderNumber: true,
+            dealer: { select: { businessName: true } },
+            approvedByAdmin: { select: { name: true } },
+            createdByAdmin: { select: { name: true } },
+            createdByRep: { select: { name: true } },
+          },
+        }),
+        this.prisma.salesReturn.findMany({
+          where: { id: { in: uuidRefs } },
+          select: {
+            id: true,
+            returnNumber: true,
+            dealer: { select: { businessName: true } },
+            order: { select: { orderNumber: true } },
+          },
+        }),
+        this.prisma.purchaseReturn.findMany({
+          where: { id: { in: uuidRefs } },
+          select: {
+            id: true,
+            returnNumber: true,
+            supplier: { select: { name: true } },
+          },
+        }),
+        this.prisma.activityLog.findMany({
+          where: {
+            OR: [
+              { targetId: { in: uuidRefs } },
+              {
+                targetId: { in: productIds },
+                action: { in: ['ADJUSTED_INVENTORY', 'CREATED_PRODUCT'] },
+              },
+            ],
+          },
+          select: {
+            targetId: true,
+            createdAt: true,
+            admin: { select: { name: true } },
+          },
+        }),
+      ]);
+
+    const purchaseMap = new Map(purchases.map((p) => [p.id, p]));
+    const orderMap = new Map(orders.map((o) => [o.id, o]));
+    const salesReturnMap = new Map(salesReturns.map((s) => [s.id, s]));
+    const purchaseReturnMap = new Map(purchaseReturns.map((p) => [p.id, p]));
+
+    const activityByTarget = new Map<string, typeof activityLogs>();
+    for (const log of activityLogs) {
+      if (!log.targetId) continue;
+      const list = activityByTarget.get(log.targetId) ?? [];
+      list.push(log);
+      activityByTarget.set(log.targetId, list);
+    }
+
+    // targetId alone isn't unique per movement for returns (fine, resolved
+    // directly) or for manual/opening-stock rows (many adjustments share the
+    // same product id) — closest-by-time picks the one written in the same
+    // transaction as this ledger row.
+    const closestActorName = (targetId: string, createdAt: Date) => {
+      const candidates = activityByTarget.get(targetId);
+      if (!candidates || candidates.length === 0) return null;
+      const closest = candidates.reduce((best, cur) =>
+        Math.abs(cur.createdAt.getTime() - createdAt.getTime()) <
+        Math.abs(best.createdAt.getTime() - createdAt.getTime())
+          ? cur
+          : best,
+      );
+      return closest.admin?.name ? `Admin: ${closest.admin.name}` : null;
+    };
+
+    return logs.map((log) => {
+      const ref = log.reference;
+      let description = ref ?? '—';
+      let performedBy: string | null = null;
+
+      if (ref && UUID_RE.test(ref)) {
+        const purchase = purchaseMap.get(ref);
+        const order = orderMap.get(ref);
+        const salesReturn = salesReturnMap.get(ref);
+        const purchaseReturn = purchaseReturnMap.get(ref);
+
+        if (purchase) {
+          description = `Purchase invoice #${purchase.invoiceNumber} — ${purchase.supplier.name}`;
+          performedBy = purchase.admin?.name
+            ? `Admin: ${purchase.admin.name}`
+            : null;
+        } else if (order) {
+          description = `Order #${order.orderNumber} — ${order.dealer.businessName}`;
+          const adminName =
+            order.approvedByAdmin?.name ?? order.createdByAdmin?.name;
+          performedBy = adminName
+            ? `Admin: ${adminName}`
+            : order.createdByRep?.name
+              ? `Rep: ${order.createdByRep.name}`
+              : null;
+        } else if (salesReturn) {
+          description = `Sales return #${salesReturn.returnNumber} — ${salesReturn.dealer.businessName} (order #${salesReturn.order.orderNumber})`;
+          performedBy = closestActorName(ref, log.createdAt);
+        } else if (purchaseReturn) {
+          description = `Purchase return #${purchaseReturn.returnNumber} — ${purchaseReturn.supplier.name}`;
+          performedBy = closestActorName(ref, log.createdAt);
+        }
+      } else if (ref) {
+        performedBy = closestActorName(log.productId, log.createdAt);
+      }
+
+      return { ...log, description, performedBy };
+    });
   }
 
   async adjustStock(dto: AdjustStockDto, adminId: string) {
