@@ -74,12 +74,17 @@ export class DashboardService {
     salesReturnTotal: Prisma.Decimal | null,
     purchaseTotal: Prisma.Decimal | null,
     purchaseReturnTotal: Prisma.Decimal | null,
+    returnReplacementTotal: Prisma.Decimal | null,
   ) {
     const netSales = toNumber(salesAnalysis.totalSales);
     const totalSalesReturn = toNumber(salesReturnTotal);
     const grossPurchase = toNumber(purchaseTotal);
+    // Kept gross (same meaning as before) — replacement receipts are shown
+    // alongside it and added back into netPurchase instead of netted here.
     const totalPurchaseReturn = toNumber(purchaseReturnTotal);
-    const netPurchase = grossPurchase - totalPurchaseReturn;
+    const totalReturnReplacement = toNumber(returnReplacementTotal);
+    const netPurchase =
+      grossPurchase - totalPurchaseReturn + totalReturnReplacement;
     const totalExpenses = toNumber(salesAnalysis.totalExpenses);
     const profit = toNumber(salesAnalysis.netProfit);
 
@@ -87,6 +92,7 @@ export class DashboardService {
       netSales,
       totalSalesReturn,
       totalPurchaseReturn,
+      totalReturnReplacement,
       netPurchase,
       totalExpenses,
       profit,
@@ -99,6 +105,7 @@ export class DashboardService {
       salesReturnAgg,
       purchaseAgg,
       purchaseReturnAgg,
+      returnReplacementAgg,
       duePaymentsAgg,
       supplierPaymentsAgg,
     ] = await Promise.all([
@@ -118,6 +125,10 @@ export class DashboardService {
       }),
       this.prisma.purchaseReturn.aggregate({
         where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.purchaseReturnReplacement.aggregate({
+        where: { receivedDate: { gte: rangeStart, lt: rangeEnd } },
         _sum: { totalAmount: true },
       }),
       this.prisma.payment.aggregate({
@@ -141,6 +152,7 @@ export class DashboardService {
       salesReturnAgg._sum.totalAmount,
       purchaseAgg._sum.totalValue,
       purchaseReturnAgg._sum.totalAmount,
+      returnReplacementAgg._sum.totalAmount,
     );
     const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
     const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
@@ -160,19 +172,28 @@ export class DashboardService {
    * (below) compare this month against last.
    */
   private async computeAllTimeFinancials() {
-    const [salesAnalysis, salesReturnAgg, purchaseAgg, purchaseReturnAgg] =
-      await Promise.all([
-        this.salesAnalysisService.getSummary({}),
-        this.prisma.salesReturn.aggregate({ _sum: { totalAmount: true } }),
-        this.prisma.purchase.aggregate({ _sum: { totalValue: true } }),
-        this.prisma.purchaseReturn.aggregate({ _sum: { totalAmount: true } }),
-      ]);
+    const [
+      salesAnalysis,
+      salesReturnAgg,
+      purchaseAgg,
+      purchaseReturnAgg,
+      returnReplacementAgg,
+    ] = await Promise.all([
+      this.salesAnalysisService.getSummary({}),
+      this.prisma.salesReturn.aggregate({ _sum: { totalAmount: true } }),
+      this.prisma.purchase.aggregate({ _sum: { totalValue: true } }),
+      this.prisma.purchaseReturn.aggregate({ _sum: { totalAmount: true } }),
+      this.prisma.purchaseReturnReplacement.aggregate({
+        _sum: { totalAmount: true },
+      }),
+    ]);
 
     return this.deriveFinancials(
       salesAnalysis,
       salesReturnAgg._sum.totalAmount,
       purchaseAgg._sum.totalValue,
       purchaseReturnAgg._sum.totalAmount,
+      returnReplacementAgg._sum.totalAmount,
     );
   }
 
@@ -200,6 +221,11 @@ export class DashboardService {
       totalPurchaseReturnChangePct: pctChange(
         current.totalPurchaseReturn,
         previous.totalPurchaseReturn,
+      ),
+      totalReturnReplacement: allTime.totalReturnReplacement,
+      totalReturnReplacementChangePct: pctChange(
+        current.totalReturnReplacement,
+        previous.totalReturnReplacement,
       ),
       netPurchase: allTime.netPurchase,
       netPurchaseChangePct: pctChange(

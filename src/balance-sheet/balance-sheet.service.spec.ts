@@ -34,7 +34,7 @@ const D = (v: number | string) => new Prisma.Decimal(v);
 // Jest's own promise/thenable duck-typing) are left alone and don't false-positive.
 const OTHER_PRISMA_MODELS = [
   'admin', 'category', 'product', 'productImage', 'supplier', 'purchase', 'purchaseReturn',
-  'purchaseReturnItem', 'purchaseItem', 'inventoryLog', 'order', 'orderItem', 'invoice',
+  'purchaseReturnItem', 'purchaseReturnReplacement', 'purchaseReturnReplacementItem', 'purchaseItem', 'inventoryLog', 'order', 'orderItem', 'invoice',
   'payment', 'supplierPayment', 'investor', 'expense', 'salesReturn', 'salesReturnItem',
   'activityLog', 'counter', 'refreshToken', 'representative', 'representativeLoginHistory',
   'representativeActivityLog', 'customerProfile', 'customerNote', 'productAssignment',

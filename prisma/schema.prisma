@@ -139,6 +139,8 @@ model Admin {
   approvedOrders Order[]        @relation("OrderApprovedBy")
   createdOrders  Order[]        @relation("OrderCreatedBy")
   customerNotes  CustomerNote[]
+
+  purchaseReturnReplacements PurchaseReturnReplacement[]
 }
 
 model Dealer {
@@ -227,16 +229,17 @@ model Product {
   compareAtPrice Decimal?
   isFeatured     Boolean  @default(false)
 
-  orderItems              OrderItem[]
-  purchaseItems           PurchaseItem[]
-  inventoryLogs           InventoryLog[]
-  salesReturnItems        SalesReturnItem[]
-  purchaseReturnItems     PurchaseReturnItem[]
-  images                  ProductImage[]
-  commissionRules         CommissionRule[]
-  commissionLedgerEntries CommissionLedgerEntry[]
-  availabilityOverride    ProductAvailabilityOverride?
-  draftItems              RepOrderDraftItem[]
+  orderItems                     OrderItem[]
+  purchaseItems                  PurchaseItem[]
+  inventoryLogs                  InventoryLog[]
+  salesReturnItems               SalesReturnItem[]
+  purchaseReturnItems            PurchaseReturnItem[]
+  purchaseReturnReplacementItems PurchaseReturnReplacementItem[]
+  images                         ProductImage[]
+  commissionRules                CommissionRule[]
+  commissionLedgerEntries        CommissionLedgerEntry[]
+  availabilityOverride           ProductAvailabilityOverride?
+  draftItems                     RepOrderDraftItem[]
 
   @@index([category])
   @@index([status])
@@ -265,6 +268,8 @@ model Supplier {
   purchases        Purchase[]
   supplierPayments SupplierPayment[]
   purchaseReturns  PurchaseReturn[]
+
+  purchaseReturnReplacements PurchaseReturnReplacement[]
 }
 
 model Purchase {
@@ -287,17 +292,18 @@ model Purchase {
 }
 
 model PurchaseReturn {
-  id           String               @id @default(uuid())
-  returnNumber String               @unique
+  id           String                      @id @default(uuid())
+  returnNumber String                      @unique
   purchaseId   String?
-  purchase     Purchase?            @relation(fields: [purchaseId], references: [id])
+  purchase     Purchase?                   @relation(fields: [purchaseId], references: [id])
   supplierId   String
-  supplier     Supplier             @relation(fields: [supplierId], references: [id])
+  supplier     Supplier                    @relation(fields: [supplierId], references: [id])
   reason       String
   totalAmount  Decimal
   returnDate   DateTime
-  createdAt    DateTime             @default(now())
+  createdAt    DateTime                    @default(now())
   items        PurchaseReturnItem[]
+  replacements PurchaseReturnReplacement[]
 
   @@index([purchaseId])
   @@index([supplierId])
@@ -314,7 +320,61 @@ model PurchaseReturnItem {
   unitCost         Decimal
   lineTotal        Decimal
 
+  replacementItems PurchaseReturnReplacementItem[]
+
   @@index([purchaseReturnId])
+  @@index([productId])
+}
+
+// Goods the supplier sent back in place of a PurchaseReturn (see
+// return_feature_implementation.md). Each receipt adds its totalAmount back
+// onto the supplier's credit balance and its units back into stock. Purely
+// additive: a return with no receipts behaves exactly as before. Foreign keys
+// are RESTRICT so Postgres itself refuses to delete a return, return item or
+// purchase that has replacement history.
+model PurchaseReturnReplacement {
+  id                String         @id @default(uuid())
+  replacementNumber String         @unique
+  // Client-generated per submit attempt — a retried/double-clicked request
+  // resolves to the already-created receipt instead of receiving twice.
+  idempotencyKey    String         @unique
+  purchaseReturnId  String
+  purchaseReturn    PurchaseReturn @relation(fields: [purchaseReturnId], references: [id], onDelete: Restrict)
+  // Copied from the return, same as PurchaseReturn.supplierId, so
+  // per-supplier balance aggregates stay a single indexed groupBy.
+  supplierId        String
+  supplier          Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  totalAmount       Decimal
+  receivedDate      DateTime
+  reference         String?
+  notes             String?
+  adminId           String
+  admin             Admin          @relation(fields: [adminId], references: [id], onDelete: Restrict)
+  createdAt         DateTime       @default(now())
+
+  items PurchaseReturnReplacementItem[]
+
+  @@index([purchaseReturnId])
+  @@index([supplierId])
+  @@index([receivedDate])
+}
+
+model PurchaseReturnReplacementItem {
+  id                   String                    @id @default(uuid())
+  replacementId        String
+  replacement          PurchaseReturnReplacement @relation(fields: [replacementId], references: [id], onDelete: Restrict)
+  purchaseReturnItemId String
+  purchaseReturnItem   PurchaseReturnItem        @relation(fields: [purchaseReturnItemId], references: [id], onDelete: Restrict)
+  productId            String
+  product              Product                   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity             Int
+  // Always copied from the PurchaseReturnItem being replaced — never taken
+  // from the client — so a full replacement exactly reverses the return.
+  unitCost             Decimal
+  lineTotal            Decimal
+
+  @@index([replacementId])
+  @@index([purchaseReturnItemId])
   @@index([productId])
 }
 

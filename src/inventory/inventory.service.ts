@@ -20,7 +20,8 @@ type TransactionClient = Prisma.TransactionClient;
 // string ('Opening stock', 'Reversed for edit of purchase INV-123', a
 // manual adjustment's admin-supplied reason). Only the UUID case needs a
 // lookup to become readable.
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class InventoryService {
@@ -184,67 +185,84 @@ export class InventoryService {
     ];
     const productIds = [...new Set(logs.map((l) => l.productId))];
 
-    const [purchases, orders, salesReturns, purchaseReturns, activityLogs] =
-      await this.prisma.$transaction([
-        this.prisma.purchase.findMany({
-          where: { id: { in: uuidRefs } },
-          select: {
-            id: true,
-            invoiceNumber: true,
-            supplier: { select: { name: true } },
-            admin: { select: { name: true } },
-          },
-        }),
-        this.prisma.order.findMany({
-          where: { id: { in: uuidRefs } },
-          select: {
-            id: true,
-            orderNumber: true,
-            dealer: { select: { businessName: true } },
-            approvedByAdmin: { select: { name: true } },
-            createdByAdmin: { select: { name: true } },
-            createdByRep: { select: { name: true } },
-          },
-        }),
-        this.prisma.salesReturn.findMany({
-          where: { id: { in: uuidRefs } },
-          select: {
-            id: true,
-            returnNumber: true,
-            dealer: { select: { businessName: true } },
-            order: { select: { orderNumber: true } },
-          },
-        }),
-        this.prisma.purchaseReturn.findMany({
-          where: { id: { in: uuidRefs } },
-          select: {
-            id: true,
-            returnNumber: true,
-            supplier: { select: { name: true } },
-          },
-        }),
-        this.prisma.activityLog.findMany({
-          where: {
-            OR: [
-              { targetId: { in: uuidRefs } },
-              {
-                targetId: { in: productIds },
-                action: { in: ['ADJUSTED_INVENTORY', 'CREATED_PRODUCT'] },
-              },
-            ],
-          },
-          select: {
-            targetId: true,
-            createdAt: true,
-            admin: { select: { name: true } },
-          },
-        }),
-      ]);
+    const [
+      purchases,
+      orders,
+      salesReturns,
+      purchaseReturns,
+      replacementReceipts,
+      activityLogs,
+    ] = await this.prisma.$transaction([
+      this.prisma.purchase.findMany({
+        where: { id: { in: uuidRefs } },
+        select: {
+          id: true,
+          invoiceNumber: true,
+          supplier: { select: { name: true } },
+          admin: { select: { name: true } },
+        },
+      }),
+      this.prisma.order.findMany({
+        where: { id: { in: uuidRefs } },
+        select: {
+          id: true,
+          orderNumber: true,
+          dealer: { select: { businessName: true } },
+          approvedByAdmin: { select: { name: true } },
+          createdByAdmin: { select: { name: true } },
+          createdByRep: { select: { name: true } },
+        },
+      }),
+      this.prisma.salesReturn.findMany({
+        where: { id: { in: uuidRefs } },
+        select: {
+          id: true,
+          returnNumber: true,
+          dealer: { select: { businessName: true } },
+          order: { select: { orderNumber: true } },
+        },
+      }),
+      this.prisma.purchaseReturn.findMany({
+        where: { id: { in: uuidRefs } },
+        select: {
+          id: true,
+          returnNumber: true,
+          supplier: { select: { name: true } },
+        },
+      }),
+      this.prisma.purchaseReturnReplacement.findMany({
+        where: { id: { in: uuidRefs } },
+        select: {
+          id: true,
+          replacementNumber: true,
+          supplier: { select: { name: true } },
+          purchaseReturn: { select: { returnNumber: true } },
+          admin: { select: { name: true } },
+        },
+      }),
+      this.prisma.activityLog.findMany({
+        where: {
+          OR: [
+            { targetId: { in: uuidRefs } },
+            {
+              targetId: { in: productIds },
+              action: { in: ['ADJUSTED_INVENTORY', 'CREATED_PRODUCT'] },
+            },
+          ],
+        },
+        select: {
+          targetId: true,
+          createdAt: true,
+          admin: { select: { name: true } },
+        },
+      }),
+    ]);
 
     const purchaseMap = new Map(purchases.map((p) => [p.id, p]));
     const orderMap = new Map(orders.map((o) => [o.id, o]));
     const salesReturnMap = new Map(salesReturns.map((s) => [s.id, s]));
     const purchaseReturnMap = new Map(purchaseReturns.map((p) => [p.id, p]));
+    const replacementMap = new Map(replacementReceipts.map((r) => [r.id, r]));
 
     const activityByTarget = new Map<string, typeof activityLogs>();
     for (const log of activityLogs) {
@@ -280,6 +298,7 @@ export class InventoryService {
         const order = orderMap.get(ref);
         const salesReturn = salesReturnMap.get(ref);
         const purchaseReturn = purchaseReturnMap.get(ref);
+        const replacement = replacementMap.get(ref);
 
         if (purchase) {
           description = `Purchase invoice #${purchase.invoiceNumber} — ${purchase.supplier.name}`;
@@ -301,6 +320,11 @@ export class InventoryService {
         } else if (purchaseReturn) {
           description = `Purchase return #${purchaseReturn.returnNumber} — ${purchaseReturn.supplier.name}`;
           performedBy = closestActorName(ref, log.createdAt);
+        } else if (replacement) {
+          description = `Replacement receipt #${replacement.replacementNumber} — ${replacement.supplier.name} (for return #${replacement.purchaseReturn.returnNumber})`;
+          performedBy = replacement.admin?.name
+            ? `Admin: ${replacement.admin.name}`
+            : null;
         }
       } else if (ref) {
         performedBy = closestActorName(log.productId, log.createdAt);

@@ -6,12 +6,14 @@ export type CreditBalanceEntryType =
   | 'PURCHASE'
   | 'TRANSPORT_CHARGE'
   | 'PURCHASE_RETURN'
+  | 'RETURN_REPLACEMENT'
   | 'SETTLEMENT';
 
 const ENTRY_TYPES: CreditBalanceEntryType[] = [
   'PURCHASE',
   'TRANSPORT_CHARGE',
   'PURCHASE_RETURN',
+  'RETURN_REPLACEMENT',
   'SETTLEMENT',
 ];
 

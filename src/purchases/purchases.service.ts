@@ -120,7 +120,12 @@ export class PurchasesService {
         include: {
           supplier: true,
           items: { include: { product: true } },
-          purchaseReturns: { select: { totalAmount: true } },
+          purchaseReturns: {
+            select: {
+              totalAmount: true,
+              replacements: { select: { totalAmount: true } },
+            },
+          },
         },
         orderBy: [{ purchaseDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
@@ -139,7 +144,12 @@ export class PurchasesService {
         supplier: true,
         items: { include: { product: true } },
         admin: { omit: { password: true } },
-        purchaseReturns: { select: { totalAmount: true } },
+        purchaseReturns: {
+          select: {
+            totalAmount: true,
+            replacements: { select: { totalAmount: true } },
+          },
+        },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
@@ -235,17 +245,32 @@ export class PurchasesService {
    * the supplier), then the purchase's own stock increase. Each reversal
    * goes through recordMovement, so if stock has since been sold below what
    * the purchase brought in, this fails loudly instead of driving stock
-   * negative.
+   * negative. Blocked outright if any of those returns has a replacement
+   * receipt.
    */
   async remove(id: string, adminId: string) {
     const purchase = await this.prisma.purchase.findUnique({
       where: { id },
       include: {
         items: true,
-        purchaseReturns: { include: { items: true } },
+        purchaseReturns: {
+          include: {
+            items: true,
+            _count: { select: { replacements: true } },
+          },
+        },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
+
+    // Replacement receipts are real goods received from the supplier —
+    // never unwind them as a side effect of deleting the purchase. (The
+    // RESTRICT foreign keys would reject it anyway; this gives a clear message.)
+    if (purchase.purchaseReturns.some((r) => r._count.replacements > 0)) {
+      throw new BadRequestException(
+        'Cannot delete this purchase: it has returns with replacement receipts. Void those receipts first (within 1 day of recording) or keep the purchase.',
+      );
+    }
 
     return this.prisma.$transaction(async (tx) => {
       for (const purchaseReturn of purchase.purchaseReturns) {

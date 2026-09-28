@@ -14,6 +14,10 @@ import { QueryCreditsDto } from './dto/query-credits.dto';
 import { QuerySettlementsDto } from './dto/query-settlements.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import {
+  EFFECTIVE_PAYMENT_FILTER,
+  supplierBalance,
+} from '../common/utils/supplier-balance';
 
 const ZERO = new Prisma.Decimal(0);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -33,12 +37,6 @@ function addDays(date: Date, days: number): Date {
 // How far into the future the dashboard's "upcoming cheques" list looks.
 const UPCOMING_CHEQUE_WINDOW_DAYS = 14;
 
-// A cheque that has bounced no longer counts as money paid to the supplier —
-// everything else (cash, bank transfer, pending or cleared cheques) does.
-const EFFECTIVE_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
-  NOT: { mode: 'CHEQUE', chequeStatus: 'RETURNED' },
-};
-
 @Injectable()
 export class CreditsService {
   private readonly logger = new Logger(CreditsService.name);
@@ -53,7 +51,7 @@ export class CreditsService {
     supplierId: string,
     client: PrismaService | Prisma.TransactionClient = this.prisma,
   ) {
-    const [purchaseAgg, transportAgg, returnAgg, paymentAgg] =
+    const [purchaseAgg, transportAgg, returnAgg, replacementAgg, paymentAgg] =
       await Promise.all([
         client.purchase.aggregate({
           where: { supplierId },
@@ -67,6 +65,10 @@ export class CreditsService {
           where: { supplierId },
           _sum: { totalAmount: true },
         }),
+        client.purchaseReturnReplacement.aggregate({
+          where: { supplierId },
+          _sum: { totalAmount: true },
+        }),
         client.supplierPayment.aggregate({
           where: { supplierId, ...EFFECTIVE_PAYMENT_FILTER },
           _sum: { amount: true },
@@ -76,16 +78,21 @@ export class CreditsService {
     const totalPurchases = purchaseAgg._sum.totalValue ?? ZERO;
     const totalTransportCharges = transportAgg._sum.transportCharges ?? ZERO;
     const totalReturns = returnAgg._sum.totalAmount ?? ZERO;
+    const totalReplacements = replacementAgg._sum.totalAmount ?? ZERO;
     const totalSettled = paymentAgg._sum.amount ?? ZERO;
-    const creditBalance = totalPurchases
-      .sub(totalReturns)
-      .sub(totalSettled)
-      .sub(totalTransportCharges);
+    const creditBalance = supplierBalance({
+      purchases: totalPurchases,
+      transportCharges: totalTransportCharges,
+      returns: totalReturns,
+      replacements: totalReplacements,
+      settled: totalSettled,
+    });
 
     return {
       totalPurchases,
       totalTransportCharges,
       totalReturns,
+      totalReplacements,
       totalSettled,
       creditBalance,
     };
@@ -103,32 +110,42 @@ export class CreditsService {
     });
     const supplierIds = suppliers.map((s) => s.id);
 
-    const [purchaseTotals, transportTotals, returnTotals, paymentTotals] =
-      await Promise.all([
-        this.prisma.purchase.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { totalValue: true },
-        }),
-        this.prisma.purchase.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { transportCharges: true },
-        }),
-        this.prisma.purchaseReturn.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { totalAmount: true },
-        }),
-        this.prisma.supplierPayment.groupBy({
-          by: ['supplierId'],
-          where: {
-            supplierId: { in: supplierIds },
-            ...EFFECTIVE_PAYMENT_FILTER,
-          },
-          _sum: { amount: true },
-        }),
-      ]);
+    const [
+      purchaseTotals,
+      transportTotals,
+      returnTotals,
+      replacementTotals,
+      paymentTotals,
+    ] = await Promise.all([
+      this.prisma.purchase.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalValue: true },
+      }),
+      this.prisma.purchase.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { transportCharges: true },
+      }),
+      this.prisma.purchaseReturn.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.purchaseReturnReplacement.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.supplierPayment.groupBy({
+        by: ['supplierId'],
+        where: {
+          supplierId: { in: supplierIds },
+          ...EFFECTIVE_PAYMENT_FILTER,
+        },
+        _sum: { amount: true },
+      }),
+    ]);
 
     const purchaseMap = new Map(
       purchaseTotals.map((r) => [r.supplierId, r._sum.totalValue ?? ZERO]),
@@ -142,6 +159,9 @@ export class CreditsService {
     const returnMap = new Map(
       returnTotals.map((r) => [r.supplierId, r._sum.totalAmount ?? ZERO]),
     );
+    const replacementMap = new Map(
+      replacementTotals.map((r) => [r.supplierId, r._sum.totalAmount ?? ZERO]),
+    );
     const paymentMap = new Map(
       paymentTotals.map((r) => [r.supplierId, r._sum.amount ?? ZERO]),
     );
@@ -150,17 +170,22 @@ export class CreditsService {
       const totalPurchases = purchaseMap.get(supplier.id) ?? ZERO;
       const totalTransportCharges = transportMap.get(supplier.id) ?? ZERO;
       const totalReturns = returnMap.get(supplier.id) ?? ZERO;
+      const totalReplacements = replacementMap.get(supplier.id) ?? ZERO;
       const totalSettled = paymentMap.get(supplier.id) ?? ZERO;
-      const creditBalance = totalPurchases
-        .sub(totalReturns)
-        .sub(totalSettled)
-        .sub(totalTransportCharges);
+      const creditBalance = supplierBalance({
+        purchases: totalPurchases,
+        transportCharges: totalTransportCharges,
+        returns: totalReturns,
+        replacements: totalReplacements,
+        settled: totalSettled,
+      });
       return {
         supplierId: supplier.id,
         supplierName: supplier.name,
         totalPurchases,
         totalTransportCharges,
         totalReturns,
+        totalReplacements,
         totalSettled,
         creditBalance,
       };
@@ -177,6 +202,7 @@ export class CreditsService {
           e.totalTransportCharges,
         ),
         totalReturns: acc.totalReturns.add(e.totalReturns),
+        totalReplacements: acc.totalReplacements.add(e.totalReplacements),
         totalSettled: acc.totalSettled.add(e.totalSettled),
         totalCreditBalance: acc.totalCreditBalance.add(e.creditBalance),
       }),
@@ -184,6 +210,7 @@ export class CreditsService {
         totalPurchases: ZERO,
         totalTransportCharges: ZERO,
         totalReturns: ZERO,
+        totalReplacements: ZERO,
         totalSettled: ZERO,
         totalCreditBalance: ZERO,
       },

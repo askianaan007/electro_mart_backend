@@ -19,6 +19,7 @@ import {
   resetSequenceCounter,
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { withReplacementSummary } from './replacement-receipts.service';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -36,6 +37,12 @@ export class PurchaseReturnsService {
     supplier: true,
     purchase: true,
     items: { include: { product: true } },
+    replacements: {
+      select: {
+        totalAmount: true,
+        items: { select: { purchaseReturnItemId: true, quantity: true } },
+      },
+    },
   } satisfies Prisma.PurchaseReturnInclude;
 
   async create(dto: CreatePurchaseReturnDto, adminId: string) {
@@ -197,9 +204,23 @@ export class PurchaseReturnsService {
       },
       _sum: { quantity: true },
     });
+    // Units the supplier already replaced are back in stock from this
+    // purchase, so they're returnable again (e.g. the replacement is faulty
+    // too) — net them off what's been returned.
+    const alreadyReceived = await tx.purchaseReturnReplacementItem.groupBy({
+      by: ['productId'],
+      where: { replacement: { purchaseReturn: { purchaseId: purchase.id } } },
+      _sum: { quantity: true },
+    });
     const returnedMap = new Map(
       alreadyReturned.map((row) => [row.productId, row._sum.quantity ?? 0]),
     );
+    for (const row of alreadyReceived) {
+      returnedMap.set(
+        row.productId,
+        (returnedMap.get(row.productId) ?? 0) - (row._sum.quantity ?? 0),
+      );
+    }
 
     let totalAmount = new Prisma.Decimal(0);
     const itemsData = dtoItems.map((item) => {
@@ -291,15 +312,16 @@ export class PurchaseReturnsService {
       this.prisma.purchaseReturn.count({ where }),
     ]);
 
-    return paginate(data, total, page, limit);
+    return paginate(data.map(withReplacementSummary), total, page, limit);
   }
 
   async findAllForPurchase(purchaseId: string) {
-    return this.prisma.purchaseReturn.findMany({
+    const returns = await this.prisma.purchaseReturn.findMany({
       where: { purchaseId },
       include: this.include,
       orderBy: { createdAt: 'desc' },
     });
+    return returns.map(withReplacementSummary);
   }
 
   async findOne(id: string) {
@@ -309,7 +331,7 @@ export class PurchaseReturnsService {
     });
     if (!purchaseReturn)
       throw new NotFoundException('Purchase return not found');
-    return purchaseReturn;
+    return withReplacementSummary(purchaseReturn);
   }
 
   /**
@@ -323,7 +345,11 @@ export class PurchaseReturnsService {
   async update(id: string, dto: UpdatePurchaseReturnDto, adminId: string) {
     const purchaseReturn = await this.prisma.purchaseReturn.findUnique({
       where: { id },
-      include: { items: true, purchase: { include: { items: true } } },
+      include: {
+        items: true,
+        purchase: { include: { items: true } },
+        _count: { select: { replacements: true } },
+      },
     });
     if (!purchaseReturn)
       throw new NotFoundException('Purchase return not found');
@@ -404,7 +430,7 @@ export class PurchaseReturnsService {
   async remove(id: string, adminId: string) {
     const purchaseReturn = await this.prisma.purchaseReturn.findUnique({
       where: { id },
-      include: { items: true },
+      include: { items: true, _count: { select: { replacements: true } } },
     });
     if (!purchaseReturn)
       throw new NotFoundException('Purchase return not found');
@@ -445,7 +471,17 @@ export class PurchaseReturnsService {
     }, TRANSACTION_OPTIONS);
   }
 
-  private assertEditable(purchaseReturn: { createdAt: Date }) {
+  private assertEditable(purchaseReturn: {
+    createdAt: Date;
+    _count: { replacements: number };
+  }) {
+    // Once goods have been received against a return, its lines are the
+    // history those receipts point at — changing them would rewrite it.
+    if (purchaseReturn._count.replacements > 0) {
+      throw new BadRequestException(
+        'This return has replacement receipts and can no longer be edited or deleted',
+      );
+    }
     if (Date.now() - purchaseReturn.createdAt.getTime() > DAY_MS) {
       throw new BadRequestException(
         'This return can only be edited or deleted within 1 day of being recorded',
