@@ -56,6 +56,13 @@ export class PaymentsController {
       : this.paymentsService.findAllForDealer(user.sub, query);
   }
 
+  @Get('deleted')
+  @Roles(Role.ADMIN)
+  @ApiOperation({ summary: 'List deleted payments that can still be restored' })
+  findDeleted(@Query() query: QueryPaymentDto) {
+    return this.paymentsService.findDeleted(query);
+  }
+
   @Get(':id')
   @Roles(Role.ADMIN, Role.DEALER)
   @ApiOperation({ summary: 'Get payment details' })
@@ -67,7 +74,7 @@ export class PaymentsController {
   @Roles(Role.ADMIN)
   @ApiOperation({
     summary:
-      'Edit a payment within 1 day of it being recorded (blocked once a cheque has moved past PENDING)',
+      'Edit a payment at any time (the previous version is kept and can be restored with undo)',
   })
   update(
     @Param('id') id: string,
@@ -81,17 +88,27 @@ export class PaymentsController {
   @Roles(Role.ADMIN)
   @ApiOperation({
     summary:
-      'Return/reverse a payment within 1 day of it being recorded, restoring the dealer balance and invoice status',
+      'Delete a payment, restoring the dealer balance and invoice status (restorable with undo)',
   })
   remove(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
     return this.paymentsService.remove(id, adminId);
+  }
+
+  @Post(':id/undo')
+  @Roles(Role.ADMIN)
+  @ApiOperation({
+    summary:
+      "Undo the payment's most recent edit, cheque-status change or delete",
+  })
+  undo(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
+    return this.paymentsService.undo(id, adminId);
   }
 
   @Patch(':id/cheque-status')
   @Roles(Role.ADMIN)
   @ApiOperation({
     summary:
-      'Mark a pending cheque payment as cleared or returned (bounced), or revert a cleared/returned cheque back to pending within 1 day of that change',
+      'Change a cheque payment to pending, cleared or returned (bounced) at any time',
   })
   async updateChequeStatus(
     @Param('id') id: string,

@@ -339,6 +339,10 @@ export class DealersService {
             await tx.payment.deleteMany({
               where: { invoiceId: order.invoice.id },
             });
+            // Their undo history would only point at an invoice that's gone.
+            await tx.paymentRevision.deleteMany({
+              where: { invoiceId: order.invoice.id },
+            });
 
             for (const item of order.items) {
               await this.inventoryService.recordMovement(tx, {

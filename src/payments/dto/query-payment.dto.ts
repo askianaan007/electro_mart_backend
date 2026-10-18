@@ -1,6 +1,12 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { ChequeStatus, PaymentMode } from '@prisma/client';
-import { IsDateString, IsEnum, IsIn, IsOptional, IsUUID } from 'class-validator';
+import {
+  IsDateString,
+  IsEnum,
+  IsIn,
+  IsOptional,
+  IsUUID,
+} from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export const PAYMENT_SORT_VALUES = ['createdAt', 'chequeDate'] as const;
@@ -19,6 +25,11 @@ export class QueryPaymentDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(ChequeStatus)
   chequeStatus?: ChequeStatus;
+
+  @ApiPropertyOptional({ description: 'Admin only: filter by invoice' })
+  @IsOptional()
+  @IsUUID()
+  invoiceId?: string;
 
   @ApiPropertyOptional({ description: 'Admin only: filter by dealer' })
   @IsOptional()

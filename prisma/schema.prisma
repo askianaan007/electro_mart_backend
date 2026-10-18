@@ -476,6 +476,28 @@ model Payment {
   @@index([chequeStatusUpdatedAt])
 }
 
+// Undo history for admin corrections on the Payments screen. Every edit,
+// cheque-status change and delete stores the full payment row as it was
+// *before* the change, so it can be put back exactly — a deleted payment is
+// restored from here with its original id and createdAt. Deliberately no FK
+// to Payment: the row being described may currently not exist (deleted).
+model PaymentRevision {
+  id        String    @id @default(uuid())
+  paymentId String
+  invoiceId String?
+  // UPDATED | CHEQUE_STATUS | DELETED
+  action    String
+  snapshot  Json
+  adminId   String
+  createdAt DateTime  @default(now())
+  // Set once this change has been undone — it then drops out of the undo stack.
+  undoneAt  DateTime?
+
+  @@index([paymentId, createdAt])
+  @@index([action, undoneAt])
+  @@index([invoiceId])
+}
+
 model SupplierPayment {
   id                    String        @id @default(uuid())
   supplierId            String
