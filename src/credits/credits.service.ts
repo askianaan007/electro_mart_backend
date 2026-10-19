@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
@@ -14,30 +15,39 @@ import { QueryCreditsDto } from './dto/query-credits.dto';
 import { QuerySettlementsDto } from './dto/query-settlements.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import {
+  computeSupplierBalance,
+  EFFECTIVE_PAYMENT_FILTER,
+  EFFECTIVE_SUPPLIER_REFUND_FILTER,
+  supplierBalance,
+} from '../common/utils/supplier-balance';
+import { assertChequeTransition } from '../common/utils/cheque-transitions';
+import {
+  assertNotFutureBusinessDate,
+  businessDateRange,
+  startOfBusinessDay,
+  startOfNextBusinessDay,
+} from '../common/utils/business-date';
+import {
+  duplicateWindowStart,
+  PossibleDuplicateException,
+} from '../common/utils/duplicate-guard';
+import { recordLedgerRevision } from '../common/utils/ledger-revision';
 
 const ZERO = new Prisma.Decimal(0);
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Colombo calendar days, whatever the server's own time zone (Vercel: UTC).
 function startOfDay(date: Date): Date {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
+  return startOfBusinessDay(date);
 }
 
 function addDays(date: Date, days: number): Date {
-  const d = new Date(date);
-  d.setDate(d.getDate() + days);
-  return d;
+  return new Date(date.getTime() + days * DAY_MS);
 }
 
 // How far into the future the dashboard's "upcoming cheques" list looks.
 const UPCOMING_CHEQUE_WINDOW_DAYS = 14;
-
-// A cheque that has bounced no longer counts as money paid to the supplier —
-// everything else (cash, bank transfer, pending or cleared cheques) does.
-const EFFECTIVE_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
-  NOT: { mode: 'CHEQUE', chequeStatus: 'RETURNED' },
-};
 
 @Injectable()
 export class CreditsService {
@@ -53,41 +63,15 @@ export class CreditsService {
     supplierId: string,
     client: PrismaService | Prisma.TransactionClient = this.prisma,
   ) {
-    const [purchaseAgg, transportAgg, returnAgg, paymentAgg] =
-      await Promise.all([
-        client.purchase.aggregate({
-          where: { supplierId },
-          _sum: { totalValue: true },
-        }),
-        client.purchase.aggregate({
-          where: { supplierId },
-          _sum: { transportCharges: true },
-        }),
-        client.purchaseReturn.aggregate({
-          where: { supplierId },
-          _sum: { totalAmount: true },
-        }),
-        client.supplierPayment.aggregate({
-          where: { supplierId, ...EFFECTIVE_PAYMENT_FILTER },
-          _sum: { amount: true },
-        }),
-      ]);
-
-    const totalPurchases = purchaseAgg._sum.totalValue ?? ZERO;
-    const totalTransportCharges = transportAgg._sum.transportCharges ?? ZERO;
-    const totalReturns = returnAgg._sum.totalAmount ?? ZERO;
-    const totalSettled = paymentAgg._sum.amount ?? ZERO;
-    const creditBalance = totalPurchases
-      .sub(totalReturns)
-      .sub(totalSettled)
-      .sub(totalTransportCharges);
-
+    const c = await computeSupplierBalance(client, supplierId);
     return {
-      totalPurchases,
-      totalTransportCharges,
-      totalReturns,
-      totalSettled,
-      creditBalance,
+      totalPurchases: c.purchases,
+      totalTransportCharges: c.transportCharges,
+      totalReturns: c.returns,
+      totalReplacements: c.replacements,
+      totalSettled: c.settled,
+      totalRefundsReceived: c.refundsReceived,
+      creditBalance: c.balance,
     };
   }
 
@@ -103,33 +87,58 @@ export class CreditsService {
     });
     const supplierIds = suppliers.map((s) => s.id);
 
-    const [purchaseTotals, transportTotals, returnTotals, paymentTotals] =
-      await Promise.all([
-        this.prisma.purchase.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { totalValue: true },
-        }),
-        this.prisma.purchase.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { transportCharges: true },
-        }),
-        this.prisma.purchaseReturn.groupBy({
-          by: ['supplierId'],
-          where: { supplierId: { in: supplierIds } },
-          _sum: { totalAmount: true },
-        }),
-        this.prisma.supplierPayment.groupBy({
-          by: ['supplierId'],
-          where: {
-            supplierId: { in: supplierIds },
-            ...EFFECTIVE_PAYMENT_FILTER,
-          },
-          _sum: { amount: true },
-        }),
-      ]);
+    const [
+      purchaseTotals,
+      transportTotals,
+      returnTotals,
+      paymentTotals,
+      replacementTotals,
+      refundTotals,
+    ] = await Promise.all([
+      this.prisma.purchase.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalValue: true },
+      }),
+      this.prisma.purchase.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { transportCharges: true },
+      }),
+      this.prisma.purchaseReturn.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.supplierPayment.groupBy({
+        by: ['supplierId'],
+        where: {
+          supplierId: { in: supplierIds },
+          ...EFFECTIVE_PAYMENT_FILTER,
+        },
+        _sum: { amount: true },
+      }),
+      this.prisma.purchaseReturnReplacement.groupBy({
+        by: ['supplierId'],
+        where: { supplierId: { in: supplierIds } },
+        _sum: { totalAmount: true },
+      }),
+      this.prisma.refund.groupBy({
+        by: ['supplierId'],
+        where: {
+          supplierId: { in: supplierIds },
+          ...EFFECTIVE_SUPPLIER_REFUND_FILTER,
+        },
+        _sum: { amount: true },
+      }),
+    ]);
 
+    const replacementMap = new Map(
+      replacementTotals.map((r) => [r.supplierId, r._sum.totalAmount ?? ZERO]),
+    );
+    const refundMap = new Map(
+      refundTotals.map((r) => [r.supplierId as string, r._sum.amount ?? ZERO]),
+    );
     const purchaseMap = new Map(
       purchaseTotals.map((r) => [r.supplierId, r._sum.totalValue ?? ZERO]),
     );
@@ -151,17 +160,25 @@ export class CreditsService {
       const totalTransportCharges = transportMap.get(supplier.id) ?? ZERO;
       const totalReturns = returnMap.get(supplier.id) ?? ZERO;
       const totalSettled = paymentMap.get(supplier.id) ?? ZERO;
-      const creditBalance = totalPurchases
-        .sub(totalReturns)
-        .sub(totalSettled)
-        .sub(totalTransportCharges);
+      const totalReplacements = replacementMap.get(supplier.id) ?? ZERO;
+      const totalRefundsReceived = refundMap.get(supplier.id) ?? ZERO;
+      const creditBalance = supplierBalance({
+        purchases: totalPurchases,
+        transportCharges: totalTransportCharges,
+        returns: totalReturns,
+        replacements: totalReplacements,
+        settled: totalSettled,
+        refundsReceived: totalRefundsReceived,
+      });
       return {
         supplierId: supplier.id,
         supplierName: supplier.name,
         totalPurchases,
         totalTransportCharges,
         totalReturns,
+        totalReplacements,
         totalSettled,
+        totalRefundsReceived,
         creditBalance,
       };
     });
@@ -177,14 +194,20 @@ export class CreditsService {
           e.totalTransportCharges,
         ),
         totalReturns: acc.totalReturns.add(e.totalReturns),
+        totalReplacements: acc.totalReplacements.add(e.totalReplacements),
         totalSettled: acc.totalSettled.add(e.totalSettled),
+        totalRefundsReceived: acc.totalRefundsReceived.add(
+          e.totalRefundsReceived,
+        ),
         totalCreditBalance: acc.totalCreditBalance.add(e.creditBalance),
       }),
       {
         totalPurchases: ZERO,
         totalTransportCharges: ZERO,
         totalReturns: ZERO,
+        totalReplacements: ZERO,
         totalSettled: ZERO,
+        totalRefundsReceived: ZERO,
         totalCreditBalance: ZERO,
       },
     );
@@ -231,10 +254,7 @@ export class CreditsService {
         reference: { contains: query.search, mode: 'insensitive' },
       }),
       ...((query.dateFrom || query.dateTo) && {
-        paymentDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lte: new Date(query.dateTo) }),
-        },
+        paymentDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 
@@ -275,6 +295,7 @@ export class CreditsService {
         'Cheque deposit date is required for cheque settlements',
       );
     }
+    assertNotFutureBusinessDate(dto.paymentDate, 'Payment date');
 
     const amount = new Prisma.Decimal(dto.amount);
 
@@ -283,6 +304,26 @@ export class CreditsService {
       // same supplier can't read the same pre-write credit balance and also
       // pass the guard below — jointly over-settling beyond what's owed.
       await tx.$queryRaw`SELECT id FROM "Supplier" WHERE id = ${supplierId} FOR UPDATE`;
+
+      if (!dto.confirmDuplicate) {
+        const duplicate = await tx.supplierPayment.findFirst({
+          where: {
+            supplierId,
+            amount,
+            mode: dto.mode,
+            reference: dto.reference ?? null,
+            paymentDate: {
+              gte: startOfBusinessDay(dto.paymentDate),
+              lt: startOfNextBusinessDay(dto.paymentDate),
+            },
+            createdAt: { gte: duplicateWindowStart() },
+          },
+          select: { id: true },
+        });
+        if (duplicate) {
+          throw new PossibleDuplicateException('settlement', duplicate.id);
+        }
+      }
 
       const { creditBalance } = await this.computeCreditBalance(supplierId, tx);
       if (amount.greaterThan(creditBalance)) {
@@ -320,58 +361,79 @@ export class CreditsService {
     }, TRANSACTION_OPTIONS);
   }
 
+  /**
+   * Legal changes are listed in cheque-transitions.ts (SUPPLIER). Reverting
+   * a RETURNED cheque to PENDING counts it as paid again, so it is refused if
+   * the supplier no longer has that much outstanding — e.g. a replacement
+   * payment already settled the debt the bounced cheque was for (LC-03).
+   * Runs under the supplier's row lock, the same lock new settlements take.
+   */
   async updateChequeStatus(
     paymentId: string,
     status: 'CLEARED' | 'RETURNED' | 'PENDING',
     adminId: string,
   ) {
-    const payment = await this.prisma.supplierPayment.findUnique({
+    const existing = await this.prisma.supplierPayment.findUnique({
       where: { id: paymentId },
     });
-    if (!payment) throw new NotFoundException('Settlement not found');
-    if (payment.mode !== 'CHEQUE') {
+    if (!existing) throw new NotFoundException('Settlement not found');
+    if (existing.mode !== 'CHEQUE') {
       throw new BadRequestException(
         'Only cheque settlements have a cheque status',
       );
     }
 
-    let details: string;
-
-    if (status === ChequeStatus.PENDING) {
-      if (payment.chequeStatus === ChequeStatus.PENDING) {
-        throw new BadRequestException('This cheque is already pending');
-      }
-      const changedAt = payment.chequeStatusUpdatedAt;
-      if (!changedAt || Date.now() - changedAt.getTime() > DAY_MS) {
-        throw new BadRequestException(
-          'This cheque can only be reverted to pending within 1 day of being marked ' +
-            `${payment.chequeStatus}`,
-        );
-      }
-      details = `Cheque ${payment.reference ?? paymentId} reverted from ${payment.chequeStatus} to PENDING`;
-    } else {
-      if (payment.chequeStatus !== ChequeStatus.PENDING) {
-        throw new BadRequestException(
-          `This cheque is already marked ${payment.chequeStatus}`,
-        );
-      }
-      details = `Cheque ${payment.reference ?? paymentId} marked ${status}`;
-    }
-
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.supplierPayment.update({
+      await tx.$queryRaw`SELECT id FROM "Supplier" WHERE id = ${existing.supplierId} FOR UPDATE`;
+      const payment = await tx.supplierPayment.findUniqueOrThrow({
         where: { id: paymentId },
+      });
+
+      assertChequeTransition(
+        'SUPPLIER',
+        payment.chequeStatus,
+        status,
+        payment.chequeStatusUpdatedAt,
+      );
+
+      if (payment.chequeStatus === ChequeStatus.RETURNED) {
+        const { creditBalance } = await this.computeCreditBalance(
+          payment.supplierId,
+          tx,
+        );
+        if (payment.amount.greaterThan(creditBalance)) {
+          throw new BadRequestException(
+            `This returned cheque can't be reinstated: the supplier's outstanding balance is ${creditBalance.toString()}, ` +
+              `less than the cheque's ${payment.amount.toString()} — it has already been settled another way.`,
+          );
+        }
+      }
+
+      await recordLedgerRevision(
+        tx,
+        'SUPPLIER_PAYMENT',
+        payment,
+        'CHEQUE_STATUS',
+        adminId,
+      );
+      const moved = await tx.supplierPayment.updateMany({
+        where: { id: paymentId, chequeStatus: payment.chequeStatus },
         data: { chequeStatus: status, chequeStatusUpdatedAt: new Date() },
       });
+      if (moved.count === 0) {
+        throw new ConflictException(
+          'This cheque was changed in the meantime — refresh and try again',
+        );
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
         action: 'UPDATED_CHEQUE_STATUS',
         targetId: paymentId,
-        details,
+        details: `Cheque ${payment.reference ?? paymentId} changed from ${payment.chequeStatus} to ${status}`,
       });
 
-      return updated;
+      return tx.supplierPayment.findUniqueOrThrow({ where: { id: paymentId } });
     }, TRANSACTION_OPTIONS);
   }
 
@@ -388,13 +450,21 @@ export class CreditsService {
     }
 
     return this.prisma.$transaction(async (tx) => {
+      const { supplier, ...row } = payment;
+      await recordLedgerRevision(
+        tx,
+        'SUPPLIER_PAYMENT',
+        row,
+        'DELETED',
+        adminId,
+      );
       await tx.supplierPayment.delete({ where: { id: paymentId } });
 
       await this.activityLogService.log(tx, {
         adminId,
         action: 'DELETED_SUPPLIER_SETTLEMENT',
         targetId: paymentId,
-        details: `Deleted ${payment.mode} settlement of ${payment.amount.toString()} to ${payment.supplier.name}`,
+        details: `Deleted ${payment.mode} settlement of ${payment.amount.toString()} to ${supplier.name}`,
       });
 
       return { message: 'Settlement deleted' };

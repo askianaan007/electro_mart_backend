@@ -1,18 +1,11 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { PaymentMode } from '@prisma/client';
-import {
-  IsDateString,
-  IsEnum,
-  IsNumber,
-  IsOptional,
-  IsString,
-  Min,
-} from 'class-validator';
+import { IsDateString, IsEnum, IsOptional, IsString } from 'class-validator';
+import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 
 export class UpdatePaymentDto {
   @ApiProperty({ minimum: 0.01 })
-  @IsNumber()
-  @Min(0.01)
+  @IsMoneyAmount()
   amount: number;
 
   @ApiProperty({ enum: PaymentMode })

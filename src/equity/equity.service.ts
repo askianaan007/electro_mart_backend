@@ -4,8 +4,13 @@ import { PrismaService } from '../prisma/prisma.service';
 import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 import { QueryEquityHistoryDto } from './dto/query-equity-history.dto';
 import { paginate } from '../common/utils/paginate';
-
-const DAY_MS = 24 * 60 * 60 * 1000;
+import { EFFECTIVE_INVESTMENT_FILTER } from '../common/utils/investment-filters';
+import {
+  startOfBusinessDay,
+  startOfNextBusinessDay,
+} from '../common/utils/business-date';
+import { likeContains } from '../common/utils/like-pattern';
+import { sqlUtc } from '../common/utils/sql-time';
 
 export interface EquityHistoryRow {
   id: string;
@@ -31,6 +36,7 @@ export class EquityService {
         this.prisma.investor.findMany({ orderBy: { name: 'asc' } }),
         this.prisma.investment.groupBy({
           by: ['investorId'],
+          where: EFFECTIVE_INVESTMENT_FILTER,
           _sum: { amount: true },
         }),
         // Gross profit computed live from every completed sale — no manual
@@ -116,17 +122,19 @@ export class EquityService {
       conditions.push(Prisma.sql`"investorId" = ${query.investorId}`);
     }
     if (query.dateFrom) {
-      conditions.push(Prisma.sql`date >= ${new Date(query.dateFrom)}`);
+      conditions.push(
+        Prisma.sql`date >= ${sqlUtc(startOfBusinessDay(query.dateFrom))}`,
+      );
     }
     if (query.dateTo) {
       conditions.push(
-        Prisma.sql`date < ${new Date(new Date(query.dateTo).getTime() + DAY_MS)}`,
+        Prisma.sql`date < ${sqlUtc(startOfNextBusinessDay(query.dateTo))}`,
       );
     }
     if (query.search) {
-      const term = `%${query.search}%`;
+      const term = likeContains(query.search);
       conditions.push(
-        Prisma.sql`(description ILIKE ${term} OR "investorName" ILIKE ${term})`,
+        Prisma.sql`(description ILIKE ${term} ESCAPE '\\' OR "investorName" ILIKE ${term} ESCAPE '\\')`,
       );
     }
 
@@ -148,6 +156,9 @@ export class EquityService {
           i."createdAt" AS "createdAt"
         FROM "Investment" i
         JOIN "Investor" inv ON inv.id = i."investorId"
+        -- Same rule as EFFECTIVE_INVESTMENT_FILTER: an uncleared or bounced
+        -- cheque isn't capital yet.
+        WHERE i.mode <> 'CHEQUE' OR i."chequeStatus" IS NULL OR i."chequeStatus" = 'CLEARED'
         UNION ALL
         SELECT
           e.id AS id,

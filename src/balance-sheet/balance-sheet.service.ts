@@ -4,7 +4,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LiquidCashService } from '../liquid-cash/liquid-cash.service';
 import { CreditBalanceService } from '../credit-balance/credit-balance.service';
 import { EquityService } from '../equity/equity.service';
-import { BalanceSheetResponse, ReconciliationStatus } from './dto/balance-sheet-response.dto';
+import { EFFECTIVE_INVESTMENT_FILTER } from '../common/utils/investment-filters';
+import {
+  BalanceSheetResponse,
+  ReconciliationStatus,
+} from './dto/balance-sheet-response.dto';
 
 const ZERO = new Prisma.Decimal(0);
 const TOLERANCE = new Prisma.Decimal('0.01');
@@ -57,12 +61,12 @@ export class BalanceSheetService {
       this.prisma.dealer.aggregate({ _sum: { outstandingBalance: true } }),
       // §8.1 — Capital Contributions: Σ Investment.amount where amount > 0 (same sign rule EquityService.getHistory() already uses).
       this.prisma.investment.aggregate({
-        where: { amount: { gt: 0 } },
+        where: { amount: { gt: 0 }, ...EFFECTIVE_INVESTMENT_FILTER },
         _sum: { amount: true },
       }),
       // §8.2 — Owner Withdrawals: Σ Investment.amount where amount < 0 (a negative number).
       this.prisma.investment.aggregate({
-        where: { amount: { lt: 0 } },
+        where: { amount: { lt: 0 }, ...EFFECTIVE_INVESTMENT_FILTER },
         _sum: { amount: true },
       }),
       // §6.4, §11 — Inventory value: SUM(currentStock × costPrice), read-only raw aggregate.
@@ -92,21 +96,38 @@ export class BalanceSheetService {
     // is Decimal-safe, without changing what LiquidCashService itself returns.
     const cashAndBank = new Prisma.Decimal(liquidCash.balance);
     const chequesInHand = new Prisma.Decimal(liquidCash.pendingDealerCheques);
+    // A supplier's refund cheque not yet cleared: the payable already counts
+    // it (credit-balance), the bank doesn't yet — the mirror of chequesInHand.
+    const refundChequesReceivable = new Prisma.Decimal(
+      liquidCash.pendingRefundChequesIn,
+    );
     const accountsReceivable = arAgg._sum.outstandingBalance ?? ZERO;
     const inventory = inventoryRows[0]?.value ?? ZERO;
     const totalCurrentAssets = cashAndBank
       .add(accountsReceivable)
       .add(chequesInHand)
+      .add(refundChequesReceivable)
       .add(inventory);
     const totalNonCurrentAssets = ZERO; // §14 — Fixed Assets unsupported, not summed in as 0-with-data
     const totalAssets = totalCurrentAssets.add(totalNonCurrentAssets);
 
     // ---- Liabilities (§7) — commissionPayable deliberately excluded, see memorandum below ----
     const accountsPayable = new Prisma.Decimal(creditBalance.balance);
-    const supplierChequesIssued = new Prisma.Decimal(creditBalance.pendingChequeSettlements);
-    const totalCurrentLiabilities = accountsPayable.add(supplierChequesIssued);
+    const supplierChequesIssued = new Prisma.Decimal(
+      creditBalance.pendingChequeSettlements,
+    );
+    // A refund cheque we wrote to a dealer, not yet cleared: the dealer's
+    // balance already counts it, the bank doesn't yet.
+    const refundChequesIssued = new Prisma.Decimal(
+      liquidCash.pendingRefundChequesOut,
+    );
+    const totalCurrentLiabilities = accountsPayable
+      .add(supplierChequesIssued)
+      .add(refundChequesIssued);
     const totalNonCurrentLiabilities = ZERO; // §14 — Business Loans unsupported
-    const totalLiabilities = totalCurrentLiabilities.add(totalNonCurrentLiabilities);
+    const totalLiabilities = totalCurrentLiabilities.add(
+      totalNonCurrentLiabilities,
+    );
 
     // ---- Equity (§8) — independently sourced from EquityService; never derived from Assets/Liabilities ----
     const capitalContributions = contributionsAgg._sum.amount ?? ZERO;
@@ -114,10 +135,20 @@ export class BalanceSheetService {
     // Gross, all-time accumulated earnings of the business (totalProfit − totalExpenses) —
     // NOT the same as (totalEquity − totalInvestment) whenever investor profit-share
     // percentages don't sum to 100% (see reconciliation.knownUnallocatedEquityDifference below).
-    const accumulatedEarningsGross = equity.totals.totalProfit.sub(equity.totals.totalExpenses);
+    const accumulatedEarningsGross = equity.totals.totalProfit.sub(
+      equity.totals.totalExpenses,
+    );
     // The authoritative bottom-line equity figure used in the balance equation — read only
     // from EquityService, never recomputed, never used as a plug (§16.4/§19 no-plug rule).
-    const totalEquity = equity.totals.totalEquity;
+    const investorEquity = equity.totals.totalEquity;
+    // Opening balance, evidenced corrections and settlement-payout reversals
+    // (CashAdjustment) move Liquid Cash with no other counterpart in this
+    // system, so they sit in equity — an opening balance is the capital the
+    // business held before it started using the system.
+    const cashAdjustments = new Prisma.Decimal(liquidCash.openingBalance).add(
+      liquidCash.totalAdjustments,
+    );
+    const totalEquity = investorEquity.add(cashAdjustments);
 
     // ---- Reconciliation (§13, extended per §13.6 addendum) ----
     const liabilitiesAndEquity = totalLiabilities.add(totalEquity);
@@ -138,10 +169,24 @@ export class BalanceSheetService {
     // EquityService itself is not touched or re-derived.
     const investorPercentageTotal = equity.totals.percentageTotal;
     const knownUnallocatedEquityDifference = accumulatedEarningsGross.sub(
-      totalEquity.sub(equity.totals.totalInvestment),
+      investorEquity.sub(equity.totals.totalInvestment),
     );
 
-    const knownDifference = knownOrderTimingDifference.add(knownUnallocatedEquityDifference);
+    // Known difference #3 — transport charges (LC-08/LC-15). A purchase's
+    // transportCharges are deducted from what we owe the supplier
+    // (supplier-borne, balance_sheet.md §7.1), but nothing records where that
+    // value went: no cash payment to a transporter and no cost or expense.
+    // So the payable falls with no other entry and assets exceed
+    // liabilities + equity by exactly the total charge. Which counterpart is
+    // right is a business decision (see accountingWarnings); until it is
+    // made the gap is named here rather than left unexplained.
+    const knownTransportChargeDifference = new Prisma.Decimal(
+      creditBalance.totalTransportCharges,
+    );
+
+    const knownDifference = knownOrderTimingDifference
+      .add(knownUnallocatedEquityDifference)
+      .add(knownTransportChargeDifference);
     const unexplainedDifference = rawDifference.sub(knownDifference);
 
     let status: ReconciliationStatus;
@@ -161,11 +206,18 @@ export class BalanceSheetService {
       'commissionPayable (see memorandum) is excluded from totalLiabilities and the balance-sheet equation — the system currently recognizes commission expense only when the settlement is paid (cash basis), so there is no corresponding reduction to accumulatedEarnings while commission is PENDING/APPROVED. See balance_sheet.md §10 for the full analysis and the accrual-basis alternative this specification did not choose.',
       'Inventory is valued at Product.costPrice (current cost), not a per-lot historical cost basis — if costPrice has changed between purchases, this valuation does not reflect FIFO/weighted-average cost. See balance_sheet.md §11.3.',
     ];
+    if (!knownTransportChargeDifference.isZero()) {
+      accountingWarnings.push(
+        `${money(knownTransportChargeDifference)} of purchase transport charges was deducted from supplier payables with no recorded counterpart ` +
+          '(no cash payment to a transporter, no cost or expense) — reported as reconciliation.knownTransportChargeDifference. ' +
+          'If the business pays transporters itself, those payments must be recorded as cash outflows; if the supplier pays and only invoices net, the charge should reduce the purchase cost instead.',
+      );
+    }
     if (investorPercentageTotal.lessThan(100)) {
       accountingWarnings.push(
         `Investor profit-share percentages total ${investorPercentageTotal.toString()}%, not 100% — ` +
           `${money(knownUnallocatedEquityDifference)} of accumulated earnings is not attributed to any ` +
-          'investor\'s equity (see reconciliation.knownUnallocatedEquityDifference). This is disclosed, not corrected — EquityService is unchanged.',
+          "investor's equity (see reconciliation.knownUnallocatedEquityDifference). This is disclosed, not corrected — EquityService is unchanged.",
       );
     }
 
@@ -176,6 +228,7 @@ export class BalanceSheetService {
           cashAndBank: money(cashAndBank),
           accountsReceivable: money(accountsReceivable),
           chequesInHand: money(chequesInHand),
+          refundChequesReceivable: money(refundChequesReceivable),
           inventory: money(inventory),
           supplierAdvances: null,
           prepaidExpenses: null,
@@ -193,6 +246,7 @@ export class BalanceSheetService {
         current: {
           accountsPayable: money(accountsPayable),
           supplierChequesIssued: money(supplierChequesIssued),
+          refundChequesIssued: money(refundChequesIssued),
           taxPayable: null,
           accruedExpenses: null,
           customerAdvances: null,
@@ -208,6 +262,8 @@ export class BalanceSheetService {
         capitalContributions: money(capitalContributions),
         ownerWithdrawals: money(ownerWithdrawals),
         accumulatedEarnings: money(accumulatedEarningsGross),
+        investorEquity: money(investorEquity),
+        cashAdjustments: money(cashAdjustments),
         totalEquity: money(totalEquity),
       },
       summary: {
@@ -219,7 +275,10 @@ export class BalanceSheetService {
       },
       reconciliation: {
         knownOrderTimingDifference: money(knownOrderTimingDifference),
-        knownUnallocatedEquityDifference: money(knownUnallocatedEquityDifference),
+        knownUnallocatedEquityDifference: money(
+          knownUnallocatedEquityDifference,
+        ),
+        knownTransportChargeDifference: money(knownTransportChargeDifference),
         knownDifference: money(knownDifference),
         unexplainedDifference: money(unexplainedDifference),
         inFlightOrderCount,

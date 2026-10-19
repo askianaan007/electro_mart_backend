@@ -12,7 +12,8 @@ import { UpdatePurchaseDto } from './dto/update-purchase.dto';
 import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
-import { resetSequenceCounter } from '../common/utils/sequence';
+import { computeSupplierBalance } from '../common/utils/supplier-balance';
+import { businessDateRange } from '../common/utils/business-date';
 
 @Injectable()
 export class PurchasesService {
@@ -107,10 +108,7 @@ export class PurchasesService {
         invoiceNumber: { contains: query.search, mode: 'insensitive' },
       }),
       ...((query.dateFrom || query.dateTo) && {
-        purchaseDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lte: new Date(query.dateTo) }),
-        },
+        purchaseDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 
@@ -162,13 +160,19 @@ export class PurchasesService {
 
     if (purchase.purchaseReturns.length > 0) {
       throw new BadRequestException(
-        'This purchase has returns recorded against it and cannot be edited. Delete the purchase instead if it needs to be corrected.',
+        'This purchase has returns recorded against it and cannot be edited.',
       );
     }
 
     await this.assertSupplierAndProductsExist(dto.supplierId, dto.items);
 
     return this.prisma.$transaction(async (tx) => {
+      await this.lockSuppliers(tx, [purchase.supplierId, dto.supplierId]);
+      const balanceBefore = await this.supplierBalanceOf(
+        tx,
+        purchase.supplierId,
+      );
+
       for (const item of purchase.items) {
         await this.inventoryService.recordMovement(tx, {
           productId: item.productId,
@@ -214,6 +218,15 @@ export class PurchasesService {
         });
       }
 
+      // Lowering the value, raising transport, or moving the purchase to
+      // another supplier reduces what the original supplier is owed — not
+      // below what we've already paid them (LC-20).
+      await this.assertSupplierNotOverpaid(
+        tx,
+        purchase.supplierId,
+        balanceBefore,
+      );
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'UPDATED_PURCHASE',
@@ -230,49 +243,34 @@ export class PurchasesService {
   }
 
   /**
-   * Deletes a purchase and unwinds everything it caused: any purchase
-   * returns recorded against it (restoring the stock that had gone back to
-   * the supplier), then the purchase's own stock increase. Each reversal
-   * goes through recordMovement, so if stock has since been sold below what
-   * the purchase brought in, this fails loudly instead of driving stock
-   * negative.
+   * Deletes a purchase and reverses its stock increase. Refused when returns
+   * exist against it — they're separate supplier documents with their own
+   * 1-day correction window, and silently deleting (and renumbering) old
+   * ones would erase supplier history (LC-20). Also refused when the
+   * supplier has already been paid more than they'd be owed without it:
+   * that money has to come back as a supplier refund first.
    */
   async remove(id: string, adminId: string) {
     const purchase = await this.prisma.purchase.findUnique({
       where: { id },
       include: {
         items: true,
-        purchaseReturns: { include: { items: true } },
+        purchaseReturns: { select: { returnNumber: true } },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
+    if (purchase.purchaseReturns.length > 0) {
+      throw new BadRequestException(
+        `This purchase has return(s) ${purchase.purchaseReturns.map((r) => r.returnNumber).join(', ')} recorded against it and cannot be deleted.`,
+      );
+    }
 
     return this.prisma.$transaction(async (tx) => {
-      for (const purchaseReturn of purchase.purchaseReturns) {
-        for (const item of purchaseReturn.items) {
-          await this.inventoryService.recordMovement(tx, {
-            productId: item.productId,
-            type: InventoryLogType.ADJUSTMENT,
-            quantityIn: item.quantity,
-            reference: `Reversal of deleted return ${purchaseReturn.returnNumber}`,
-          });
-        }
-        await tx.purchaseReturnItem.deleteMany({
-          where: { purchaseReturnId: purchaseReturn.id },
-        });
-        await tx.purchaseReturn.delete({ where: { id: purchaseReturn.id } });
-      }
-
-      if (purchase.purchaseReturns.length > 0) {
-        const remainingReturns = await tx.purchaseReturn.findMany({
-          select: { returnNumber: true },
-        });
-        await resetSequenceCounter(
-          tx,
-          'purchaseReturn',
-          remainingReturns.map((r) => r.returnNumber),
-        );
-      }
+      await this.lockSuppliers(tx, [purchase.supplierId]);
+      const balanceBefore = await this.supplierBalanceOf(
+        tx,
+        purchase.supplierId,
+      );
 
       for (const item of purchase.items) {
         await this.inventoryService.recordMovement(tx, {
@@ -286,14 +284,53 @@ export class PurchasesService {
       await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
       await tx.purchase.delete({ where: { id } });
 
+      await this.assertSupplierNotOverpaid(
+        tx,
+        purchase.supplierId,
+        balanceBefore,
+      );
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'DELETED_PURCHASE',
         targetId: id,
-        details: `Deleted purchase ${purchase.invoiceNumber} (${purchase.items.length} item(s)) and reversed its stock movements${purchase.purchaseReturns.length ? `, including ${purchase.purchaseReturns.length} return(s)` : ''}`,
+        details: `Deleted purchase ${purchase.invoiceNumber} (${purchase.items.length} item(s), total ${purchase.totalValue.toString()}) and reversed its stock movements`,
       });
 
       return { message: 'Purchase deleted and stock reversed' };
     }, TRANSACTION_OPTIONS);
+  }
+
+  /** Same lock CreditsService takes for settlements; sorted so two edits can't deadlock. */
+  private async lockSuppliers(tx: Prisma.TransactionClient, ids: string[]) {
+    for (const supplierId of [...new Set(ids)].sort()) {
+      await tx.$queryRaw`SELECT id FROM "Supplier" WHERE id = ${supplierId} FOR UPDATE`;
+    }
+  }
+
+  private async supplierBalanceOf(
+    tx: Prisma.TransactionClient,
+    supplierId: string,
+  ) {
+    return (await computeSupplierBalance(tx, supplierId)).balance;
+  }
+
+  /**
+   * Refuses a change that pushes the supplier into (further) credit — i.e.
+   * we'd have paid more than they're owed. A supplier already in credit for
+   * another reason (a return after full settlement) isn't blocked by changes
+   * that don't make it worse.
+   */
+  private async assertSupplierNotOverpaid(
+    tx: Prisma.TransactionClient,
+    supplierId: string,
+    balanceBefore: Prisma.Decimal,
+  ) {
+    const balance = await this.supplierBalanceOf(tx, supplierId);
+    if (balance.isNegative() && balance.lessThan(balanceBefore)) {
+      throw new BadRequestException(
+        `This change would leave the supplier owing us ${balance.abs().toString()} — more has already been paid to them than they would be owed. Record a supplier refund first, or correct the payments.`,
+      );
+    }
   }
 }

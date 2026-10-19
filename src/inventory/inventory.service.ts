@@ -11,6 +11,7 @@ import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { QueryInventoryDto } from './dto/query-inventory.dto';
 import { QueryLedgerDto } from './dto/query-ledger.dto';
+import { businessDateRange } from '../common/utils/business-date';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -140,10 +141,7 @@ export class InventoryService {
       productId,
       ...(query.type && { type: query.type }),
       ...((query.dateFrom || query.dateTo) && {
-        createdAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        createdAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 

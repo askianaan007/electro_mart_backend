@@ -94,14 +94,11 @@ export class SalesReturnsService {
       // against future orders via the same balance the credit-limit check
       // already reads. Never clamped to zero: clamping would silently
       // discard the credit instead of recording it.
-      const dealer = await tx.dealer.findUniqueOrThrow({
-        where: { id: order.dealerId },
-      });
+      // Atomic decrement: a concurrent payment/return on another order of
+      // the same dealer can't be lost to a stale read (LC-17).
       await tx.dealer.update({
         where: { id: order.dealerId },
-        data: {
-          outstandingBalance: dealer.outstandingBalance.sub(totalAmount),
-        },
+        data: { outstandingBalance: { decrement: totalAmount } },
       });
 
       if (order.invoice) {
@@ -186,15 +183,12 @@ export class SalesReturnsService {
         include: this.include,
       });
 
-      const dealer = await tx.dealer.findUniqueOrThrow({
-        where: { id: order.dealerId },
-      });
       await tx.dealer.update({
         where: { id: order.dealerId },
         data: {
-          outstandingBalance: dealer.outstandingBalance
-            .add(oldTotalAmount)
-            .sub(totalAmount),
+          outstandingBalance: {
+            increment: new Prisma.Decimal(oldTotalAmount).sub(totalAmount),
+          },
         },
       });
 
@@ -244,16 +238,9 @@ export class SalesReturnsService {
       await tx.salesReturnItem.deleteMany({ where: { salesReturnId: id } });
       await tx.salesReturn.delete({ where: { id } });
 
-      const dealer = await tx.dealer.findUniqueOrThrow({
-        where: { id: order.dealerId },
-      });
       await tx.dealer.update({
         where: { id: order.dealerId },
-        data: {
-          outstandingBalance: dealer.outstandingBalance.add(
-            salesReturn.totalAmount,
-          ),
-        },
+        data: { outstandingBalance: { increment: salesReturn.totalAmount } },
       });
 
       if (order.invoice) {

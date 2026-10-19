@@ -1,9 +1,16 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { CommissionLineStatus, Prisma, SettlementStatus } from '@prisma/client';
+import {
+  CashAdjustmentType,
+  ChequeStatus,
+  CommissionLineStatus,
+  Prisma,
+  SettlementStatus,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { MailerService } from '../mailer/mailer.service';
@@ -14,6 +21,12 @@ import { QuerySettlementDto } from './dto/query-settlement.dto';
 import { paginate } from '../common/utils/paginate';
 import { nextSequenceNumber } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { assertChequeTransition } from '../common/utils/cheque-transitions';
+import {
+  businessDateOf,
+  startOfBusinessDay,
+  startOfNextBusinessDay,
+} from '../common/utils/business-date';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -82,6 +95,7 @@ export class SettlementsService {
    * Batches a representative's eligible (PENDING) ledger lines for a period
    * into a new PENDING settlement, marking those lines APPROVED
    * (pending-settlement — i.e. spoken for by this settlement, not yet paid).
+   * The period is whole Colombo days, both ends inclusive (LC-21).
    */
   async create(dto: CreateSettlementDto, adminId: string) {
     const rep = await this.prisma.representative.findUnique({
@@ -89,29 +103,39 @@ export class SettlementsService {
     });
     if (!rep) throw new NotFoundException('Representative not found');
 
-    const periodStart = new Date(dto.periodStart);
-    const periodEnd = new Date(dto.periodEnd);
-
-    const lines = await this.prisma.commissionLedgerEntry.findMany({
-      where: {
-        representativeId: dto.representativeId,
-        status: CommissionLineStatus.PENDING,
-        settlementId: null,
-        createdAt: { gte: periodStart, lte: periodEnd },
-      },
-    });
-    if (lines.length === 0) {
-      throw new BadRequestException(
-        'No pending commission lines found for this representative in the given period',
-      );
+    const periodStart = startOfBusinessDay(dto.periodStart);
+    const periodEnd = startOfBusinessDay(dto.periodEnd);
+    if (periodEnd < periodStart) {
+      throw new BadRequestException('periodEnd must not be before periodStart');
     }
 
-    const totalCommission = lines.reduce(
-      (sum, line) => sum.add(line.amount),
-      ZERO,
-    );
-
     return this.prisma.$transaction(async (tx) => {
+      // Serializes concurrent settlement creation for one representative, so
+      // two requests can't both batch the same PENDING lines.
+      await tx.$queryRaw`SELECT id FROM "Representative" WHERE id = ${dto.representativeId} FOR UPDATE`;
+
+      const lines = await tx.commissionLedgerEntry.findMany({
+        where: {
+          representativeId: dto.representativeId,
+          status: CommissionLineStatus.PENDING,
+          settlementId: null,
+          createdAt: {
+            gte: periodStart,
+            lt: startOfNextBusinessDay(dto.periodEnd),
+          },
+        },
+      });
+      if (lines.length === 0) {
+        throw new BadRequestException(
+          'No pending commission lines found for this representative in the given period',
+        );
+      }
+
+      const totalCommission = lines.reduce(
+        (sum, line) => sum.add(line.amount),
+        ZERO,
+      );
+
       const settlementNumber = await nextSequenceNumber(
         tx,
         'settlement',
@@ -129,13 +153,22 @@ export class SettlementsService {
         },
       });
 
-      await tx.commissionLedgerEntry.updateMany({
-        where: { id: { in: lines.map((l) => l.id) } },
+      const claimed = await tx.commissionLedgerEntry.updateMany({
+        where: {
+          id: { in: lines.map((l) => l.id) },
+          status: CommissionLineStatus.PENDING,
+          settlementId: null,
+        },
         data: {
           status: CommissionLineStatus.APPROVED,
           settlementId: settlement.id,
         },
       });
+      if (claimed.count !== lines.length) {
+        throw new ConflictException(
+          'Some of these commission lines were just settled elsewhere — refresh and try again',
+        );
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -150,38 +183,56 @@ export class SettlementsService {
 
   async approve(id: string, adminId: string) {
     const settlement = await this.findOne(id);
-    if (settlement.status !== SettlementStatus.PENDING) {
-      throw new BadRequestException(
-        'Only a pending settlement can be approved',
-      );
-    }
 
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.representativeSettlement.update({
-        where: { id },
+      const moved = await tx.representativeSettlement.updateMany({
+        where: { id, status: SettlementStatus.PENDING },
         data: {
           status: SettlementStatus.APPROVED,
           approvedByAdminId: adminId,
           approvedAt: new Date(),
         },
       });
+      if (moved.count === 0) {
+        throw new BadRequestException(
+          'Only a pending settlement can be approved',
+        );
+      }
       await this.activityLogService.log(tx, {
         adminId,
         action: 'APPROVED_SETTLEMENT',
         targetId: id,
         details: `Approved settlement ${settlement.settlementNumber}`,
       });
-      return updated;
+      return tx.representativeSettlement.findUniqueOrThrow({ where: { id } });
     }, TRANSACTION_OPTIONS);
   }
 
+  /**
+   * Rejects a not-yet-paid settlement and releases its lines. Refused while a
+   * cheque for it is still PENDING (LC-01): that cheque could still clear and
+   * pay the representative, so it must first be marked RETURNED (stopped /
+   * never handed over), which records it as not paid.
+   */
   async reject(id: string, dto: RejectSettlementDto, adminId: string) {
     const settlement = await this.findOne(id);
-    if (settlement.status === SettlementStatus.PAID) {
-      throw new BadRequestException('A paid settlement cannot be rejected');
-    }
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      const current = await this.lockSettlement(tx, id);
+      if (
+        current.status !== SettlementStatus.PENDING &&
+        current.status !== SettlementStatus.APPROVED
+      ) {
+        throw new BadRequestException(
+          `A ${current.status.toLowerCase()} settlement cannot be rejected`,
+        );
+      }
+      if (current.chequeStatus === ChequeStatus.PENDING) {
+        throw new BadRequestException(
+          'A cheque for this settlement is still pending. Mark it RETURNED (cancelled) before rejecting the settlement.',
+        );
+      }
+
       const result = await tx.representativeSettlement.update({
         where: { id },
         data: { status: SettlementStatus.REJECTED, rejectedReason: dto.reason },
@@ -189,10 +240,15 @@ export class SettlementsService {
 
       // Release the lines back to PENDING/un-batched so they can be picked
       // up by a future settlement — a rejected settlement must never strand
-      // a representative's already-earned commission.
+      // a representative's already-earned commission. Lines reversed since
+      // batching stay REVERSED; they're only detached.
+      await tx.commissionLedgerEntry.updateMany({
+        where: { settlementId: id, status: CommissionLineStatus.APPROVED },
+        data: { status: CommissionLineStatus.PENDING, settlementId: null },
+      });
       await tx.commissionLedgerEntry.updateMany({
         where: { settlementId: id },
-        data: { status: CommissionLineStatus.PENDING, settlementId: null },
+        data: { settlementId: null },
       });
 
       await this.activityLogService.log(tx, {
@@ -223,12 +279,12 @@ export class SettlementsService {
    * deferred until the cheque clears (updateChequeStatus below) — mirroring
    * exactly how a customer cheque payment doesn't count as "collected"
    * until it clears.
+   *
+   * Runs under a row lock on the settlement and re-checks its state there,
+   * so two concurrent pay requests can't both create an Expense (LC-02).
    */
   async pay(id: string, dto: PaySettlementDto, adminId: string) {
     const settlement = await this.findOne(id);
-    if (settlement.status !== SettlementStatus.APPROVED) {
-      throw new BadRequestException('Only an approved settlement can be paid');
-    }
     if (
       dto.mode === 'CHEQUE' &&
       (!dto.chequeNumber || !dto.bankName || !dto.chequeDate)
@@ -239,18 +295,36 @@ export class SettlementsService {
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      const current = await this.lockSettlement(tx, id);
+      if (current.status !== SettlementStatus.APPROVED) {
+        throw new BadRequestException(
+          'Only an approved settlement can be paid',
+        );
+      }
+      if (current.chequeStatus === ChequeStatus.PENDING) {
+        throw new BadRequestException(
+          'This settlement already has a pending cheque — mark it CLEARED or RETURNED first',
+        );
+      }
+      await this.assertLinesUnchanged(tx, current);
+
+      const isCheque = dto.mode === 'CHEQUE';
       let result = await tx.representativeSettlement.update({
         where: { id },
         data: {
           mode: dto.mode,
-          chequeNumber: dto.chequeNumber,
-          bankName: dto.bankName,
-          chequeDate: dto.chequeDate ? new Date(dto.chequeDate) : undefined,
-          chequeStatus: dto.mode === 'CHEQUE' ? 'PENDING' : undefined,
+          // A re-payment after a returned cheque must not keep the old
+          // cheque's details on a cash/bank-transfer payment.
+          reference: isCheque ? null : (dto.reference ?? null),
+          chequeNumber: isCheque ? dto.chequeNumber : null,
+          bankName: isCheque ? dto.bankName : null,
+          chequeDate:
+            isCheque && dto.chequeDate ? new Date(dto.chequeDate) : null,
+          chequeStatus: isCheque ? ChequeStatus.PENDING : null,
         },
       });
 
-      if (dto.mode !== 'CHEQUE') {
+      if (!isCheque) {
         result = await this.createSettlementExpense(tx, result);
       }
 
@@ -279,29 +353,39 @@ export class SettlementsService {
     return updated;
   }
 
-  /** Cheque-mode settlements only — mirrors PaymentsService.updateChequeStatus's own transition guard shape. */
+  /**
+   * Cheque-mode settlements only. Only an APPROVED settlement's PENDING
+   * cheque can change, and only forward (cheque-transitions.ts SETTLEMENT):
+   * a rejected settlement's cheque can never clear and pay it (LC-01).
+   */
   async updateChequeStatus(
     id: string,
     status: 'CLEARED' | 'RETURNED',
     adminId: string,
   ) {
     const settlement = await this.findOne(id);
-    if (settlement.mode !== 'CHEQUE' || !settlement.chequeStatus) {
-      throw new BadRequestException('This settlement was not paid by cheque');
-    }
-    if (settlement.chequeStatus !== 'PENDING') {
-      throw new BadRequestException(
-        `This cheque is already marked ${settlement.chequeStatus}`,
-      );
-    }
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      const current = await this.lockSettlement(tx, id);
+      if (current.mode !== 'CHEQUE' || !current.chequeStatus) {
+        throw new BadRequestException('This settlement was not paid by cheque');
+      }
+      if (current.status !== SettlementStatus.APPROVED) {
+        throw new BadRequestException(
+          `The cheque of a ${current.status.toLowerCase()} settlement cannot change status`,
+        );
+      }
+      assertChequeTransition('SETTLEMENT', current.chequeStatus, status, null);
+      if (status === ChequeStatus.CLEARED) {
+        await this.assertLinesUnchanged(tx, current);
+      }
+
       let result = await tx.representativeSettlement.update({
         where: { id },
         data: { chequeStatus: status },
       });
 
-      if (status === 'CLEARED') {
+      if (status === ChequeStatus.CLEARED) {
         result = await this.createSettlementExpense(tx, result);
       }
 
@@ -331,10 +415,103 @@ export class SettlementsService {
   }
 
   /**
+   * Controlled correction of a PAID settlement (LC-07): the payout's Expense
+   * stays exactly as recorded, and a SETTLEMENT_REVERSAL cash adjustment of
+   * the same amount is posted today, so Liquid Cash history shows both the
+   * payout and its reversal on their own dates. The lines return to PENDING
+   * so the still-earned commission can be settled again.
+   */
+  async reversePayment(id: string, reason: string, adminId: string) {
+    const settlement = await this.findOne(id);
+
+    return this.prisma.$transaction(async (tx) => {
+      const current = await this.lockSettlement(tx, id);
+      if (current.status !== SettlementStatus.PAID || !current.expenseId) {
+        throw new BadRequestException(
+          'Only a paid settlement can have its payment reversed',
+        );
+      }
+
+      const adjustmentNumber = await nextSequenceNumber(
+        tx,
+        'cashAdjustment',
+        'ADJ',
+      );
+      await tx.cashAdjustment.create({
+        data: {
+          adjustmentNumber,
+          type: CashAdjustmentType.SETTLEMENT_REVERSAL,
+          amount: current.totalCommission,
+          adjustmentDate: new Date(),
+          reason: `Reversal of settlement ${current.settlementNumber} payout: ${reason}`,
+          adminId,
+          settlementId: id,
+        },
+      });
+
+      const result = await tx.representativeSettlement.update({
+        where: { id },
+        data: {
+          status: SettlementStatus.REVERSED,
+          reversedAt: new Date(),
+          reversalReason: reason,
+        },
+      });
+
+      await tx.commissionLedgerEntry.updateMany({
+        where: { settlementId: id, status: CommissionLineStatus.SETTLED },
+        data: { status: CommissionLineStatus.PENDING, settlementId: null },
+      });
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'REVERSED_SETTLEMENT_PAYMENT',
+        targetId: id,
+        details: `Reversed payout of settlement ${settlement.settlementNumber} (${current.totalCommission.toString()}) as ${adjustmentNumber}: ${reason}`,
+      });
+
+      return result;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  private async lockSettlement(tx: Prisma.TransactionClient, id: string) {
+    await tx.$queryRaw`SELECT id FROM "RepresentativeSettlement" WHERE id = ${id} FOR UPDATE`;
+    return tx.representativeSettlement.findUniqueOrThrow({ where: { id } });
+  }
+
+  /**
+   * A line reversed after batching (order returned — see
+   * CommissionReconciliationService) must not be paid (LC-22). Paying the
+   * stored total would overpay, so the settlement has to be redone.
+   */
+  private async assertLinesUnchanged(
+    tx: Prisma.TransactionClient,
+    settlement: { id: string; totalCommission: Prisma.Decimal },
+  ) {
+    const lines = await tx.commissionLedgerEntry.findMany({
+      where: { settlementId: settlement.id },
+    });
+    const payable = lines.filter(
+      (l) => l.status === CommissionLineStatus.APPROVED,
+    );
+    const payableTotal = payable.reduce((sum, l) => sum.add(l.amount), ZERO);
+    if (
+      payable.length !== lines.length ||
+      !payableTotal.equals(settlement.totalCommission)
+    ) {
+      throw new BadRequestException(
+        `${lines.length - payable.length} commission line(s) in this settlement were reversed after it was created. Reject it and create a new settlement.`,
+      );
+    }
+  }
+
+  /**
    * The exact tx.expense.create() call ExpensesService.create() already
    * uses — not a copy of its logic, the identical write, so every existing
    * calculation that sums Expense (computeLiquidCash, netProfit,
-   * expenseShare) picks this up automatically (§12.4).
+   * expenseShare) picks this up automatically (§12.4). The conditional
+   * APPROVED → PAID update makes a second payout in the same state
+   * impossible even without the caller's lock.
    */
   private async createSettlementExpense(
     tx: Prisma.TransactionClient,
@@ -356,25 +533,37 @@ export class SettlementsService {
         description: `Representative commission settlement — ${rep.name} (${settlement.settlementNumber})`,
         amount: settlement.totalCommission,
         expenseDate: new Date(),
-        remarks: `Settlement period ${settlement.periodStart.toISOString().slice(0, 10)}–${settlement.periodEnd.toISOString().slice(0, 10)}`,
+        remarks: `Settlement period ${businessDateOf(settlement.periodStart)}–${businessDateOf(settlement.periodEnd)}`,
       },
     });
 
-    const updated = await tx.representativeSettlement.update({
-      where: { id: settlement.id },
+    const paid = await tx.representativeSettlement.updateMany({
+      where: {
+        id: settlement.id,
+        status: SettlementStatus.APPROVED,
+        expenseId: null,
+      },
       data: {
         expenseId: expense.id,
         status: SettlementStatus.PAID,
         paidAt: new Date(),
       },
     });
+    if (paid.count === 0) {
+      throw new ConflictException('This settlement has already been paid');
+    }
 
     await tx.commissionLedgerEntry.updateMany({
-      where: { settlementId: settlement.id },
+      where: {
+        settlementId: settlement.id,
+        status: CommissionLineStatus.APPROVED,
+      },
       data: { status: CommissionLineStatus.SETTLED },
     });
 
-    return updated;
+    return tx.representativeSettlement.findUniqueOrThrow({
+      where: { id: settlement.id },
+    });
   }
 
   // -------------------------------------------------------------------

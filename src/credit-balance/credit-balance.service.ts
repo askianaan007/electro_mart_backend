@@ -2,18 +2,19 @@ import { Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { paginate } from '../common/utils/paginate';
+import { likeContains } from '../common/utils/like-pattern';
 import { QueryCreditBalanceHistoryDto } from './dto/query-credit-balance-history.dto';
+import { computeSupplierBalance } from '../common/utils/supplier-balance';
+import {
+  startOfBusinessDay,
+  startOfNextBusinessDay,
+} from '../common/utils/business-date';
+import { sqlUtc } from '../common/utils/sql-time';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-// A settlement cheque reduces what's owed as soon as it's recorded (PENDING
-// or CLEARED) — writing the cheque is the commitment to pay. Only if it
-// actually bounces (RETURNED) does the debt come back. This is the opposite
-// timing rule from Liquid Cash, where a cheque only moves real cash once
-// CLEARED — here the payable is considered settled unless proven otherwise.
-const EFFECTIVE_PAYMENT_FILTER: Prisma.SupplierPaymentWhereInput = {
-  NOT: { mode: 'CHEQUE', chequeStatus: 'RETURNED' },
-};
+// Supplier balance rules live in common/utils/supplier-balance.ts. Note the
+// timing differs from Liquid Cash on purpose: a settlement cheque reduces
+// what's owed as soon as it's written (PENDING), but only moves cash once
+// CLEARED.
 
 function toNumber(value: Prisma.Decimal | null | undefined): number {
   return value ? Number(value) : 0;
@@ -21,7 +22,13 @@ function toNumber(value: Prisma.Decimal | null | undefined): number {
 
 export interface CreditBalanceHistoryRow {
   id: string;
-  type: 'PURCHASE' | 'TRANSPORT_CHARGE' | 'PURCHASE_RETURN' | 'SETTLEMENT';
+  type:
+    | 'PURCHASE'
+    | 'TRANSPORT_CHARGE'
+    | 'PURCHASE_RETURN'
+    | 'REPLACEMENT'
+    | 'SETTLEMENT'
+    | 'REFUND';
   status: 'PENDING' | 'CLEARED' | 'RETURNED' | null;
   date: Date;
   description: string;
@@ -43,36 +50,20 @@ export class CreditBalanceService {
   constructor(private prisma: PrismaService) {}
 
   /**
-   * The four aggregates that make up the company-wide Credit Balance (total
-   * owed to suppliers) — mirrors the per-supplier formula in
-   * CreditsService.computeCreditBalance, summed globally instead of grouped
-   * by supplier.
+   * The aggregates that make up the company-wide Credit Balance (total owed
+   * to suppliers) — the same supplierBalance() formula CreditsService uses
+   * per supplier, summed globally.
    */
   private async computeBalanceBreakdown() {
-    const [purchaseAgg, transportAgg, returnAgg, paymentAgg] =
-      await Promise.all([
-        this.prisma.purchase.aggregate({ _sum: { totalValue: true } }),
-        this.prisma.purchase.aggregate({ _sum: { transportCharges: true } }),
-        this.prisma.purchaseReturn.aggregate({ _sum: { totalAmount: true } }),
-        this.prisma.supplierPayment.aggregate({
-          where: EFFECTIVE_PAYMENT_FILTER,
-          _sum: { amount: true },
-        }),
-      ]);
-
-    const totalPurchases = toNumber(purchaseAgg._sum.totalValue);
-    const totalTransportCharges = toNumber(transportAgg._sum.transportCharges);
-    const totalReturns = toNumber(returnAgg._sum.totalAmount);
-    const totalSettled = toNumber(paymentAgg._sum.amount);
-    const balance =
-      totalPurchases - totalReturns - totalSettled - totalTransportCharges;
-
+    const c = await computeSupplierBalance(this.prisma);
     return {
-      balance,
-      totalPurchases,
-      totalTransportCharges,
-      totalReturns,
-      totalSettled,
+      balance: toNumber(c.balance),
+      totalPurchases: toNumber(c.purchases),
+      totalTransportCharges: toNumber(c.transportCharges),
+      totalReturns: toNumber(c.returns),
+      totalReplacements: toNumber(c.replacements),
+      totalSettled: toNumber(c.settled),
+      totalRefundsReceived: toNumber(c.refundsReceived),
     };
   }
 
@@ -123,16 +114,19 @@ export class CreditBalanceService {
       conditions.push(Prisma.sql`type = ${query.type}`);
     }
     if (query.dateFrom) {
-      conditions.push(Prisma.sql`date >= ${new Date(query.dateFrom)}`);
+      conditions.push(
+        Prisma.sql`date >= ${sqlUtc(startOfBusinessDay(query.dateFrom))}`,
+      );
     }
     if (query.dateTo) {
       conditions.push(
-        Prisma.sql`date < ${new Date(new Date(query.dateTo).getTime() + DAY_MS)}`,
+        Prisma.sql`date < ${sqlUtc(startOfNextBusinessDay(query.dateTo))}`,
       );
     }
     if (query.search) {
-      const term = `%${query.search}%`;
-      conditions.push(Prisma.sql`description ILIKE ${term}`);
+      conditions.push(
+        Prisma.sql`description ILIKE ${likeContains(query.search)} ESCAPE '\\'`,
+      );
     }
 
     const whereClause =
@@ -188,6 +182,43 @@ export class CreditBalanceService {
           pr."createdAt" AS "createdAt"
         FROM "PurchaseReturn" pr
         JOIN "Supplier" s ON s.id = pr."supplierId"
+
+        UNION ALL
+
+        SELECT
+          rr.id AS id,
+          'REPLACEMENT'::text AS type,
+          NULL::text AS status,
+          rr."receivedDate" AS date,
+          (s.name || ' — Replacement #' || rr."replacementNumber") AS description,
+          NULL::text AS mode,
+          rr."replacementNumber" AS reference,
+          rr."totalAmount" AS "faceAmount",
+          rr."totalAmount" AS amount,
+          rr."createdAt" AS "createdAt"
+        FROM "PurchaseReturnReplacement" rr
+        JOIN "Supplier" s ON s.id = rr."supplierId"
+
+        UNION ALL
+
+        SELECT
+          rf.id AS id,
+          'REFUND'::text AS type,
+          CASE WHEN rf.mode = 'CHEQUE' THEN rf."chequeStatus"::text ELSE NULL END AS status,
+          rf."refundDate" AS date,
+          (s.name || ' — Refund received #' || rf."refundNumber") AS description,
+          rf.mode::text AS mode,
+          rf.reference AS reference,
+          rf.amount AS "faceAmount",
+          CASE
+            WHEN rf."cancelledAt" IS NOT NULL THEN 0::numeric
+            WHEN rf.mode = 'CHEQUE' AND rf."chequeStatus" = 'RETURNED' THEN 0::numeric
+            ELSE rf.amount
+          END AS amount,
+          rf."createdAt" AS "createdAt"
+        FROM "Refund" rf
+        JOIN "Supplier" s ON s.id = rf."supplierId"
+        WHERE rf.party = 'SUPPLIER'
 
         UNION ALL
 

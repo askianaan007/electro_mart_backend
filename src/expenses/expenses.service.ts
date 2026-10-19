@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
@@ -7,6 +12,9 @@ import { UpdateExpenseDto } from './dto/update-expense.dto';
 import { QueryExpensesDto } from './dto/query-expenses.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { assertNotFutureBusinessDate } from '../common/utils/business-date';
+import { recordLedgerRevision } from '../common/utils/ledger-revision';
+import { businessDateRange } from '../common/utils/business-date';
 
 @Injectable()
 export class ExpensesService {
@@ -16,6 +24,7 @@ export class ExpensesService {
   ) {}
 
   create(dto: CreateExpenseDto, adminId: string) {
+    assertNotFutureBusinessDate(dto.expenseDate, 'Expense date');
     return this.prisma.$transaction(async (tx) => {
       const expense = await tx.expense.create({
         data: {
@@ -46,16 +55,18 @@ export class ExpensesService {
         description: { contains: query.search, mode: 'insensitive' },
       }),
       ...((query.dateFrom || query.dateTo) && {
-        expenseDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lte: new Date(query.dateTo) }),
-        },
+        expenseDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 
     const [data, total] = await this.prisma.$transaction([
       this.prisma.expense.findMany({
         where,
+        include: {
+          representativeSettlement: {
+            select: { id: true, settlementNumber: true, status: true },
+          },
+        },
         orderBy: [{ expenseDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
         take: limit,
@@ -67,15 +78,45 @@ export class ExpensesService {
   }
 
   async findOne(id: string) {
-    const expense = await this.prisma.expense.findUnique({ where: { id } });
+    const expense = await this.prisma.expense.findUnique({
+      where: { id },
+      include: {
+        representativeSettlement: {
+          select: { id: true, settlementNumber: true, status: true },
+        },
+      },
+    });
     if (!expense) throw new NotFoundException('Expense not found');
     return expense;
   }
 
+  /**
+   * An expense created by paying a commission settlement *is* that payout:
+   * editing or deleting it would change Liquid Cash while the settlement
+   * stays PAID (LC-07). It's corrected only by reversing the settlement's
+   * payment, which keeps the expense and posts an offsetting adjustment.
+   */
+  private assertNotSettlementPayout(expense: {
+    representativeSettlement: { settlementNumber: string } | null;
+  }) {
+    if (expense.representativeSettlement) {
+      throw new BadRequestException(
+        `This expense is the payout of commission settlement ${expense.representativeSettlement.settlementNumber} and can't be edited or deleted. Reverse the settlement's payment instead.`,
+      );
+    }
+  }
+
   async update(id: string, dto: UpdateExpenseDto, adminId: string) {
-    await this.findOne(id);
+    const existing = await this.findOne(id);
+    this.assertNotSettlementPayout(existing);
+    if (dto.expenseDate) {
+      assertNotFutureBusinessDate(dto.expenseDate, 'Expense date');
+    }
 
     return this.prisma.$transaction(async (tx) => {
+      await this.assertUnlinked(tx, id);
+      await recordLedgerRevision(tx, 'EXPENSE', existing, 'UPDATED', adminId);
+
       const expense = await tx.expense.update({
         where: { id },
         data: {
@@ -90,7 +131,7 @@ export class ExpensesService {
         adminId,
         action: 'UPDATED_EXPENSE',
         targetId: expense.id,
-        details: `Updated expense "${expense.description}" to ${expense.amount.toString()}`,
+        details: `Updated expense "${expense.description}": ${existing.amount.toString()} -> ${expense.amount.toString()}`,
       });
 
       return expense;
@@ -99,9 +140,15 @@ export class ExpensesService {
 
   async remove(id: string, adminId: string) {
     const expense = await this.findOne(id);
+    this.assertNotSettlementPayout(expense);
 
     return this.prisma.$transaction(async (tx) => {
-      await tx.expense.delete({ where: { id } });
+      await this.assertUnlinked(tx, id);
+      await recordLedgerRevision(tx, 'EXPENSE', expense, 'DELETED', adminId);
+      const deleted = await tx.expense.deleteMany({ where: { id } });
+      if (deleted.count === 0) {
+        throw new ConflictException('This expense was already deleted');
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -112,5 +159,17 @@ export class ExpensesService {
 
       return { message: 'Expense deleted' };
     }, TRANSACTION_OPTIONS);
+  }
+
+  private async assertUnlinked(
+    tx: Prisma.TransactionClient,
+    expenseId: string,
+  ) {
+    await tx.$queryRaw`SELECT id FROM "Expense" WHERE id = ${expenseId} FOR UPDATE`;
+    const link = await tx.representativeSettlement.findUnique({
+      where: { expenseId },
+      select: { settlementNumber: true },
+    });
+    this.assertNotSettlementPayout({ representativeSettlement: link });
   }
 }

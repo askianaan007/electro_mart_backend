@@ -38,6 +38,8 @@ import { CommissionModule } from './commission/commission.module';
 import { CollectionsModule } from './collections/collections.module';
 import { ReportsModule } from './reports/reports.module';
 import { BalanceSheetModule } from './balance-sheet/balance-sheet.module';
+import { RefundsModule } from './refunds/refunds.module';
+import { CashAdjustmentsModule } from './cash-adjustments/cash-adjustments.module';
 
 @Module({
   imports: [
@@ -76,6 +78,8 @@ import { BalanceSheetModule } from './balance-sheet/balance-sheet.module';
     CollectionsModule,
     ReportsModule,
     BalanceSheetModule,
+    RefundsModule,
+    CashAdjustmentsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

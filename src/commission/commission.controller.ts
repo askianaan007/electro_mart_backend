@@ -15,6 +15,8 @@ import { CreateSettlementDto } from './dto/create-settlement.dto';
 import { RejectSettlementDto } from './dto/reject-settlement.dto';
 import { PaySettlementDto } from './dto/pay-settlement.dto';
 import { QuerySettlementDto } from './dto/query-settlement.dto';
+import { UpdateSettlementChequeStatusDto } from './dto/update-settlement-cheque-status.dto';
+import { ReverseSettlementPaymentDto } from './dto/reverse-settlement-payment.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -102,10 +104,23 @@ export class CommissionController {
   })
   updateChequeStatus(
     @Param('id') id: string,
-    @Body('status') status: 'CLEARED' | 'RETURNED',
+    @Body() dto: UpdateSettlementChequeStatusDto,
     @CurrentUser('sub') adminId: string,
   ) {
-    return this.settlementsService.updateChequeStatus(id, status, adminId);
+    return this.settlementsService.updateChequeStatus(id, dto.status, adminId);
+  }
+
+  @Patch('settlements/:id/reverse-payment')
+  @ApiOperation({
+    summary:
+      'Reverse a paid settlement: posts an offsetting cash adjustment and releases its lines',
+  })
+  reversePayment(
+    @Param('id') id: string,
+    @Body() dto: ReverseSettlementPaymentDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.settlementsService.reversePayment(id, dto.reason, adminId);
   }
 
   @Get('settlements/:id/receipt')

@@ -14,6 +14,7 @@ import { Role } from '@prisma/client';
 import { InvestmentsService } from './investments.service';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { UpdateInvestmentDto } from './dto/update-investment.dto';
+import { UpdateInvestmentChequeStatusDto } from './dto/update-investment-cheque-status.dto';
 import { QueryInvestmentDto } from './dto/query-investment.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -57,6 +58,18 @@ export class InvestmentsController {
     @CurrentUser('sub') adminId: string,
   ) {
     return this.investmentsService.update(id, dto, adminId);
+  }
+
+  @Patch(':id/cheque-status')
+  @ApiOperation({
+    summary: 'Mark a cheque investment/withdrawal CLEARED or RETURNED',
+  })
+  updateChequeStatus(
+    @Param('id') id: string,
+    @Body() dto: UpdateInvestmentChequeStatusDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.investmentsService.updateChequeStatus(id, dto.status, adminId);
   }
 
   @Delete(':id')

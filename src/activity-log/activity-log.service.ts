@@ -9,10 +9,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { QueryActivityLogDto } from './dto/query-activity-log.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { businessDateRange } from '../common/utils/business-date';
 
 type TransactionClient = Prisma.TransactionClient;
-
-const DAY_MS = 24 * 60 * 60 * 1000;
 
 @Injectable()
 export class ActivityLogService {
@@ -43,12 +42,7 @@ export class ActivityLogService {
         }),
       ...(query.adminId && { adminId: query.adminId }),
       ...((query.dateFrom || query.dateTo) && {
-        createdAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && {
-            lt: new Date(new Date(query.dateTo).getTime() + DAY_MS),
-          }),
-        },
+        createdAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
       ...(query.search && {
         OR: [

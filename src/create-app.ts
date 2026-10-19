@@ -1,4 +1,4 @@
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { INestApplication, Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { ExpressAdapter } from '@nestjs/platform-express';
@@ -7,6 +7,18 @@ import helmet from 'helmet';
 import type express from 'express';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+
+/** Request validation and error shaping — shared with the integration tests so they exercise the same pipeline. */
+export function applyGlobalPipesAndFilters(app: INestApplication) {
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  );
+  app.useGlobalFilters(new HttpExceptionFilter());
+}
 
 export async function createApp(expressInstance?: express.Express) {
   const app = expressInstance
@@ -40,14 +52,7 @@ export async function createApp(expressInstance?: express.Express) {
     app.enableCors();
   }
 
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      transform: true,
-      forbidNonWhitelisted: true,
-    }),
-  );
-  app.useGlobalFilters(new HttpExceptionFilter());
+  applyGlobalPipesAndFilters(app);
 
   // The full API schema — including admin-only destructive routes like
   // clear-data and the activity-log wipe — is otherwise publicly browsable

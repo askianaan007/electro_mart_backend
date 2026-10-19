@@ -19,6 +19,7 @@ import {
   resetSequenceCounter,
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { businessDateRange } from '../common/utils/business-date';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -273,10 +274,7 @@ export class PurchaseReturnsService {
         ],
       }),
       ...((query.dateFrom || query.dateTo) && {
-        returnDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lte: new Date(query.dateTo) }),
-        },
+        returnDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -25,6 +26,24 @@ import {
   isEffectivePayment,
   recomputeInvoicePaymentStatus,
 } from '../common/utils/invoice-financials';
+import { assertChequeTransition } from '../common/utils/cheque-transitions';
+import {
+  assertNotFutureBusinessDate,
+  startOfBusinessDay,
+  startOfNextBusinessDay,
+} from '../common/utils/business-date';
+import {
+  duplicateWindowStart,
+  PossibleDuplicateException,
+} from '../common/utils/duplicate-guard';
+
+/**
+ * PaymentRevision.action values. UNDO / RESTORED are written *by* undo() so
+ * Liquid Cash history can show the undo as its own dated correction; they are
+ * not themselves undoable and never appear as a payment's "last change".
+ */
+const UNDOABLE_ACTIONS = ['UPDATED', 'CHEQUE_STATUS', 'DELETED'];
+import { businessDateRange } from '../common/utils/business-date';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -105,6 +124,19 @@ function fromSnapshot(s: PaymentSnapshot) {
   };
 }
 
+/** The `lastChange` shape the admin list returns, for a just-recorded revision. */
+function lastChangeOf(revision: {
+  id: string;
+  action: string;
+  createdAt: Date;
+}) {
+  return {
+    id: revision.id,
+    action: revision.action,
+    createdAt: revision.createdAt,
+  };
+}
+
 @Injectable()
 export class PaymentsService {
   constructor(
@@ -130,89 +162,116 @@ export class PaymentsService {
         'Bank name, cheque number, cheque date, and collected date are all required for cheque payments',
       );
     }
-    if (new Date(dto.collectedDate) > new Date()) {
-      throw new BadRequestException('Collected date cannot be in the future');
-    }
+    assertNotFutureBusinessDate(dto.collectedDate, 'Collected date');
   }
 
   async create(dto: CreatePaymentDto, adminId: string) {
+    return this.prisma.$transaction(
+      (tx) => this.createInTransaction(tx, dto, adminId),
+      TRANSACTION_OPTIONS,
+    );
+  }
+
+  /**
+   * create() inside a caller's transaction — CollectionsService uses it so
+   * recording the payment and confirming the collection commit together or
+   * not at all (LC-18).
+   */
+  async createInTransaction(
+    tx: Prisma.TransactionClient,
+    dto: CreatePaymentDto,
+    adminId: string,
+  ) {
     this.validateChequeFields(dto);
+    assertNotFutureBusinessDate(dto.paymentDate, 'Payment date');
 
     const amount = new Prisma.Decimal(dto.amount);
 
-    return this.prisma.$transaction(async (tx) => {
-      // Lock the invoice row for the duration of this transaction so a
-      // second concurrent payment against the same invoice can't read the
-      // same pre-write "amount remaining" snapshot and also pass the
-      // overpayment guard below — it blocks here until this transaction
-      // commits, then sees this payment already counted.
-      await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${dto.invoiceId} FOR UPDATE`;
+    // Lock the invoice row for the duration of this transaction so a
+    // second concurrent payment against the same invoice can't read the
+    // same pre-write "amount remaining" snapshot and also pass the
+    // overpayment guard below — it blocks here until this transaction
+    // commits, then sees this payment already counted.
+    await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${dto.invoiceId} FOR UPDATE`;
 
-      const invoice = await tx.invoice.findUnique({
-        where: { id: dto.invoiceId },
-        include: { payments: true },
-      });
-      if (!invoice) throw new NotFoundException('Invoice not found');
+    const invoice = await tx.invoice.findUnique({
+      where: { id: dto.invoiceId },
+      include: { payments: true },
+    });
+    if (!invoice) throw new NotFoundException('Invoice not found');
 
-      const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
-      const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
-      const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
-      if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
-        throw new BadRequestException(
-          'Payment amount exceeds the outstanding invoice balance',
-        );
+    // Same lock, so a double-submitted identical payment always sees the
+    // first one here (LC-04).
+    if (!dto.confirmDuplicate) {
+      const duplicate = invoice.payments.find(
+        (p) =>
+          p.amount.equals(amount) &&
+          p.mode === dto.mode &&
+          (dto.mode !== 'CHEQUE' || p.chequeNumber === dto.chequeNumber) &&
+          p.paymentDate >= startOfBusinessDay(dto.paymentDate) &&
+          p.paymentDate < startOfNextBusinessDay(dto.paymentDate) &&
+          p.createdAt >= duplicateWindowStart(),
+      );
+      if (duplicate) {
+        throw new PossibleDuplicateException('payment', duplicate.id);
       }
+    }
 
-      const payment = await tx.payment.create({
-        data: {
-          invoiceId: dto.invoiceId,
-          dealerId: invoice.dealerId,
-          amount,
-          mode: dto.mode,
-          reference: dto.reference,
-          paymentDate: new Date(dto.paymentDate),
-          chequeStatus:
-            dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
-          chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : undefined,
-          bankName: dto.mode === 'CHEQUE' ? dto.bankName : undefined,
-          chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : undefined,
-          chequeDate:
-            dto.mode === 'CHEQUE' && dto.chequeDate
-              ? new Date(dto.chequeDate)
-              : undefined,
-          collectedDate:
-            dto.mode === 'CHEQUE' && dto.collectedDate
-              ? new Date(dto.collectedDate)
-              : undefined,
-          remarks: dto.remarks,
-        },
-      });
+    const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
+    const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
+    const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
+    if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
+      throw new BadRequestException(
+        'Payment amount exceeds the outstanding invoice balance',
+      );
+    }
 
-      await recomputeInvoicePaymentStatus(tx, invoice.id);
+    const payment = await tx.payment.create({
+      data: {
+        invoiceId: dto.invoiceId,
+        dealerId: invoice.dealerId,
+        amount,
+        mode: dto.mode,
+        reference: dto.reference,
+        paymentDate: new Date(dto.paymentDate),
+        chequeStatus: dto.mode === 'CHEQUE' ? ChequeStatus.PENDING : undefined,
+        chequeStatusUpdatedAt: dto.mode === 'CHEQUE' ? new Date() : undefined,
+        bankName: dto.mode === 'CHEQUE' ? dto.bankName : undefined,
+        chequeNumber: dto.mode === 'CHEQUE' ? dto.chequeNumber : undefined,
+        chequeDate:
+          dto.mode === 'CHEQUE' && dto.chequeDate
+            ? new Date(dto.chequeDate)
+            : undefined,
+        collectedDate:
+          dto.mode === 'CHEQUE' && dto.collectedDate
+            ? new Date(dto.collectedDate)
+            : undefined,
+        remarks: dto.remarks,
+      },
+    });
 
-      // Not clamped to zero — a payment recorded while the dealer already
-      // has a return credit correctly pushes their balance further negative
-      // rather than discarding part of that credit.
-      const dealer = await tx.dealer.findUniqueOrThrow({
-        where: { id: invoice.dealerId },
-      });
-      await tx.dealer.update({
-        where: { id: invoice.dealerId },
-        data: { outstandingBalance: dealer.outstandingBalance.sub(amount) },
-      });
+    await recomputeInvoicePaymentStatus(tx, invoice.id);
 
-      await this.activityLogService.log(tx, {
-        adminId,
-        action: 'RECORDED_PAYMENT',
-        targetId: payment.id,
-        details:
-          dto.mode === 'CHEQUE'
-            ? `Cheque payment of ${amount.toString()} against invoice ${invoice.invoiceNumber} (${dto.bankName}, #${dto.chequeNumber})`
-            : `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`,
-      });
+    // Not clamped to zero — a payment recorded while the dealer already
+    // has a return credit correctly pushes their balance further negative
+    // rather than discarding part of that credit. Atomic decrement, so a
+    // concurrent change on another invoice of this dealer isn't lost (LC-17).
+    await tx.dealer.update({
+      where: { id: invoice.dealerId },
+      data: { outstandingBalance: { decrement: amount } },
+    });
 
-      return payment;
-    }, TRANSACTION_OPTIONS);
+    await this.activityLogService.log(tx, {
+      adminId,
+      action: 'RECORDED_PAYMENT',
+      targetId: payment.id,
+      details:
+        dto.mode === 'CHEQUE'
+          ? `Cheque payment of ${amount.toString()} against invoice ${invoice.invoiceNumber} (${dto.bankName}, #${dto.chequeNumber})`
+          : `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`,
+    });
+
+    return payment;
   }
 
   /**
@@ -223,6 +282,7 @@ export class PaymentsService {
    */
   async update(id: string, dto: UpdatePaymentDto, adminId: string) {
     this.validateChequeFields(dto);
+    assertNotFutureBusinessDate(dto.paymentDate, 'Payment date');
 
     const existing = await this.prisma.payment.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Payment not found');
@@ -254,7 +314,12 @@ export class PaymentsService {
         chequeStatus,
       });
 
-      await this.recordRevision(tx, payment, 'UPDATED', adminId);
+      const revision = await this.recordRevision(
+        tx,
+        payment,
+        'UPDATED',
+        adminId,
+      );
 
       const updated = await tx.payment.update({
         where: { id },
@@ -291,7 +356,8 @@ export class PaymentsService {
         details: `Updated payment against invoice ${payment.invoice.invoiceNumber}: ${payment.amount.toString()} -> ${amount.toString()}`,
       });
 
-      return updated;
+      // The client's immediate "Undo" names this exact change (LC-19).
+      return { ...updated, lastChange: lastChangeOf(revision) };
     }, TRANSACTION_OPTIONS);
   }
 
@@ -315,7 +381,12 @@ export class PaymentsService {
       if (!payment) throw new NotFoundException('Payment not found');
       this.assertHasInvoice(payment);
 
-      await this.recordRevision(tx, payment, 'DELETED', adminId);
+      const revision = await this.recordRevision(
+        tx,
+        payment,
+        'DELETED',
+        adminId,
+      );
       await tx.payment.delete({ where: { id } });
 
       await this.settleFinancials(tx, payment.invoiceId, payment.dealerId, {
@@ -330,15 +401,22 @@ export class PaymentsService {
         details: `Deleted payment of ${payment.amount.toString()} against invoice ${payment.invoice.invoiceNumber} (restorable)`,
       });
 
-      return { message: 'Payment deleted' };
+      return { message: 'Payment deleted', revisionId: revision.id };
     }, TRANSACTION_OPTIONS);
   }
 
   /**
-   * Changes a cheque's status to any other status — PENDING, CLEARED or
-   * RETURNED — at any time. RETURNED means the money was never received, so
-   * moving into or out of RETURNED adjusts the dealer's balance and the
-   * invoice's payment status. The previous status is kept for undo().
+   * Changes a cheque's status. The legal changes are listed in
+   * cheque-transitions.ts (DEALER — all of them, so a bank reversal or a
+   * re-presented cheque can be recorded as it happened). RETURNED means the
+   * money was never received, so moving into or out of RETURNED adjusts the
+   * dealer's balance and the invoice's payment status.
+   *
+   * Only a change that *adds* to what counts against the invoice — leaving
+   * RETURNED — is checked against the invoice balance. PENDING → CLEARED
+   * doesn't change that amount (a pending cheque already counts), so a sales
+   * return recorded meanwhile can't block recording a real bank clearing
+   * (LC-10); any excess shows as dealer credit (negative outstanding).
    */
   async updateChequeStatus(
     paymentId: string,
@@ -364,19 +442,27 @@ export class PaymentsService {
         );
       }
       this.assertHasInvoice(payment);
-      if (payment.chequeStatus === status) {
-        throw new BadRequestException(
-          `This cheque is already marked ${status}`,
-        );
+      assertChequeTransition(
+        'DEALER',
+        payment.chequeStatus,
+        status,
+        payment.chequeStatusUpdatedAt,
+      );
+
+      if (!isEffectivePayment(payment)) {
+        await this.assertFitsInvoice(tx, payment.invoice, paymentId, {
+          amount: payment.amount,
+          mode: payment.mode,
+          chequeStatus: status,
+        });
       }
 
-      await this.assertFitsInvoice(tx, payment.invoice, paymentId, {
-        amount: payment.amount,
-        mode: payment.mode,
-        chequeStatus: status,
-      });
-
-      await this.recordRevision(tx, payment, 'CHEQUE_STATUS', adminId);
+      const revision = await this.recordRevision(
+        tx,
+        payment,
+        'CHEQUE_STATUS',
+        adminId,
+      );
 
       const updated = await tx.payment.update({
         where: { id: paymentId },
@@ -395,7 +481,7 @@ export class PaymentsService {
         details: `Cheque ${payment.chequeNumber ?? payment.reference ?? paymentId} changed from ${payment.chequeStatus} to ${status}`,
       });
 
-      return updated;
+      return { ...updated, lastChange: lastChangeOf(revision) };
     }, TRANSACTION_OPTIONS);
   }
 
@@ -405,11 +491,18 @@ export class PaymentsService {
    * was and re-applying its balance/invoice-status effects. Calling it
    * repeatedly walks further back through the payment's history.
    */
-  async undo(paymentId: string, adminId: string) {
+  async undo(paymentId: string, adminId: string, expectedRevisionId?: string) {
     const latest = await this.prisma.paymentRevision.findFirst({
-      where: { paymentId, undoneAt: null },
+      where: { paymentId, undoneAt: null, action: { in: UNDOABLE_ACTIONS } },
       orderBy: { createdAt: 'desc' },
     });
+    // The client names the change it showed the user, so a double click or
+    // a second tab can't undo one change further back than intended (LC-19).
+    if (expectedRevisionId && latest?.id !== expectedRevisionId) {
+      throw new ConflictException(
+        'That change has already been undone — refresh to see the current state',
+      );
+    }
     if (!latest) {
       throw new BadRequestException(
         'There is nothing to undo for this payment',
@@ -423,7 +516,7 @@ export class PaymentsService {
       // Re-read under the lock so two concurrent undos can't both apply the
       // same revision.
       const revision = await tx.paymentRevision.findFirst({
-        where: { paymentId, undoneAt: null },
+        where: { paymentId, undoneAt: null, action: { in: UNDOABLE_ACTIONS } },
         orderBy: { createdAt: 'desc' },
       });
       if (!revision || revision.id !== latest.id) {
@@ -442,7 +535,10 @@ export class PaymentsService {
       }
 
       const restored = fromSnapshot(snapshot);
-      const current = await tx.payment.findUnique({ where: { id: paymentId } });
+      const current = await tx.payment.findUnique({
+        where: { id: paymentId },
+        include: { collectionSubmission: true },
+      });
 
       if (revision.action === 'DELETED' && current) {
         throw new BadRequestException('This payment already exists');
@@ -454,6 +550,21 @@ export class PaymentsService {
       }
 
       await this.assertFitsInvoice(tx, invoice, paymentId, restored);
+
+      // The undo is itself a dated change: keep the state it replaces, so
+      // Liquid Cash history shows the undo on the day it happened instead of
+      // silently re-dating the original entry (LC-05/LC-06).
+      await tx.paymentRevision.create({
+        data: {
+          paymentId,
+          invoiceId: invoice.id,
+          action: current ? 'UNDO' : 'RESTORED',
+          adminId,
+          snapshot: current
+            ? toSnapshot(current)
+            : { id: paymentId, absent: true },
+        },
+      });
 
       let result: Payment;
       if (current) {
@@ -614,12 +725,9 @@ export class PaymentsService {
     );
     if (delta.isZero()) return;
 
-    const dealer = await tx.dealer.findUniqueOrThrow({
-      where: { id: dealerId },
-    });
     await tx.dealer.update({
       where: { id: dealerId },
-      data: { outstandingBalance: dealer.outstandingBalance.add(delta) },
+      data: { outstandingBalance: { increment: delta } },
     });
   }
 
@@ -669,10 +777,7 @@ export class PaymentsService {
       dealerId: query.dealerId,
       invoiceId: query.invoiceId,
       ...((query.dateFrom || query.dateTo) && {
-        paymentDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        paymentDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
       ...(query.search && {
         OR: [
@@ -705,17 +810,21 @@ export class PaymentsService {
     // The newest undoable change per payment, so the screen can offer
     // "Undo" on exactly the rows that have one.
     const revisions = await this.prisma.paymentRevision.findMany({
-      where: { paymentId: { in: data.map((p) => p.id) }, undoneAt: null },
+      where: {
+        paymentId: { in: data.map((p) => p.id) },
+        undoneAt: null,
+        action: { in: UNDOABLE_ACTIONS },
+      },
       orderBy: { createdAt: 'desc' },
       distinct: ['paymentId'],
-      select: { paymentId: true, action: true, createdAt: true },
+      select: { id: true, paymentId: true, action: true, createdAt: true },
     });
     const withLastChange = data.map((payment) => {
       const last = revisions.find((r) => r.paymentId === payment.id);
       return {
         ...payment,
         lastChange: last
-          ? { action: last.action, createdAt: last.createdAt }
+          ? { id: last.id, action: last.action, createdAt: last.createdAt }
           : null,
       };
     });

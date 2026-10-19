@@ -8,17 +8,14 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueryReportDto } from './dto/query-report.dto';
+import { businessDateRange } from '../common/utils/business-date';
 
 const ZERO = new Prisma.Decimal(0);
 
 function dateRangeWhere(
   query: QueryReportDto,
-): { gte?: Date; lte?: Date } | undefined {
-  if (!query.dateFrom && !query.dateTo) return undefined;
-  return {
-    ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-    ...(query.dateTo && { lte: new Date(query.dateTo) }),
-  };
+): { gte?: Date; lt?: Date } | undefined {
+  return businessDateRange(query.dateFrom, query.dateTo);
 }
 
 /**

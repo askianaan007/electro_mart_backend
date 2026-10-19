@@ -1,17 +1,21 @@
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { generateTempPassword } from '../src/common/utils/generate-password';
 
 const prisma = new PrismaClient();
 
 async function main() {
   const email = 'electromarttrade@gmail.com';
-  const plainPassword = 'Aa@amjaskmub077';
+  // Never a password committed to the repo: set SEED_ADMIN_PASSWORD, or a
+  // random one is generated and printed once below.
+  const plainPassword =
+    process.env.SEED_ADMIN_PASSWORD || generateTempPassword();
 
   const existing = await prisma.admin.findUnique({ where: { email } });
   if (existing) {
     console.log('Admin already exists:', email);
 
-    return; 
+    return;
   }
 
   const hashed = await bcrypt.hash(plainPassword, 10);
