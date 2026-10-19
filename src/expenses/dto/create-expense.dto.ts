@@ -2,11 +2,10 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsDateString,
   IsNotEmpty,
-  IsNumber,
   IsOptional,
   IsString,
-  Min,
 } from 'class-validator';
+import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 
 export class CreateExpenseDto {
   @ApiProperty()
@@ -15,8 +14,7 @@ export class CreateExpenseDto {
   description: string;
 
   @ApiProperty({ minimum: 0.01 })
-  @IsNumber()
-  @Min(0.01)
+  @IsMoneyAmount()
   amount: number;
 
   @ApiProperty()

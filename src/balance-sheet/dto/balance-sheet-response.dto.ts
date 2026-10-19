@@ -22,6 +22,8 @@ export interface BalanceSheetResponse {
       cashAndBank: string;
       accountsReceivable: string;
       chequesInHand: string;
+      /** Supplier refund cheques received, not yet cleared. */
+      refundChequesReceivable: string;
       inventory: string;
       supplierAdvances: null;
       prepaidExpenses: null;
@@ -40,6 +42,8 @@ export interface BalanceSheetResponse {
     current: {
       accountsPayable: string;
       supplierChequesIssued: string;
+      /** Dealer refund cheques written, not yet cleared. */
+      refundChequesIssued: string;
       taxPayable: null;
       accruedExpenses: null;
       customerAdvances: null;
@@ -57,6 +61,11 @@ export interface BalanceSheetResponse {
     capitalContributions: string;
     ownerWithdrawals: string;
     accumulatedEarnings: string;
+    /** EquityService's total (contributions + attributed earnings). */
+    investorEquity: string;
+    /** Opening balance + cash adjustments (CashAdjustment) — no other counterpart. */
+    cashAdjustments: string;
+    /** investorEquity + cashAdjustments. */
     totalEquity: string;
   };
 
@@ -80,6 +89,8 @@ export interface BalanceSheetResponse {
   reconciliation: {
     knownOrderTimingDifference: string;
     knownUnallocatedEquityDifference: string;
+    /** Transport charges deducted from payables with no recorded counterpart (LC-08). */
+    knownTransportChargeDifference: string;
     knownDifference: string;
     unexplainedDifference: string;
     inFlightOrderCount: number;

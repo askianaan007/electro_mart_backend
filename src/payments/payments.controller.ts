@@ -14,6 +14,7 @@ import { Role } from '@prisma/client';
 import { PaymentsService } from './payments.service';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { UpdatePaymentDto } from './dto/update-payment.dto';
+import { UndoPaymentDto } from './dto/undo-payment.dto';
 import { UpdatePaymentChequeStatusDto } from './dto/update-payment-cheque-status.dto';
 import { QueryPaymentDto } from './dto/query-payment.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -100,8 +101,12 @@ export class PaymentsController {
     summary:
       "Undo the payment's most recent edit, cheque-status change or delete",
   })
-  undo(@Param('id') id: string, @CurrentUser('sub') adminId: string) {
-    return this.paymentsService.undo(id, adminId);
+  undo(
+    @Param('id') id: string,
+    @Body() dto: UndoPaymentDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.paymentsService.undo(id, adminId, dto.revisionId);
   }
 
   @Patch(':id/cheque-status')

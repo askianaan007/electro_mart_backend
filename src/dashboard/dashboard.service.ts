@@ -5,24 +5,18 @@ import { CreditsService } from '../credits/credits.service';
 import { SalesAnalysisService } from '../sales-analysis/sales-analysis.service';
 import { LiquidCashService } from '../liquid-cash/liquid-cash.service';
 import { CreditBalanceService } from '../credit-balance/credit-balance.service';
+import {
+  BUSINESS_TIME_ZONE,
+  businessDateOf,
+  startOfBusinessDay,
+  startOfBusinessMonth,
+} from '../common/utils/business-date';
+import { sqlUtc } from '../common/utils/sql-time';
 
-// Liquid Cash tracks actual bank balance: cash/bank-transfer payments move
-// money immediately, but a cheque doesn't until it actually clears — while
-// PENDING (or if it later bounces) the money hasn't left/entered the bank
-// yet. Applies symmetrically to money going out (supplier payments) and
-// money coming in (dealer payments/collections).
-const SUPPLIER_CLEARED_FILTER: Prisma.SupplierPaymentWhereInput = {
-  OR: [
-    { mode: { not: 'CHEQUE' } },
-    { mode: 'CHEQUE', chequeStatus: 'CLEARED' },
-  ],
-};
-const DEALER_CLEARED_FILTER: Prisma.PaymentWhereInput = {
-  OR: [
-    { mode: { not: 'CHEQUE' } },
-    { mode: 'CHEQUE', chequeStatus: 'CLEARED' },
-  ],
-};
+// Cash figures (collections, cash flow) come from LiquidCashService's one
+// ledger: a cheque counts on the day it cleared, not the day it was written,
+// and corrections count on the day they were made — the same rows the
+// Liquid Cash page shows (LC-14).
 
 const FULFILLMENT_STATUSES: OrderStatus[] = [
   OrderStatus.APPROVED,
@@ -99,14 +93,14 @@ export class DashboardService {
       salesReturnAgg,
       purchaseAgg,
       purchaseReturnAgg,
-      duePaymentsAgg,
-      supplierPaymentsAgg,
+      cash,
     ] = await Promise.all([
       // Single source of truth for Net Sales/Profit: cost-of-goods-sold based
       // on completed orders in this range, shared with the Sales Analysis page.
+      // Whole Colombo days, inclusive: the range's first and last dates.
       this.salesAnalysisService.getSummary({
-        dateFrom: rangeStart.toISOString(),
-        dateTo: rangeEnd.toISOString(),
+        dateFrom: businessDateOf(rangeStart),
+        dateTo: businessDateOf(new Date(rangeEnd.getTime() - 1)),
       }),
       this.prisma.salesReturn.aggregate({
         where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
@@ -120,20 +114,7 @@ export class DashboardService {
         where: { returnDate: { gte: rangeStart, lt: rangeEnd } },
         _sum: { totalAmount: true },
       }),
-      this.prisma.payment.aggregate({
-        where: {
-          paymentDate: { gte: rangeStart, lt: rangeEnd },
-          ...DEALER_CLEARED_FILTER,
-        },
-        _sum: { amount: true },
-      }),
-      this.prisma.supplierPayment.aggregate({
-        where: {
-          paymentDate: { gte: rangeStart, lt: rangeEnd },
-          ...SUPPLIER_CLEARED_FILTER,
-        },
-        _sum: { amount: true },
-      }),
+      this.liquidCashService.getPeriodTotals(rangeStart, rangeEnd),
     ]);
 
     const shared = this.deriveFinancials(
@@ -142,12 +123,12 @@ export class DashboardService {
       purchaseAgg._sum.totalValue,
       purchaseReturnAgg._sum.totalAmount,
     );
-    const invoiceDuePayments = toNumber(duePaymentsAgg._sum.amount);
-    const supplierPayments = toNumber(supplierPaymentsAgg._sum.amount);
-    const netCashFlow =
-      invoiceDuePayments - supplierPayments - shared.totalExpenses;
-
-    return { ...shared, invoiceDuePayments, netCashFlow };
+    return {
+      ...shared,
+      invoiceDuePayments: cash.collected,
+      netCashFlow: cash.netCashFlow,
+      operatingCashFlow: cash.operatingCashFlow,
+    };
   }
 
   /**
@@ -178,9 +159,9 @@ export class DashboardService {
 
   private async getMonthlyKpis() {
     const now = new Date();
-    const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-    const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const startOfThisMonth = startOfBusinessMonth(now);
+    const startOfNextMonth = startOfBusinessMonth(now, 1);
+    const startOfLastMonth = startOfBusinessMonth(now, -1);
 
     const [current, previous, allTime] = await Promise.all([
       this.computeMonthlyFinancials(startOfThisMonth, startOfNextMonth),
@@ -206,7 +187,10 @@ export class DashboardService {
         current.netPurchase,
         previous.netPurchase,
       ),
+      // Change in Liquid Cash this month — equals the Liquid Cash page's
+      // movement over the same dates. operatingCashFlow excludes capital.
       netCashFlow: current.netCashFlow,
+      operatingCashFlow: current.operatingCashFlow,
       profit: allTime.profit,
       profitChangePct: pctChange(current.profit, previous.profit),
       totalExpenses: allTime.totalExpenses,
@@ -223,13 +207,8 @@ export class DashboardService {
   }
 
   async getAdminSummary() {
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
-
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 5);
-    sixMonthsAgo.setDate(1);
-    sixMonthsAgo.setHours(0, 0, 0, 0);
+    const startOfToday = startOfBusinessDay(new Date());
+    const sixMonthsAgo = startOfBusinessMonth(new Date(), -5);
 
     // Extend the revenue chart's window back far enough to include any
     // admin-recorded sale with a backdated sale date older than 6 months —
@@ -242,11 +221,7 @@ export class DashboardService {
     const earliestCompletedAt = earliestCompleted._min.completedAt;
     const revenueChartStart =
       earliestCompletedAt && earliestCompletedAt < sixMonthsAgo
-        ? new Date(
-            earliestCompletedAt.getFullYear(),
-            earliestCompletedAt.getMonth(),
-            1,
-          )
+        ? startOfBusinessMonth(earliestCompletedAt)
         : sixMonthsAgo;
 
     const [
@@ -306,9 +281,9 @@ export class DashboardService {
         include: { dealer: { select: { businessName: true } } },
       }),
       this.prisma.$queryRaw<{ month: string; revenue: Prisma.Decimal }[]>`
-        SELECT to_char(date_trunc('month', "completedAt"), 'YYYY-MM') as month, SUM("totalAmount") as revenue
+        SELECT to_char(date_trunc('month', ("completedAt" AT TIME ZONE 'UTC') AT TIME ZONE ${BUSINESS_TIME_ZONE}), 'YYYY-MM') as month, SUM("totalAmount") as revenue
         FROM "Order"
-        WHERE status = 'COMPLETED' AND "completedAt" >= ${revenueChartStart}
+        WHERE status = 'COMPLETED' AND "completedAt" >= ${sqlUtc(revenueChartStart)}
         GROUP BY 1 ORDER BY 1
       `,
       // Over-fetch by gross quantity, then net against returns and re-rank

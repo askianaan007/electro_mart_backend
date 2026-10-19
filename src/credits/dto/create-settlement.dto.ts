@@ -1,18 +1,17 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { PaymentMode } from '@prisma/client';
 import {
+  IsBoolean,
   IsDateString,
   IsEnum,
-  IsNumber,
   IsOptional,
   IsString,
-  Min,
 } from 'class-validator';
+import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 
 export class CreateSettlementDto {
   @ApiProperty({ minimum: 0.01 })
-  @IsNumber()
-  @Min(0.01)
+  @IsMoneyAmount()
   amount: number;
 
   @ApiProperty({ enum: PaymentMode })
@@ -40,4 +39,12 @@ export class CreateSettlementDto {
   @IsOptional()
   @IsString()
   remarks?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Set after the server reported a POSSIBLE_DUPLICATE, to record an identical settlement on purpose',
+  })
+  @IsOptional()
+  @IsBoolean()
+  confirmDuplicate?: boolean;
 }

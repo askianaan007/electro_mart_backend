@@ -7,7 +7,7 @@
  *   npx ts-node -r tsconfig-paths/register prisma/scripts/import-emax-legacy.ts            (dry run, no writes)
  *   npx ts-node -r tsconfig-paths/register prisma/scripts/import-emax-legacy.ts --commit    (writes for real)
  */
-import { PrismaClient, InventoryLogType, PaymentMode, PaymentStatus, Prisma } from '@prisma/client';
+import { PrismaClient, ChequeStatus, InventoryLogType, PaymentMode, PaymentStatus, Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -641,6 +641,7 @@ async function main() {
   }
 
   // ---- Phase C: supplier payments ----
+  const importedCheques: string[] = [];
   for (const [date, mode, ref, amount, remarks] of raw.supplierPayments) {
     const isCheque = (mode ?? '').toLowerCase().includes('cheque');
     await prisma.supplierPayment.create({
@@ -650,9 +651,24 @@ async function main() {
         mode: isCheque ? PaymentMode.CHEQUE : PaymentMode.CASH,
         reference: ref ? String(ref) : undefined,
         paymentDate: new Date(date),
+        // Every cheque needs a status, or Liquid Cash and the credit balance
+        // can't tell whether it moved money (LC-24). The legacy sheet doesn't
+        // say whether it cleared, so it is imported PENDING — never assumed
+        // cleared — and listed below for checking against the bank statement.
+        ...(isCheque && {
+          chequeStatus: ChequeStatus.PENDING,
+          chequeStatusUpdatedAt: new Date(date),
+        }),
         remarks: remarks ?? undefined,
       },
     });
+    if (isCheque) importedCheques.push(`${date} ${ref ?? ''} ${amount}`);
+  }
+  if (importedCheques.length > 0) {
+    console.log(
+      `\n${importedCheques.length} supplier cheque(s) imported as PENDING — verify each against the bank statement and mark it CLEARED or RETURNED:`,
+    );
+    for (const line of importedCheques) console.log(`  ${line}`);
   }
 
   // ---- Final report ----

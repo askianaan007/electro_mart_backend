@@ -115,6 +115,25 @@ enum SettlementStatus {
   APPROVED
   REJECTED
   PAID
+  // A PAID settlement whose payout was reversed (money returned / recorded in
+  // error). The original Expense stays; a SETTLEMENT_REVERSAL CashAdjustment
+  // offsets it on the reversal date, and the lines go back to PENDING.
+  REVERSED
+}
+
+// Liquid Cash entries that are not tied to a dealer/supplier/investor/expense
+// document. OPENING_BALANCE is the verified cash on hand when record-keeping
+// started (at most one active); ADJUSTMENT is a counted/bank-verified
+// correction; SETTLEMENT_REVERSAL offsets a reversed commission payout.
+enum CashAdjustmentType {
+  OPENING_BALANCE
+  ADJUSTMENT
+  SETTLEMENT_REVERSAL
+}
+
+enum RefundParty {
+  DEALER
+  SUPPLIER
 }
 
 enum CollectionStatus {
@@ -139,6 +158,10 @@ model Admin {
   approvedOrders Order[]        @relation("OrderApprovedBy")
   createdOrders  Order[]        @relation("OrderCreatedBy")
   customerNotes  CustomerNote[]
+
+  purchaseReturnReplacements PurchaseReturnReplacement[]
+  cashAdjustments            CashAdjustment[]
+  refunds                    Refund[]
 }
 
 model Dealer {
@@ -171,6 +194,7 @@ model Dealer {
   invoices              Invoice[]
   payments              Payment[]
   salesReturns          SalesReturn[]
+  refunds               Refund[]
   customerProfile       CustomerProfile?
   notes                 CustomerNote[]
   drafts                RepOrderDraft[]
@@ -227,16 +251,17 @@ model Product {
   compareAtPrice Decimal?
   isFeatured     Boolean  @default(false)
 
-  orderItems              OrderItem[]
-  purchaseItems           PurchaseItem[]
-  inventoryLogs           InventoryLog[]
-  salesReturnItems        SalesReturnItem[]
-  purchaseReturnItems     PurchaseReturnItem[]
-  images                  ProductImage[]
-  commissionRules         CommissionRule[]
-  commissionLedgerEntries CommissionLedgerEntry[]
-  availabilityOverride    ProductAvailabilityOverride?
-  draftItems              RepOrderDraftItem[]
+  orderItems                     OrderItem[]
+  purchaseItems                  PurchaseItem[]
+  purchaseReturnReplacementItems PurchaseReturnReplacementItem[]
+  inventoryLogs                  InventoryLog[]
+  salesReturnItems               SalesReturnItem[]
+  purchaseReturnItems            PurchaseReturnItem[]
+  images                         ProductImage[]
+  commissionRules                CommissionRule[]
+  commissionLedgerEntries        CommissionLedgerEntry[]
+  availabilityOverride           ProductAvailabilityOverride?
+  draftItems                     RepOrderDraftItem[]
 
   @@index([category])
   @@index([status])
@@ -265,6 +290,9 @@ model Supplier {
   purchases        Purchase[]
   supplierPayments SupplierPayment[]
   purchaseReturns  PurchaseReturn[]
+  refunds          Refund[]
+
+  purchaseReturnReplacements PurchaseReturnReplacement[]
 }
 
 model Purchase {
@@ -287,17 +315,18 @@ model Purchase {
 }
 
 model PurchaseReturn {
-  id           String               @id @default(uuid())
-  returnNumber String               @unique
+  id           String                      @id @default(uuid())
+  returnNumber String                      @unique
   purchaseId   String?
-  purchase     Purchase?            @relation(fields: [purchaseId], references: [id])
+  purchase     Purchase?                   @relation(fields: [purchaseId], references: [id])
   supplierId   String
-  supplier     Supplier             @relation(fields: [supplierId], references: [id])
+  supplier     Supplier                    @relation(fields: [supplierId], references: [id])
   reason       String
   totalAmount  Decimal
   returnDate   DateTime
-  createdAt    DateTime             @default(now())
+  createdAt    DateTime                    @default(now())
   items        PurchaseReturnItem[]
+  replacements PurchaseReturnReplacement[]
 
   @@index([purchaseId])
   @@index([supplierId])
@@ -314,7 +343,54 @@ model PurchaseReturnItem {
   unitCost         Decimal
   lineTotal        Decimal
 
+  replacementItems PurchaseReturnReplacementItem[]
+
   @@index([purchaseReturnId])
+  @@index([productId])
+}
+
+// Goods a supplier sent in place of returned ones. The tables were created by
+// migration 20260929120000_purchase_return_replacements (feature branch
+// feature/return-replacement-receipts) and already hold data in deployed
+// databases; these models only describe them — no migration is needed. A
+// replacement reverses the payable credit its return took off.
+model PurchaseReturnReplacement {
+  id                String         @id @default(uuid())
+  replacementNumber String         @unique
+  idempotencyKey    String         @unique
+  purchaseReturnId  String
+  purchaseReturn    PurchaseReturn @relation(fields: [purchaseReturnId], references: [id], onDelete: Restrict)
+  supplierId        String
+  supplier          Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  totalAmount       Decimal
+  receivedDate      DateTime
+  reference         String?
+  notes             String?
+  adminId           String
+  admin             Admin          @relation(fields: [adminId], references: [id], onDelete: Restrict)
+  createdAt         DateTime       @default(now())
+
+  items PurchaseReturnReplacementItem[]
+
+  @@index([purchaseReturnId])
+  @@index([supplierId])
+  @@index([receivedDate])
+}
+
+model PurchaseReturnReplacementItem {
+  id                   String                    @id @default(uuid())
+  replacementId        String
+  replacement          PurchaseReturnReplacement @relation(fields: [replacementId], references: [id], onDelete: Restrict)
+  purchaseReturnItemId String
+  purchaseReturnItem   PurchaseReturnItem        @relation(fields: [purchaseReturnItemId], references: [id], onDelete: Restrict)
+  productId            String
+  product              Product                   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  quantity             Int
+  unitCost             Decimal
+  lineTotal            Decimal
+
+  @@index([replacementId])
+  @@index([purchaseReturnItemId])
   @@index([productId])
 }
 
@@ -540,8 +616,18 @@ model Investment {
   remarks        String?
   createdAt      DateTime    @default(now())
 
+  // Cheque lifecycle, same rules as dealer payments: a cheque investment adds
+  // to Liquid Cash only once CLEARED (dated by chequeStatusUpdatedAt). Null on
+  // every row recorded before this existed — those keep counting as before.
+  chequeStatus          ChequeStatus?
+  chequeStatusUpdatedAt DateTime?
+  chequeNumber          String?
+  bankName              String?
+  chequeDate            DateTime?
+
   @@index([investorId])
   @@index([investmentDate])
+  @@index([chequeStatusUpdatedAt])
 }
 
 model Expense {
@@ -868,9 +954,93 @@ model RepresentativeSettlement {
   approvedAt        DateTime?
   rejectedReason    String?
   paidAt            DateTime?
+  // Cash/bank-transfer reference given when paying.
+  reference         String?
+  reversedAt        DateTime?
+  reversalReason    String?
   createdAt         DateTime         @default(now())
 
-  lines CommissionLedgerEntry[]
+  lines          CommissionLedgerEntry[]
+  cashAdjustment CashAdjustment?
+}
+
+// ---------------------------------------------------------------------------
+// Liquid Cash integrity (docs/LIQUID_CASH_ACCOUNTING_CONTRACT.md)
+// ---------------------------------------------------------------------------
+
+model CashAdjustment {
+  id                String                    @id @default(uuid())
+  adjustmentNumber  String                    @unique
+  type              CashAdjustmentType
+  // Signed: positive adds to Liquid Cash, negative takes from it.
+  amount            Decimal
+  adjustmentDate    DateTime
+  reason            String
+  // Cash-count sheet, bank statement or other evidence the figure came from.
+  evidenceReference String?
+  adminId           String
+  admin             Admin                     @relation(fields: [adminId], references: [id], onDelete: Restrict)
+  // Set on a row that exactly negates an earlier adjustment. Adjustments are
+  // never edited or deleted — a mistake is corrected by reversing it.
+  reversalOfId      String?                   @unique
+  reversalOf        CashAdjustment?           @relation("CashAdjustmentReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy        CashAdjustment?           @relation("CashAdjustmentReversal")
+  settlementId      String?                   @unique
+  settlement        RepresentativeSettlement? @relation(fields: [settlementId], references: [id], onDelete: Restrict)
+  createdAt         DateTime                  @default(now())
+
+  @@index([adjustmentDate])
+  @@index([type])
+}
+
+// Money returned to a dealer (cash out) or received back from a supplier
+// (cash in) when they hold a credit — e.g. a sales return on a paid invoice.
+// Cheque refunds move Liquid Cash only once CLEARED, like payments.
+model Refund {
+  id                    String        @id @default(uuid())
+  refundNumber          String        @unique
+  party                 RefundParty
+  dealerId              String?
+  dealer                Dealer?       @relation(fields: [dealerId], references: [id], onDelete: Restrict)
+  supplierId            String?
+  supplier              Supplier?     @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  amount                Decimal
+  mode                  PaymentMode
+  refundDate            DateTime
+  reference             String?
+  reason                String
+  chequeStatus          ChequeStatus?
+  chequeStatusUpdatedAt DateTime?
+  chequeNumber          String?
+  bankName              String?
+  chequeDate            DateTime?
+  cancelledAt           DateTime?
+  cancelReason          String?
+  adminId               String
+  admin                 Admin         @relation(fields: [adminId], references: [id], onDelete: Restrict)
+  createdAt             DateTime      @default(now())
+
+  @@index([dealerId])
+  @@index([supplierId])
+  @@index([refundDate])
+  @@index([chequeStatusUpdatedAt])
+}
+
+// Before-images of changes to cash-moving records other than dealer payments
+// (those use PaymentRevision). Liquid Cash history replays them as dated
+// correction rows instead of silently re-dating the original entry.
+model LedgerRevision {
+  id         String   @id @default(uuid())
+  // SUPPLIER_PAYMENT | INVESTMENT | EXPENSE | REFUND
+  entityType String
+  entityId   String
+  // UPDATED | CHEQUE_STATUS | DELETED | CANCELLED
+  action     String
+  snapshot   Json
+  adminId    String
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
 }
 
 // ---------------------------------------------------------------------------

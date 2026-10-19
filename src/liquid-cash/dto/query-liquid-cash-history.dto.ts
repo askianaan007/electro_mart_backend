@@ -6,13 +6,17 @@ export type LiquidCashEntryType =
   | 'INVESTMENT'
   | 'DEALER_PAYMENT'
   | 'SUPPLIER_PAYMENT'
-  | 'EXPENSE';
+  | 'EXPENSE'
+  | 'REFUND'
+  | 'ADJUSTMENT';
 
 const ENTRY_TYPES: LiquidCashEntryType[] = [
   'INVESTMENT',
   'DEALER_PAYMENT',
   'SUPPLIER_PAYMENT',
   'EXPENSE',
+  'REFUND',
+  'ADJUSTMENT',
 ];
 
 export class QueryLiquidCashHistoryDto extends PaginationQueryDto {

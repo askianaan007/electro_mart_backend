@@ -30,6 +30,7 @@ import {
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 import { derivePaymentStatus } from '../common/utils/invoice-financials';
+import { businessDateRange } from '../common/utils/business-date';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -902,10 +903,7 @@ export class OrdersService {
       status: query.status,
       dealerId: query.dealerId,
       ...((query.dateFrom || query.dateTo) && {
-        createdAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        createdAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
       ...(query.search && {
         OR: [

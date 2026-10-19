@@ -11,6 +11,7 @@ import { paginate } from '../common/utils/paginate';
 import { computeReturnedAmount } from '../common/utils/invoice-financials';
 import { resetSequenceCounter } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { businessDateRange } from '../common/utils/business-date';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -115,10 +116,7 @@ export class InvoicesService {
       ...this.buildPaymentStatusWhere(query.paymentStatus),
       dealerId: query.dealerId,
       ...((query.dateFrom || query.dateTo) && {
-        createdAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        createdAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
       ...(query.search && {
         invoiceNumber: { contains: query.search, mode: 'insensitive' },
@@ -153,10 +151,7 @@ export class InvoicesService {
       dealerId,
       ...this.buildPaymentStatusWhere(query.paymentStatus),
       ...((query.dateFrom || query.dateTo) && {
-        createdAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        createdAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
 

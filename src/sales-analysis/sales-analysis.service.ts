@@ -3,6 +3,7 @@ import { OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { QuerySalesAnalysisDto } from './dto/query-sales-analysis.dto';
 import { paginate } from '../common/utils/paginate';
+import { businessDateRange } from '../common/utils/business-date';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -32,10 +33,7 @@ export class SalesAnalysisService {
       status: OrderStatus.COMPLETED,
       ...(query.dealerId && { dealerId: query.dealerId }),
       ...((query.dateFrom || query.dateTo) && {
-        completedAt: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        completedAt: businessDateRange(query.dateFrom, query.dateTo),
       }),
       ...(query.search && {
         OR: [
@@ -157,19 +155,22 @@ export class SalesAnalysisService {
     const totalBuying = rows.reduce((sum, r) => sum.add(r.buyingPrice), ZERO);
     const totalProfit = rows.reduce((sum, r) => sum.add(r.profit), ZERO);
 
+    // Expenses are company-wide, not per dealer: subtracting all of them
+    // from one dealer's (or one search result's) profit would misstate it,
+    // so they only apply to the unfiltered company view.
+    const expensesIncluded = !query.dealerId && !query.search;
     const expenseWhere: Prisma.ExpenseWhereInput = {
       ...((query.dateFrom || query.dateTo) && {
-        expenseDate: {
-          ...(query.dateFrom && { gte: new Date(query.dateFrom) }),
-          ...(query.dateTo && { lt: new Date(query.dateTo) }),
-        },
+        expenseDate: businessDateRange(query.dateFrom, query.dateTo),
       }),
     };
-    const expenseAgg = await this.prisma.expense.aggregate({
-      where: expenseWhere,
-      _sum: { amount: true },
-    });
-    const totalExpenses = expenseAgg._sum.amount ?? ZERO;
+    const expenseAgg = expensesIncluded
+      ? await this.prisma.expense.aggregate({
+          where: expenseWhere,
+          _sum: { amount: true },
+        })
+      : null;
+    const totalExpenses = expenseAgg?._sum.amount ?? ZERO;
     const netProfit = totalProfit.sub(totalExpenses);
 
     return {
@@ -178,6 +179,7 @@ export class SalesAnalysisService {
       totalBuying,
       totalProfit,
       totalExpenses,
+      expensesIncluded,
       netProfit,
     };
   }

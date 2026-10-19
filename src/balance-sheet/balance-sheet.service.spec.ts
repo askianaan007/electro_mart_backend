@@ -125,13 +125,17 @@ describe('BalanceSheetService', () => {
       totalExpensesPaid: 50_000,
       pendingDealerCheques: 0,
       pendingSupplierCheques: 0,
+      pendingRefundChequesIn: 0,
+      pendingRefundChequesOut: 0,
+      openingBalance: 0,
+      totalAdjustments: 0,
     });
     creditBalanceService.getSummary.mockResolvedValue({
       balance: 120_000,
       totalPurchases: 200_000,
-      totalTransportCharges: 5_000,
+      totalTransportCharges: 0,
       totalReturns: 10_000,
-      totalSettled: 65_000,
+      totalSettled: 60,
       pendingChequeSettlements: 0,
     });
     equityService.getSummary.mockResolvedValue({
@@ -219,6 +223,10 @@ describe('BalanceSheetService', () => {
         totalExpensesPaid: 0,
         pendingDealerCheques: 0.2,
         pendingSupplierCheques: 0,
+        pendingRefundChequesIn: 0,
+        pendingRefundChequesOut: 0,
+        openingBalance: 0,
+        totalAdjustments: 0,
       });
       mocks.dealerAggregate.mockResolvedValue({ _sum: { outstandingBalance: D(0) } });
       mocks.queryRaw
@@ -328,6 +336,10 @@ describe('BalanceSheetService', () => {
         totalExpensesPaid: 0,
         pendingDealerCheques: 0,
         pendingSupplierCheques: 0,
+        pendingRefundChequesIn: 0,
+        pendingRefundChequesOut: 0,
+        openingBalance: 0,
+        totalAdjustments: 0,
       });
       creditBalanceService.getSummary.mockResolvedValue({
         balance: 40_000,
@@ -443,6 +455,10 @@ describe('BalanceSheetService', () => {
         totalExpensesPaid: 50_000,
         pendingDealerCheques: 25_000,
         pendingSupplierCheques: 0,
+        pendingRefundChequesIn: 0,
+        pendingRefundChequesOut: 0,
+        openingBalance: 0,
+        totalAdjustments: 0,
       });
       const result = await service.getSummary();
       expect(result.assets.current.chequesInHand).toBe('25000.00');
@@ -463,6 +479,74 @@ describe('BalanceSheetService', () => {
       const result = await service.getSummary();
       expect(result.liabilities.current.supplierChequesIssued).toBe('15000.00');
       expect(result.liabilities.current.totalCurrentLiabilities).toBe('135000.00');
+    });
+  });
+
+  describe('Liquid Cash remediation items (LC-08/LC-12/LC-15)', () => {
+    // The clean fixture has rawDifference 80,000 (see wireCleanFixture).
+    const liquid = (over: Record<string, number>) => ({
+      balance: 500_000,
+      totalInvestments: 400_000,
+      totalCollected: 300_000,
+      totalPaidToSuppliers: 150_000,
+      totalExpensesPaid: 50_000,
+      pendingDealerCheques: 0,
+      pendingSupplierCheques: 0,
+      pendingRefundChequesIn: 0,
+      pendingRefundChequesOut: 0,
+      openingBalance: 0,
+      totalAdjustments: 0,
+      ...over,
+    });
+
+    it('names transport charges deducted from payables as a known difference, with a warning', async () => {
+      wireCleanFixture();
+      creditBalanceService.getSummary.mockResolvedValue({
+        balance: 120_000,
+        totalTransportCharges: 80_000,
+        pendingChequeSettlements: 0,
+      });
+      const result = await service.getSummary();
+      expect(result.summary.rawDifference).toBe('80000.00');
+      expect(result.reconciliation.knownTransportChargeDifference).toBe(
+        '80000.00',
+      );
+      expect(result.reconciliation.unexplainedDifference).toBe('0.00');
+      expect(result.reconciliation.status).toBe(
+        'BALANCED_WITH_KNOWN_TIMING_DIFFERENCE',
+      );
+      expect(result.accountingWarnings.join(' ')).toMatch(/transport charges/);
+    });
+
+    it('puts opening balance and cash adjustments in equity', async () => {
+      wireCleanFixture();
+      liquidCashService.getSummary.mockResolvedValue(
+        liquid({ openingBalance: 50_000, totalAdjustments: 30_000 }),
+      );
+      const result = await service.getSummary();
+      expect(result.equity.investorEquity).toBe('430000.00');
+      expect(result.equity.cashAdjustments).toBe('80000.00');
+      expect(result.equity.totalEquity).toBe('510000.00');
+      expect(result.summary.rawDifference).toBe('0.00');
+      expect(result.reconciliation.status).toBe('BALANCED');
+    });
+
+    it('carries refund cheques in transit on both sides without changing the difference', async () => {
+      wireCleanFixture();
+      liquidCashService.getSummary.mockResolvedValue(
+        liquid({
+          pendingRefundChequesIn: 7_000,
+          pendingRefundChequesOut: 3_000,
+        }),
+      );
+      const result = await service.getSummary();
+      expect(result.assets.current.refundChequesReceivable).toBe('7000.00');
+      expect(result.liabilities.current.refundChequesIssued).toBe('3000.00');
+      expect(result.assets.current.totalCurrentAssets).toBe('637000.00');
+      expect(result.liabilities.current.totalCurrentLiabilities).toBe(
+        '123000.00',
+      );
+      expect(result.summary.rawDifference).toBe('84000.00');
     });
   });
 
