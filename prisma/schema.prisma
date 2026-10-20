@@ -296,37 +296,48 @@ model Supplier {
 }
 
 model Purchase {
-  id               String   @id @default(uuid())
+  id               String    @id @default(uuid())
   supplierId       String
-  supplier         Supplier @relation(fields: [supplierId], references: [id])
+  supplier         Supplier  @relation(fields: [supplierId], references: [id])
   invoiceNumber    String
   purchaseDate     DateTime
   totalValue       Decimal
-  transportCharges Decimal  @default(0)
+  transportCharges Decimal   @default(0)
   adminId          String
-  admin            Admin    @relation(fields: [adminId], references: [id])
-  createdAt        DateTime @default(now())
+  admin            Admin     @relation(fields: [adminId], references: [id])
+  createdAt        DateTime  @default(now())
+  // Set when the order was called off. Cancelling returns every unit still
+  // held through a PurchaseReturn flagged isCancellation, so the supplier's
+  // payable drops by the same value; reinstating removes that return again.
+  cancelledAt      DateTime?
+  cancelReason     String?
 
   items           PurchaseItem[]
   purchaseReturns PurchaseReturn[]
+  // Supplier refunds of money paid toward this order (e.g. an advance on a
+  // cancelled order). Informational link — the balance is per supplier.
+  refunds         Refund[]
 
   @@index([supplierId])
   @@index([purchaseDate])
 }
 
 model PurchaseReturn {
-  id           String                      @id @default(uuid())
-  returnNumber String                      @unique
-  purchaseId   String?
-  purchase     Purchase?                   @relation(fields: [purchaseId], references: [id])
-  supplierId   String
-  supplier     Supplier                    @relation(fields: [supplierId], references: [id])
-  reason       String
-  totalAmount  Decimal
-  returnDate   DateTime
-  createdAt    DateTime                    @default(now())
-  items        PurchaseReturnItem[]
-  replacements PurchaseReturnReplacement[]
+  id             String                      @id @default(uuid())
+  returnNumber   String                      @unique
+  purchaseId     String?
+  purchase       Purchase?                   @relation(fields: [purchaseId], references: [id])
+  supplierId     String
+  supplier       Supplier                    @relation(fields: [supplierId], references: [id])
+  reason         String
+  totalAmount    Decimal
+  returnDate     DateTime
+  createdAt      DateTime                    @default(now())
+  // The return created by cancelling its purchase. Only reinstating that
+  // purchase removes it; it can't be edited or deleted on its own.
+  isCancellation Boolean                     @default(false)
+  items          PurchaseReturnItem[]
+  replacements   PurchaseReturnReplacement[]
 
   @@index([purchaseId])
   @@index([supplierId])
@@ -1004,6 +1015,9 @@ model Refund {
   dealer                Dealer?       @relation(fields: [dealerId], references: [id], onDelete: Restrict)
   supplierId            String?
   supplier              Supplier?     @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  // Supplier refunds only: the order the money was paid toward, if any.
+  purchaseId            String?
+  purchase              Purchase?     @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
   amount                Decimal
   mode                  PaymentMode
   refundDate            DateTime
@@ -1022,6 +1036,7 @@ model Refund {
 
   @@index([dealerId])
   @@index([supplierId])
+  @@index([purchaseId])
   @@index([refundDate])
   @@index([chequeStatusUpdatedAt])
 }

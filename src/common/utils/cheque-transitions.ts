@@ -12,11 +12,20 @@ import { ChequeStatus } from '@prisma/client';
  * - SUPPLIER (cheques we issued): forward from PENDING, plus a 1-day revert
  *   to PENDING for a mis-click. A RETURNED → PENDING revert re-counts the
  *   payment, so CreditsService re-checks the supplier balance (LC-03).
- * - SETTLEMENT / REFUND: forward from PENDING only — final once decided.
+ * - REFUND_RECEIVED (a supplier's refund cheque we deposit): same as DEALER —
+ *   it is money coming in. Leaving RETURNED re-counts the refund against the
+ *   supplier's credit, so RefundsService re-checks it.
+ * - REFUND_PAID (a refund cheque we wrote to a dealer): same as SUPPLIER.
+ * - SETTLEMENT: forward from PENDING only — final once decided.
  * - INVESTMENT: same as SUPPLIER.
  */
 export type ChequeKind =
-  'DEALER' | 'SUPPLIER' | 'SETTLEMENT' | 'REFUND' | 'INVESTMENT';
+  | 'DEALER'
+  | 'SUPPLIER'
+  | 'SETTLEMENT'
+  | 'REFUND_RECEIVED'
+  | 'REFUND_PAID'
+  | 'INVESTMENT';
 
 const { PENDING, CLEARED, RETURNED } = ChequeStatus;
 
@@ -40,13 +49,23 @@ export const CHEQUE_TRANSITIONS: Record<
     RETURNED: [PENDING],
   },
   SETTLEMENT: { PENDING: [CLEARED, RETURNED], CLEARED: [], RETURNED: [] },
-  REFUND: { PENDING: [CLEARED, RETURNED], CLEARED: [], RETURNED: [] },
+  REFUND_RECEIVED: {
+    PENDING: [CLEARED, RETURNED],
+    CLEARED: [RETURNED, PENDING],
+    RETURNED: [PENDING, CLEARED],
+  },
+  REFUND_PAID: {
+    PENDING: [CLEARED, RETURNED],
+    CLEARED: [PENDING],
+    RETURNED: [PENDING],
+  },
 };
 
 /** Kinds whose revert to PENDING is only a short mistake-correction window. */
 const REVERT_WINDOW_MS: Partial<Record<ChequeKind, number>> = {
   SUPPLIER: 24 * 60 * 60 * 1000,
   INVESTMENT: 24 * 60 * 60 * 1000,
+  REFUND_PAID: 24 * 60 * 60 * 1000,
 };
 
 export function assertChequeTransition(

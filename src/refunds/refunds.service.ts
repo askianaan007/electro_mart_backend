@@ -3,7 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { ChequeStatus, Prisma, Refund } from '@prisma/client';
+import { ChequeStatus, PaymentMode, Prisma, Refund } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { paginate } from '../common/utils/paginate';
@@ -23,6 +23,14 @@ import { recordLedgerRevision } from '../common/utils/ledger-revision';
 import { computeSupplierBalance } from '../common/utils/supplier-balance';
 import { CreateRefundDto } from './dto/create-refund.dto';
 import { QueryRefundsDto } from './dto/query-refunds.dto';
+import { UpdateRefundDto } from './dto/update-refund.dto';
+
+const ZERO = new Prisma.Decimal(0);
+
+type RefundEffectFields = Pick<
+  Refund,
+  'cancelledAt' | 'mode' | 'chequeStatus' | 'amount'
+>;
 
 /** A refund still moves (or will move) money: not cancelled, not a bounced cheque. */
 function isEffectiveRefund(
@@ -34,6 +42,27 @@ function isEffectiveRefund(
   );
 }
 
+/** What the refund currently takes off the party's credit. */
+function effectiveAmount(refund: RefundEffectFields) {
+  return isEffectiveRefund(refund) ? refund.amount : ZERO;
+}
+
+function requireChequeDetails(dto: {
+  mode: PaymentMode;
+  chequeNumber?: string;
+  bankName?: string;
+  chequeDate?: string;
+}) {
+  if (
+    dto.mode === 'CHEQUE' &&
+    (!dto.chequeNumber || !dto.bankName || !dto.chequeDate)
+  ) {
+    throw new BadRequestException(
+      'Cheque number, bank name and cheque date are required for cheque refunds',
+    );
+  }
+}
+
 /**
  * Money returned to a party that holds a credit (LC-12):
  *
@@ -41,13 +70,18 @@ function isEffectiveRefund(
  *   they now owe, e.g. a return on a paid invoice). Paying it back is cash
  *   out and brings the balance back toward zero.
  * - SUPPLIER: the supplier balance is negative (we paid more than we now owe,
- *   e.g. a purchase return after full settlement). Their repayment is cash in.
+ *   e.g. a purchase return after full settlement, or the advance on a
+ *   cancelled order). Their repayment is cash in, optionally linked to the
+ *   order it was paid toward.
  *
  * A refund can never exceed the credit held, so the same credit can't be
- * refunded twice. Like payments, a cheque refund changes the party's balance
- * when written and moves Liquid Cash only once CLEARED; a RETURNED cheque or
- * a cancellation undoes the balance effect, and Liquid Cash history shows the
- * change on its own date (LedgerRevision). Refunds are never edited or deleted.
+ * refunded twice — every change that makes a refund count for more (edit,
+ * restore, a bounced cheque re-presented) re-checks that. Like payments, a
+ * cheque refund changes the party's balance when written and moves Liquid
+ * Cash only once CLEARED; a RETURNED cheque or a cancellation undoes the
+ * balance effect. Refunds are never deleted: every edit, status change,
+ * cancellation and restore stores a before-image (LedgerRevision), so Liquid
+ * Cash history shows it as a dated correction instead of rewriting the past.
  */
 @Injectable()
 export class RefundsService {
@@ -58,12 +92,8 @@ export class RefundsService {
 
   async create(dto: CreateRefundDto, adminId: string) {
     assertNotFutureBusinessDate(dto.refundDate, 'Refund date');
+    requireChequeDetails(dto);
     const isCheque = dto.mode === 'CHEQUE';
-    if (isCheque && (!dto.chequeNumber || !dto.bankName || !dto.chequeDate)) {
-      throw new BadRequestException(
-        'Cheque number, bank name and cheque date are required for cheque refunds',
-      );
-    }
     const amount = new Prisma.Decimal(dto.amount);
     const isDealer = dto.party === 'DEALER';
     const counterpartyId = isDealer ? dto.dealerId : dto.supplierId;
@@ -79,6 +109,11 @@ export class RefundsService {
       const name = isDealer
         ? await this.lockDealer(tx, counterpartyId)
         : await this.lockSupplier(tx, counterpartyId);
+      const purchase = await this.resolvePurchase(
+        tx,
+        dto.purchaseId,
+        isDealer ? null : counterpartyId,
+      );
 
       if (!dto.confirmDuplicate) {
         const duplicate = await tx.refund.findFirst({
@@ -101,16 +136,15 @@ export class RefundsService {
           throw new PossibleDuplicateException('refund', duplicate.id);
       }
 
-      const credit = isDealer
-        ? await this.dealerCredit(tx, counterpartyId)
-        : await this.supplierCredit(tx, counterpartyId);
-      if (amount.greaterThan(credit)) {
-        throw new BadRequestException(
-          credit.isZero()
-            ? `${name} holds no credit to refund`
-            : `Refund of ${amount.toString()} exceeds the ${credit.toString()} credit ${name} holds`,
-        );
-      }
+      await this.assertCreditCovers(
+        tx,
+        {
+          dealerId: isDealer ? counterpartyId : null,
+          supplierId: isDealer ? null : counterpartyId,
+        },
+        amount,
+        name,
+      );
 
       const refundNumber = await nextSequenceNumber(tx, 'refund', 'RFD');
       const refund = await tx.refund.create({
@@ -119,6 +153,7 @@ export class RefundsService {
           party: dto.party,
           dealerId: isDealer ? counterpartyId : null,
           supplierId: isDealer ? null : counterpartyId,
+          purchaseId: purchase?.id ?? null,
           amount,
           mode: dto.mode,
           refundDate: new Date(dto.refundDate),
@@ -147,16 +182,111 @@ export class RefundsService {
           ? 'RECORDED_DEALER_REFUND'
           : 'RECORDED_SUPPLIER_REFUND',
         targetId: refund.id,
-        details: `${refundNumber}: ${dto.mode} refund of ${amount.toString()} ${isDealer ? 'paid to' : 'received from'} ${name} (${dto.reason})`,
+        details:
+          `${refundNumber}: ${dto.mode} refund of ${amount.toString()} ${isDealer ? 'paid to' : 'received from'} ${name} (${dto.reason})` +
+          (purchase ? ` for purchase ${purchase.invoiceNumber}` : ''),
       });
 
       return refund;
     }, TRANSACTION_OPTIONS);
   }
 
+  /**
+   * Corrects a refund recorded with the wrong amount, date, mode or cheque
+   * details. A refund that switches to cheque starts PENDING (out of Liquid
+   * Cash until cleared); one that stays a cheque keeps its status. Cancelled
+   * refunds must be restored first.
+   */
+  async update(id: string, dto: UpdateRefundDto, adminId: string) {
+    assertNotFutureBusinessDate(dto.refundDate, 'Refund date');
+    requireChequeDetails(dto);
+    const isCheque = dto.mode === 'CHEQUE';
+    const amount = new Prisma.Decimal(dto.amount);
+
+    return this.prisma.$transaction(async (tx) => {
+      const refund = await this.lockRefund(tx, id);
+      if (refund.cancelledAt) {
+        throw new BadRequestException(
+          'This refund is cancelled — restore it before editing',
+        );
+      }
+      const name = await this.lockParty(tx, refund);
+      if (dto.purchaseId && refund.party !== 'SUPPLIER') {
+        throw new BadRequestException(
+          'Only supplier refunds can be linked to a purchase',
+        );
+      }
+      const purchase = await this.resolvePurchase(
+        tx,
+        dto.purchaseId,
+        refund.supplierId,
+      );
+
+      const keepsChequeStatus = isCheque && refund.mode === 'CHEQUE';
+      const chequeStatus = isCheque
+        ? keepsChequeStatus
+          ? refund.chequeStatus
+          : ChequeStatus.PENDING
+        : null;
+      const delta = effectiveAmount({
+        cancelledAt: null,
+        mode: dto.mode,
+        chequeStatus,
+        amount,
+      }).sub(effectiveAmount(refund));
+      if (delta.greaterThan(0)) {
+        await this.assertCreditCovers(tx, refund, delta, name);
+      }
+
+      await recordLedgerRevision(tx, 'REFUND', refund, 'UPDATED', adminId);
+      const updated = await tx.refund.update({
+        where: { id },
+        data: {
+          amount,
+          mode: dto.mode,
+          refundDate: new Date(dto.refundDate),
+          reason: dto.reason,
+          reference: dto.reference ?? null,
+          purchaseId: purchase?.id ?? null,
+          chequeStatus,
+          chequeStatusUpdatedAt: keepsChequeStatus
+            ? refund.chequeStatusUpdatedAt
+            : isCheque
+              ? new Date()
+              : null,
+          chequeNumber: isCheque ? dto.chequeNumber : null,
+          bankName: isCheque ? dto.bankName : null,
+          chequeDate:
+            isCheque && dto.chequeDate ? new Date(dto.chequeDate) : null,
+        },
+      });
+      if (refund.dealerId && !delta.isZero()) {
+        await tx.dealer.update({
+          where: { id: refund.dealerId },
+          data: { outstandingBalance: { increment: delta } },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UPDATED_REFUND',
+        targetId: id,
+        details: `${refund.refundNumber} edited: ${refund.mode} ${refund.amount.toString()} -> ${dto.mode} ${amount.toString()}`,
+      });
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Legal changes are listed in cheque-transitions.ts: a supplier's refund
+   * cheque (REFUND_RECEIVED) can move freely, a dealer refund cheque we
+   * wrote (REFUND_PAID) only forward or back to PENDING within a day.
+   * Leaving RETURNED counts the refund again, so the party must still hold
+   * that much credit — it may have been settled another way meanwhile.
+   */
   async updateChequeStatus(
     id: string,
-    status: 'CLEARED' | 'RETURNED',
+    status: 'PENDING' | 'CLEARED' | 'RETURNED',
     adminId: string,
   ) {
     return this.prisma.$transaction(async (tx) => {
@@ -167,7 +297,20 @@ export class RefundsService {
       if (refund.cancelledAt) {
         throw new BadRequestException('This refund has been cancelled');
       }
-      assertChequeTransition('REFUND', refund.chequeStatus, status, null);
+      assertChequeTransition(
+        refund.party === 'SUPPLIER' ? 'REFUND_RECEIVED' : 'REFUND_PAID',
+        refund.chequeStatus,
+        status,
+        refund.chequeStatusUpdatedAt,
+      );
+
+      const name = await this.lockParty(tx, refund);
+      const delta = effectiveAmount({ ...refund, chequeStatus: status }).sub(
+        effectiveAmount(refund),
+      );
+      if (delta.greaterThan(0)) {
+        await this.assertCreditCovers(tx, refund, delta, name);
+      }
 
       await recordLedgerRevision(
         tx,
@@ -181,11 +324,12 @@ export class RefundsService {
         data: { chequeStatus: status, chequeStatusUpdatedAt: new Date() },
       });
       // A returned dealer-refund cheque never paid the dealer: their credit
-      // comes back. (A supplier refund's effect is derived — nothing to undo.)
-      if (status === 'RETURNED' && refund.dealerId) {
+      // comes back (and goes again if it's re-presented). A supplier
+      // refund's effect is derived — nothing to update.
+      if (refund.dealerId && !delta.isZero()) {
         await tx.dealer.update({
           where: { id: refund.dealerId },
-          data: { outstandingBalance: { decrement: refund.amount } },
+          data: { outstandingBalance: { increment: delta } },
         });
       }
 
@@ -193,24 +337,24 @@ export class RefundsService {
         adminId,
         action: 'UPDATED_REFUND_CHEQUE_STATUS',
         targetId: id,
-        details: `${refund.refundNumber}: cheque ${refund.chequeNumber ?? ''} marked ${status}`,
+        details: `${refund.refundNumber}: cheque ${refund.chequeNumber ?? ''} changed from ${refund.chequeStatus} to ${status}`,
       });
       return updated;
     }, TRANSACTION_OPTIONS);
   }
 
-  /** Corrects a refund recorded in error. Its row stays; history shows the cancellation dated today. */
+  /**
+   * Voids a refund recorded in error (or a promised refund that never came).
+   * Its row stays; history shows the cancellation dated today, and restore()
+   * undoes it.
+   */
   async cancel(id: string, reason: string, adminId: string) {
     return this.prisma.$transaction(async (tx) => {
       const refund = await this.lockRefund(tx, id);
       if (refund.cancelledAt) {
         throw new BadRequestException('This refund is already cancelled');
       }
-      if (refund.mode === 'CHEQUE' && refund.chequeStatus === 'CLEARED') {
-        throw new BadRequestException(
-          'This refund cheque has cleared — the money has moved. Record a new refund in the other direction if it was returned.',
-        );
-      }
+      await this.lockParty(tx, refund);
 
       await recordLedgerRevision(tx, 'REFUND', refund, 'CANCELLED', adminId);
       const updated = await tx.refund.update({
@@ -234,6 +378,41 @@ export class RefundsService {
     }, TRANSACTION_OPTIONS);
   }
 
+  /** Undoes a cancellation, provided the party still holds the credit it uses. */
+  async restore(id: string, adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const refund = await this.lockRefund(tx, id);
+      if (!refund.cancelledAt) {
+        throw new BadRequestException('This refund is not cancelled');
+      }
+      const name = await this.lockParty(tx, refund);
+      const delta = effectiveAmount({ ...refund, cancelledAt: null });
+      if (delta.greaterThan(0)) {
+        await this.assertCreditCovers(tx, refund, delta, name);
+      }
+
+      await recordLedgerRevision(tx, 'REFUND', refund, 'RESTORED', adminId);
+      const updated = await tx.refund.update({
+        where: { id },
+        data: { cancelledAt: null, cancelReason: null },
+      });
+      if (refund.dealerId && !delta.isZero()) {
+        await tx.dealer.update({
+          where: { id: refund.dealerId },
+          data: { outstandingBalance: { increment: delta } },
+        });
+      }
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'RESTORED_REFUND',
+        targetId: id,
+        details: `${refund.refundNumber} restored (was cancelled: ${refund.cancelReason ?? '—'})`,
+      });
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
   async findAll(query: QueryRefundsDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -241,6 +420,7 @@ export class RefundsService {
       party: query.party,
       dealerId: query.dealerId,
       supplierId: query.supplierId,
+      purchaseId: query.purchaseId,
       ...(query.search && {
         OR: [
           { refundNumber: { contains: query.search, mode: 'insensitive' } },
@@ -255,6 +435,7 @@ export class RefundsService {
         include: {
           dealer: { select: { id: true, businessName: true } },
           supplier: { select: { id: true, name: true } },
+          purchase: { select: { id: true, invoiceNumber: true } },
         },
         orderBy: [{ refundDate: 'desc' }, { createdAt: 'desc' }],
         skip: (page - 1) * limit,
@@ -281,6 +462,15 @@ export class RefundsService {
     return refund;
   }
 
+  private lockParty(
+    tx: Prisma.TransactionClient,
+    refund: Pick<Refund, 'dealerId' | 'supplierId'>,
+  ) {
+    return refund.dealerId
+      ? this.lockDealer(tx, refund.dealerId)
+      : this.lockSupplier(tx, refund.supplierId as string);
+  }
+
   private async lockDealer(tx: Prisma.TransactionClient, dealerId: string) {
     await tx.$queryRaw`SELECT id FROM "Dealer" WHERE id = ${dealerId} FOR UPDATE`;
     const dealer = await tx.dealer.findUnique({ where: { id: dealerId } });
@@ -295,6 +485,50 @@ export class RefundsService {
     });
     if (!supplier) throw new NotFoundException('Supplier not found');
     return supplier.name;
+  }
+
+  /** The purchase a supplier refund is for — it must be that supplier's. */
+  private async resolvePurchase(
+    tx: Prisma.TransactionClient,
+    purchaseId: string | undefined,
+    supplierId: string | null,
+  ) {
+    if (!purchaseId) return null;
+    if (!supplierId) {
+      throw new BadRequestException(
+        'Only supplier refunds can be linked to a purchase',
+      );
+    }
+    const purchase = await tx.purchase.findUnique({
+      where: { id: purchaseId },
+      select: { id: true, supplierId: true, invoiceNumber: true },
+    });
+    if (!purchase) throw new NotFoundException('Purchase not found');
+    if (purchase.supplierId !== supplierId) {
+      throw new BadRequestException(
+        'That purchase belongs to a different supplier',
+      );
+    }
+    return purchase;
+  }
+
+  /** Refuses to let refunds take more than the credit the party currently holds. */
+  private async assertCreditCovers(
+    tx: Prisma.TransactionClient,
+    party: Pick<Refund, 'dealerId' | 'supplierId'>,
+    increase: Prisma.Decimal,
+    name: string,
+  ) {
+    const credit = party.dealerId
+      ? await this.dealerCredit(tx, party.dealerId)
+      : await this.supplierCredit(tx, party.supplierId as string);
+    if (increase.greaterThan(credit)) {
+      throw new BadRequestException(
+        credit.isZero()
+          ? `${name} holds no credit to refund`
+          : `Refund of ${increase.toString()} exceeds the ${credit.toString()} credit ${name} holds`,
+      );
+    }
   }
 
   private async dealerCredit(

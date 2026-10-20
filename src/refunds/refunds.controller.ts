@@ -20,6 +20,7 @@ import { CreateRefundDto } from './dto/create-refund.dto';
 import { QueryRefundsDto } from './dto/query-refunds.dto';
 import { UpdateRefundChequeStatusDto } from './dto/update-refund-cheque-status.dto';
 import { CancelRefundDto } from './dto/cancel-refund.dto';
+import { UpdateRefundDto } from './dto/update-refund.dto';
 
 @ApiTags('Refunds')
 @ApiBearerAuth('access-token')
@@ -58,8 +59,23 @@ export class RefundsController {
     return this.refundsService.availableCredit('SUPPLIER', id);
   }
 
+  @Patch(':id')
+  @ApiOperation({
+    summary:
+      "Correct a refund's amount, date, mode, cheque details or linked purchase",
+  })
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateRefundDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.refundsService.update(id, dto, adminId);
+  }
+
   @Patch(':id/cheque-status')
-  @ApiOperation({ summary: 'Mark a refund cheque CLEARED or RETURNED' })
+  @ApiOperation({
+    summary: 'Change a refund cheque to PENDING, CLEARED or RETURNED',
+  })
   updateChequeStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateRefundChequeStatusDto,
@@ -76,5 +92,14 @@ export class RefundsController {
     @CurrentUser('sub') adminId: string,
   ) {
     return this.refundsService.cancel(id, dto.reason, adminId);
+  }
+
+  @Patch(':id/restore')
+  @ApiOperation({ summary: 'Undo the cancellation of a refund' })
+  restore(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.refundsService.restore(id, adminId);
   }
 }

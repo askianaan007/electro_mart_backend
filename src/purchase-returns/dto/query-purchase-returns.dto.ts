@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsDateString, IsOptional, IsUUID } from 'class-validator';
+import { IsDateString, IsIn, IsOptional, IsUUID } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export class QueryPurchaseReturnsDto extends PaginationQueryDto {
@@ -7,6 +7,15 @@ export class QueryPurchaseReturnsDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID()
   supplierId?: string;
+
+  @ApiPropertyOptional({
+    enum: ['true', 'false'],
+    description:
+      'true: only returns tied to a purchase; false: only standalone returns',
+  })
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  linked?: 'true' | 'false';
 
   @ApiPropertyOptional({
     description:

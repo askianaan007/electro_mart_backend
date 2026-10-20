@@ -51,62 +51,111 @@ export class PurchaseReturnsService {
     dto: CreatePurchaseReturnDto,
     adminId: string,
   ) {
-    const purchase = await this.prisma.purchase.findUnique({
+    return this.prisma.$transaction(async (tx) => {
+      const purchase = await this.lockPurchase(tx, purchaseId);
+      if (purchase.cancelledAt) {
+        throw new BadRequestException(
+          `Purchase ${purchase.invoiceNumber} is cancelled — every unit has already been returned`,
+        );
+      }
+      return this.insertAgainstPurchase(tx, purchase, dto, adminId);
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Locks the purchase row so a concurrent return (or cancellation) against
+   * it can't read the same pre-write "already returned" snapshot in
+   * computeItemsAgainstPurchase and also pass its remaining-quantity guard.
+   */
+  async lockPurchase(tx: TransactionClient, purchaseId: string) {
+    await tx.$queryRaw`SELECT id FROM "Purchase" WHERE id = ${purchaseId} FOR UPDATE`;
+    const purchase = await tx.purchase.findUnique({
       where: { id: purchaseId },
       include: { items: true },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
+    return purchase;
+  }
 
-    return this.prisma.$transaction(async (tx) => {
-      // Lock the purchase row so a second concurrent return against the
-      // same purchase can't read the same pre-write "already returned"
-      // snapshot in computeItemsAgainstPurchase and also pass its
-      // remaining-quantity guard.
-      await tx.$queryRaw`SELECT id FROM "Purchase" WHERE id = ${purchaseId} FOR UPDATE`;
+  /**
+   * Records a return against a purchase the caller has locked (lockPurchase).
+   * PurchasesService.cancel() uses it with isCancellation for the return
+   * that sends back everything still held.
+   */
+  async insertAgainstPurchase(
+    tx: TransactionClient,
+    purchase: Awaited<ReturnType<PurchaseReturnsService['lockPurchase']>>,
+    dto: Pick<CreatePurchaseReturnDto, 'reason' | 'returnDate' | 'items'>,
+    adminId: string,
+    isCancellation = false,
+  ) {
+    const { itemsData, totalAmount } = await this.computeItemsAgainstPurchase(
+      tx,
+      purchase,
+      dto.items,
+    );
 
-      const { itemsData, totalAmount } = await this.computeItemsAgainstPurchase(
-        tx,
-        purchase,
-        dto.items,
-      );
+    const returnNumber = await nextSequenceNumber(tx, 'purchaseReturn', 'PRTN');
 
-      const returnNumber = await nextSequenceNumber(
-        tx,
-        'purchaseReturn',
-        'PRTN',
-      );
+    const purchaseReturn = await tx.purchaseReturn.create({
+      data: {
+        returnNumber,
+        purchaseId: purchase.id,
+        supplierId: purchase.supplierId,
+        reason: dto.reason,
+        totalAmount,
+        returnDate: new Date(dto.returnDate),
+        isCancellation,
+        items: { create: itemsData },
+      },
+      include: this.include,
+    });
 
-      const purchaseReturn = await tx.purchaseReturn.create({
-        data: {
-          returnNumber,
-          purchaseId: purchase.id,
-          supplierId: purchase.supplierId,
-          reason: dto.reason,
-          totalAmount,
-          returnDate: new Date(dto.returnDate),
-          items: { create: itemsData },
-        },
-        include: this.include,
+    for (const item of itemsData) {
+      await this.inventoryService.recordMovement(tx, {
+        productId: item.productId,
+        type: InventoryLogType.ADJUSTMENT,
+        quantityOut: item.quantity,
+        reference: purchaseReturn.id,
       });
+    }
 
-      for (const item of itemsData) {
-        await this.inventoryService.recordMovement(tx, {
-          productId: item.productId,
-          type: InventoryLogType.ADJUSTMENT,
-          quantityOut: item.quantity,
-          reference: purchaseReturn.id,
-        });
+    await this.activityLogService.log(tx, {
+      adminId,
+      action: 'RECORDED_PURCHASE_RETURN',
+      targetId: purchaseReturn.id,
+      details:
+        `Purchase return ${returnNumber} of ${totalAmount.toString()} against purchase invoice ${purchase.invoiceNumber}` +
+        (isCancellation ? ' (order cancelled)' : ''),
+    });
+
+    return purchaseReturn;
+  }
+
+  /** Per product, how many units of the purchase haven't been returned yet. */
+  async remainingQuantities(
+    tx: TransactionClient,
+    purchase: { id: string; items: { productId: string; quantity: number }[] },
+  ) {
+    const alreadyReturned = await tx.purchaseReturnItem.groupBy({
+      by: ['productId'],
+      where: { purchaseReturn: { purchaseId: purchase.id } },
+      _sum: { quantity: true },
+    });
+    const remaining = new Map<string, number>();
+    for (const item of purchase.items) {
+      remaining.set(
+        item.productId,
+        (remaining.get(item.productId) ?? 0) + item.quantity,
+      );
+    }
+    for (const row of alreadyReturned) {
+      const bought = remaining.get(row.productId);
+      if (bought !== undefined) {
+        remaining.set(row.productId, bought - (row._sum.quantity ?? 0));
       }
-
-      await this.activityLogService.log(tx, {
-        adminId,
-        action: 'RECORDED_PURCHASE_RETURN',
-        targetId: purchaseReturn.id,
-        details: `Purchase return ${returnNumber} of ${totalAmount.toString()} against purchase invoice ${purchase.invoiceNumber}`,
-      });
-
-      return purchaseReturn;
-    }, TRANSACTION_OPTIONS);
+    }
+    return remaining;
   }
 
   // For returns not tied to a specific purchase invoice — e.g. a damaged unit
@@ -267,6 +316,8 @@ export class PurchaseReturnsService {
 
     const where: Prisma.PurchaseReturnWhereInput = {
       ...(query.supplierId && { supplierId: query.supplierId }),
+      ...(query.linked === 'true' && { purchaseId: { not: null } }),
+      ...(query.linked === 'false' && { purchaseId: null }),
       ...(query.search && {
         OR: [
           { returnNumber: { contains: query.search, mode: 'insensitive' } },
@@ -326,6 +377,7 @@ export class PurchaseReturnsService {
     if (!purchaseReturn)
       throw new NotFoundException('Purchase return not found');
     this.assertEditable(purchaseReturn);
+    this.assertNotCancellation(purchaseReturn);
 
     const oldItems = purchaseReturn.items;
     const oldTotalAmount = purchaseReturn.totalAmount;
@@ -340,7 +392,11 @@ export class PurchaseReturnsService {
       let totalAmount: Prisma.Decimal;
 
       if (purchaseReturn.purchase) {
-        await tx.$queryRaw`SELECT id FROM "Purchase" WHERE id = ${purchaseReturn.purchase.id} FOR UPDATE`;
+        const purchase = await this.lockPurchase(
+          tx,
+          purchaseReturn.purchase.id,
+        );
+        this.assertPurchaseActive(purchase);
         const computed = await this.computeItemsAgainstPurchase(
           tx,
           purchaseReturn.purchase,
@@ -402,45 +458,189 @@ export class PurchaseReturnsService {
   async remove(id: string, adminId: string) {
     const purchaseReturn = await this.prisma.purchaseReturn.findUnique({
       where: { id },
-      include: { items: true },
+      include: { items: true, purchase: true },
     });
     if (!purchaseReturn)
       throw new NotFoundException('Purchase return not found');
     this.assertEditable(purchaseReturn);
+    this.assertNotCancellation(purchaseReturn);
 
     return this.prisma.$transaction(async (tx) => {
-      for (const item of purchaseReturn.items) {
-        await this.inventoryService.recordMovement(tx, {
-          productId: item.productId,
-          type: InventoryLogType.ADJUSTMENT,
-          quantityIn: item.quantity,
-          reference: purchaseReturn.id,
-        });
+      if (purchaseReturn.purchaseId) {
+        this.assertPurchaseActive(
+          await this.lockPurchase(tx, purchaseReturn.purchaseId),
+        );
       }
-
-      await tx.purchaseReturnItem.deleteMany({
-        where: { purchaseReturnId: id },
-      });
-      await tx.purchaseReturn.delete({ where: { id } });
-
-      const remaining = await tx.purchaseReturn.findMany({
-        select: { returnNumber: true },
-      });
-      await resetSequenceCounter(
-        tx,
-        'purchaseReturn',
-        remaining.map((r) => r.returnNumber),
-      );
-
-      await this.activityLogService.log(tx, {
-        adminId,
-        action: 'DELETED_PURCHASE_RETURN',
-        targetId: id,
-        details: `Deleted purchase return ${purchaseReturn.returnNumber} of ${purchaseReturn.totalAmount.toString()}`,
-      });
-
+      await this.deleteWithin(tx, purchaseReturn, adminId);
       return { message: 'Purchase return deleted' };
     }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Deletes a return inside the caller's transaction: puts its stock back,
+   * removes it and realigns the PRTN counter. Also used by
+   * PurchasesService.reinstate() for the cancellation return.
+   */
+  async deleteWithin(
+    tx: TransactionClient,
+    purchaseReturn: {
+      id: string;
+      returnNumber: string;
+      totalAmount: Prisma.Decimal;
+      items: { productId: string; quantity: number }[];
+    },
+    adminId: string,
+  ) {
+    const replacements = await tx.purchaseReturnReplacement.count({
+      where: { purchaseReturnId: purchaseReturn.id },
+    });
+    if (replacements > 0) {
+      throw new BadRequestException(
+        `Return ${purchaseReturn.returnNumber} has replacement goods recorded against it and cannot be removed.`,
+      );
+    }
+
+    for (const item of purchaseReturn.items) {
+      await this.inventoryService.recordMovement(tx, {
+        productId: item.productId,
+        type: InventoryLogType.ADJUSTMENT,
+        quantityIn: item.quantity,
+        reference: purchaseReturn.id,
+      });
+    }
+
+    await tx.purchaseReturnItem.deleteMany({
+      where: { purchaseReturnId: purchaseReturn.id },
+    });
+    await tx.purchaseReturn.delete({ where: { id: purchaseReturn.id } });
+
+    const remaining = await tx.purchaseReturn.findMany({
+      select: { returnNumber: true },
+    });
+    await resetSequenceCounter(
+      tx,
+      'purchaseReturn',
+      remaining.map((r) => r.returnNumber),
+    );
+
+    await this.activityLogService.log(tx, {
+      adminId,
+      action: 'DELETED_PURCHASE_RETURN',
+      targetId: purchaseReturn.id,
+      details: `Deleted purchase return ${purchaseReturn.returnNumber} of ${purchaseReturn.totalAmount.toString()}`,
+    });
+  }
+
+  /**
+   * Ties a standalone return to the purchase its goods came from — for a
+   * return recorded from the supplier's page that was really against one
+   * invoice. Nothing financial moves (the supplier credit was taken when
+   * the return was recorded); the purchase just starts counting it, so the
+   * same units can't be returned against it a second time.
+   */
+  async link(id: string, purchaseId: string, adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const purchase = await this.lockPurchase(tx, purchaseId);
+      this.assertPurchaseActive(purchase);
+      await tx.$queryRaw`SELECT id FROM "PurchaseReturn" WHERE id = ${id} FOR UPDATE`;
+      const purchaseReturn = await tx.purchaseReturn.findUnique({
+        where: { id },
+        include: { items: true },
+      });
+      if (!purchaseReturn)
+        throw new NotFoundException('Purchase return not found');
+      if (purchaseReturn.purchaseId) {
+        throw new BadRequestException(
+          `Return ${purchaseReturn.returnNumber} is already linked to a purchase`,
+        );
+      }
+      if (purchaseReturn.supplierId !== purchase.supplierId) {
+        throw new BadRequestException(
+          'That return was made to a different supplier',
+        );
+      }
+
+      const remaining = await this.remainingQuantities(tx, purchase);
+      for (const item of purchaseReturn.items) {
+        const left = remaining.get(item.productId);
+        if (left === undefined) {
+          throw new BadRequestException(
+            `Return ${purchaseReturn.returnNumber} includes a product that isn't on purchase ${purchase.invoiceNumber}`,
+          );
+        }
+        if (item.quantity > left) {
+          throw new BadRequestException(
+            `Return ${purchaseReturn.returnNumber} sends back ${item.quantity} of a product, but only ${left} remain returnable on purchase ${purchase.invoiceNumber}`,
+          );
+        }
+        remaining.set(item.productId, left - item.quantity);
+      }
+
+      const updated = await tx.purchaseReturn.update({
+        where: { id },
+        data: { purchaseId: purchase.id },
+        include: this.include,
+      });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'LINKED_PURCHASE_RETURN',
+        targetId: id,
+        details: `Linked return ${purchaseReturn.returnNumber} to purchase invoice ${purchase.invoiceNumber}`,
+      });
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /** Undoes link(): the return becomes standalone again. */
+  async unlink(id: string, adminId: string) {
+    const existing = await this.prisma.purchaseReturn.findUnique({
+      where: { id },
+    });
+    if (!existing) throw new NotFoundException('Purchase return not found');
+    if (!existing.purchaseId) {
+      throw new BadRequestException('This return is not linked to a purchase');
+    }
+    const purchaseId = existing.purchaseId;
+    this.assertNotCancellation(existing);
+
+    return this.prisma.$transaction(async (tx) => {
+      const purchase = await this.lockPurchase(tx, purchaseId);
+      this.assertPurchaseActive(purchase);
+      const updated = await tx.purchaseReturn.update({
+        where: { id },
+        data: { purchaseId: null },
+        include: this.include,
+      });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'UNLINKED_PURCHASE_RETURN',
+        targetId: id,
+        details: `Unlinked return ${existing.returnNumber} from purchase invoice ${purchase.invoiceNumber}`,
+      });
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  private assertNotCancellation(purchaseReturn: {
+    isCancellation: boolean;
+    returnNumber: string;
+  }) {
+    if (purchaseReturn.isCancellation) {
+      throw new BadRequestException(
+        `Return ${purchaseReturn.returnNumber} was created by cancelling its purchase — reinstate the purchase to undo it.`,
+      );
+    }
+  }
+
+  private assertPurchaseActive(purchase: {
+    cancelledAt: Date | null;
+    invoiceNumber: string;
+  }) {
+    if (purchase.cancelledAt) {
+      throw new BadRequestException(
+        `Purchase ${purchase.invoiceNumber} is cancelled — reinstate it before changing its returns.`,
+      );
+    }
   }
 
   private assertEditable(purchaseReturn: { createdAt: Date }) {

@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Query,
@@ -15,6 +16,7 @@ import { PurchaseReturnsService } from './purchase-returns.service';
 import { CreatePurchaseReturnDto } from './dto/create-purchase-return.dto';
 import { UpdatePurchaseReturnDto } from './dto/update-purchase-return.dto';
 import { QueryPurchaseReturnsDto } from './dto/query-purchase-returns.dto';
+import { LinkPurchaseReturnDto } from './dto/link-purchase-return.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -68,6 +70,28 @@ export class PurchaseReturnsController {
     @CurrentUser('sub') adminId: string,
   ) {
     return this.purchaseReturnsService.update(id, dto, adminId);
+  }
+
+  @Patch(':id/link')
+  @ApiOperation({
+    summary:
+      'Tie a standalone return to the purchase its goods came from (no financial effect)',
+  })
+  link(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: LinkPurchaseReturnDto,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.purchaseReturnsService.link(id, dto.purchaseId, adminId);
+  }
+
+  @Patch(':id/unlink')
+  @ApiOperation({ summary: 'Make a linked return standalone again' })
+  unlink(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('sub') adminId: string,
+  ) {
+    return this.purchaseReturnsService.unlink(id, adminId);
   }
 
   @Delete(':id')

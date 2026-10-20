@@ -13,7 +13,12 @@ import { QueryPurchasesDto } from './dto/query-purchases.dto';
 import { paginate } from '../common/utils/paginate';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { computeSupplierBalance } from '../common/utils/supplier-balance';
-import { businessDateRange } from '../common/utils/business-date';
+import {
+  assertNotFutureBusinessDate,
+  businessDateRange,
+} from '../common/utils/business-date';
+import { PurchaseReturnsService } from '../purchase-returns/purchase-returns.service';
+import { CancelPurchaseDto } from './dto/cancel-purchase.dto';
 
 @Injectable()
 export class PurchasesService {
@@ -21,6 +26,7 @@ export class PurchasesService {
     private prisma: PrismaService,
     private inventoryService: InventoryService,
     private activityLogService: ActivityLogService,
+    private purchaseReturnsService: PurchaseReturnsService,
   ) {}
 
   private async assertSupplierAndProductsExist(
@@ -158,6 +164,11 @@ export class PurchasesService {
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
 
+    if (purchase.cancelledAt) {
+      throw new BadRequestException(
+        'This purchase is cancelled — reinstate it before editing.',
+      );
+    }
     if (purchase.purchaseReturns.length > 0) {
       throw new BadRequestException(
         'This purchase has returns recorded against it and cannot be edited.',
@@ -256,12 +267,18 @@ export class PurchasesService {
       include: {
         items: true,
         purchaseReturns: { select: { returnNumber: true } },
+        refunds: { select: { refundNumber: true } },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
     if (purchase.purchaseReturns.length > 0) {
       throw new BadRequestException(
         `This purchase has return(s) ${purchase.purchaseReturns.map((r) => r.returnNumber).join(', ')} recorded against it and cannot be deleted.`,
+      );
+    }
+    if (purchase.refunds.length > 0) {
+      throw new BadRequestException(
+        `Supplier refund(s) ${purchase.refunds.map((r) => r.refundNumber).join(', ')} are linked to this purchase — unlink them before deleting it.`,
       );
     }
 
@@ -298,6 +315,134 @@ export class PurchasesService {
       });
 
       return { message: 'Purchase deleted and stock reversed' };
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Calls the order off. Everything still held from it (quantity bought minus
+   * any earlier returns) goes back to the supplier as one return flagged
+   * isCancellation, so stock and the supplier's payable drop by the same
+   * value — through the same rules as any other return. Money already paid
+   * toward it isn't touched: if the supplier now owes us, that shows as
+   * their credit until a supplier refund is recorded (cash/bank when
+   * received, or a cheque that counts in Liquid Cash only once cleared).
+   * Refused if some of the goods have been sold since — record a partial
+   * return instead.
+   */
+  async cancel(id: string, dto: CancelPurchaseDto, adminId: string) {
+    assertNotFutureBusinessDate(dto.cancelDate, 'Cancellation date');
+
+    return this.prisma.$transaction(async (tx) => {
+      const purchase = await this.purchaseReturnsService.lockPurchase(tx, id);
+      if (purchase.cancelledAt) {
+        throw new BadRequestException('This purchase is already cancelled');
+      }
+      // Same supplier lock as settlements, so one can't be paid against the
+      // payable this cancellation is about to reduce.
+      await this.lockSuppliers(tx, [purchase.supplierId]);
+
+      const remaining = await this.purchaseReturnsService.remainingQuantities(
+        tx,
+        purchase,
+      );
+      const items = [...remaining]
+        .filter(([, quantity]) => quantity > 0)
+        .map(([productId, quantity]) => ({ productId, quantity }));
+
+      let cancellationReturn: { returnNumber: string } | null = null;
+      if (items.length > 0) {
+        try {
+          cancellationReturn =
+            await this.purchaseReturnsService.insertAgainstPurchase(
+              tx,
+              purchase,
+              {
+                reason: `Order cancelled: ${dto.reason}`,
+                returnDate: dto.cancelDate,
+                items,
+              },
+              adminId,
+              true,
+            );
+        } catch (error) {
+          if (
+            error instanceof BadRequestException &&
+            error.message.startsWith('Insufficient stock')
+          ) {
+            throw new BadRequestException(
+              `Can't cancel this order: some of its goods have already left stock (${error.message}). Record a return for the units still held instead.`,
+            );
+          }
+          throw error;
+        }
+      }
+
+      const updated = await tx.purchase.update({
+        where: { id },
+        data: { cancelledAt: new Date(), cancelReason: dto.reason },
+        include: { supplier: true },
+      });
+      const balance = await this.supplierBalanceOf(tx, purchase.supplierId);
+
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'CANCELLED_PURCHASE',
+        targetId: id,
+        details:
+          `Cancelled purchase ${purchase.invoiceNumber} from ${updated.supplier.name} (${dto.reason})` +
+          (cancellationReturn
+            ? `; goods returned as ${cancellationReturn.returnNumber}`
+            : '; nothing left to return') +
+          (balance.isNegative()
+            ? `; supplier now owes ${balance.abs().toString()}`
+            : ''),
+      });
+
+      return updated;
+    }, TRANSACTION_OPTIONS);
+  }
+
+  /**
+   * Undoes cancel(): removes its cancellation return (stock comes back in,
+   * the supplier's payable goes back up) and makes the order active again.
+   * Refunds already received for it stay — they are real money and are
+   * corrected on their own.
+   */
+  async reinstate(id: string, adminId: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const purchase = await this.purchaseReturnsService.lockPurchase(tx, id);
+      if (!purchase.cancelledAt) {
+        throw new BadRequestException('This purchase is not cancelled');
+      }
+      await this.lockSuppliers(tx, [purchase.supplierId]);
+
+      const cancellationReturn = await tx.purchaseReturn.findFirst({
+        where: { purchaseId: id, isCancellation: true },
+        include: { items: true },
+      });
+      if (cancellationReturn) {
+        await this.purchaseReturnsService.deleteWithin(
+          tx,
+          cancellationReturn,
+          adminId,
+        );
+      }
+
+      const updated = await tx.purchase.update({
+        where: { id },
+        data: { cancelledAt: null, cancelReason: null },
+      });
+      await this.activityLogService.log(tx, {
+        adminId,
+        action: 'REINSTATED_PURCHASE',
+        targetId: id,
+        details:
+          `Reinstated cancelled purchase ${purchase.invoiceNumber}` +
+          (cancellationReturn
+            ? `; cancellation return ${cancellationReturn.returnNumber} removed and stock restored`
+            : ''),
+      });
+      return updated;
     }, TRANSACTION_OPTIONS);
   }
 

@@ -31,6 +31,14 @@ export class CreateRefundDto {
   @IsUUID()
   supplierId?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Supplier refunds only: the order the refunded money was paid toward (e.g. the advance on a cancelled order)',
+  })
+  @IsOptional()
+  @IsUUID()
+  purchaseId?: string;
+
   @ApiProperty({ minimum: 0.01 })
   @IsMoneyAmount()
   amount: number;

@@ -18,4 +18,9 @@ export class QueryRefundsDto extends PaginationQueryDto {
   @IsOptional()
   @IsUUID()
   supplierId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUUID()
+  purchaseId?: string;
 }

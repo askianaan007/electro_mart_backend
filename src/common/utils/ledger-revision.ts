@@ -4,7 +4,7 @@ export type LedgerEntityType =
   'SUPPLIER_PAYMENT' | 'INVESTMENT' | 'EXPENSE' | 'REFUND';
 
 export type LedgerRevisionAction =
-  'UPDATED' | 'CHEQUE_STATUS' | 'DELETED' | 'CANCELLED';
+  'UPDATED' | 'CHEQUE_STATUS' | 'DELETED' | 'CANCELLED' | 'RESTORED';
 
 /**
  * Saves `row` as it is *before* a change, so Liquid Cash history can show the
