@@ -14,6 +14,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+import { SerialList } from '../../product-units/dto/product-units.dto';
 
 export class OrderItemDto {
   @ApiProperty()
@@ -46,6 +47,15 @@ export class OrderItemDto {
   @IsNumber()
   @Min(0)
   discountAmount?: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Admin-only, on create: serials of the exact units sold on this line (at most `quantity`). Ignored for dealer/representative callers and on edits.',
+  })
+  @IsOptional()
+  @SerialList()
+  serials?: string[];
 }
 
 export class CreateOrderDto {

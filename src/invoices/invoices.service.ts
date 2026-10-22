@@ -12,6 +12,7 @@ import { computeReturnedAmount } from '../common/utils/invoice-financials';
 import { resetSequenceCounter } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { businessDateRange } from '../common/utils/business-date';
+import { ProductUnitsService } from '../product-units/product-units.service';
 
 const ZERO = new Prisma.Decimal(0);
 
@@ -31,6 +32,7 @@ export class InvoicesService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private productUnitsService: ProductUnitsService,
   ) {}
 
   /**
@@ -188,10 +190,15 @@ export class InvoicesService {
       this.prisma,
       invoice.orderId,
     );
+    // Invoice page 2 (Bar_code_plan.md §7.4) — dealer-safe fields only.
+    const serialAnnex = await this.productUnitsService.serialAnnexForOrder(
+      invoice.orderId,
+    );
     return this.withComputedStatus({
       ...invoice,
       returnedAmount,
       netGrandTotal: invoice.grandTotal.sub(returnedAmount),
+      serialAnnex,
     });
   }
 

@@ -251,6 +251,13 @@ model Product {
   compareAtPrice Decimal?
   isFeatured     Boolean  @default(false)
 
+  // Serial tracking (Bar_code_plan.md) — opt-in per product; every existing
+  // product stays untracked. warrantyMonths is the machine-readable warranty
+  // used to stamp unit expiry dates; the free-text `warranty` is unchanged.
+  trackSerials   Boolean       @default(false)
+  warrantyMonths Int?
+  units          ProductUnit[]
+
   orderItems                     OrderItem[]
   purchaseItems                  PurchaseItem[]
   purchaseReturnReplacementItems PurchaseReturnReplacementItem[]
@@ -317,6 +324,7 @@ model Purchase {
   // Supplier refunds of money paid toward this order (e.g. an advance on a
   // cancelled order). Informational link — the balance is per supplier.
   refunds         Refund[]
+  units           ProductUnit[]
 
   @@index([supplierId])
   @@index([purchaseDate])
@@ -338,6 +346,7 @@ model PurchaseReturn {
   isCancellation Boolean                     @default(false)
   items          PurchaseReturnItem[]
   replacements   PurchaseReturnReplacement[]
+  units          ProductUnit[]
 
   @@index([purchaseId])
   @@index([supplierId])
@@ -382,6 +391,7 @@ model PurchaseReturnReplacement {
   createdAt         DateTime       @default(now())
 
   items PurchaseReturnReplacementItem[]
+  units ProductUnit[]
 
   @@index([purchaseReturnId])
   @@index([supplierId])
@@ -476,6 +486,7 @@ model Order {
   salesReturns        SalesReturn[]
   commissionEntries   CommissionLedgerEntry[]
   collectionReminders CollectionReminderLog[]
+  units               ProductUnit[]
 
   @@index([dealerId])
   @@index([status])
@@ -1177,4 +1188,146 @@ model RepOrderDraftItem {
   quantity  Int
 
   @@index([draftId])
+}
+
+// ---------------------------------------------------------------------------
+// Serial-number tracking — Bar_code_plan.md. Additive only: a label layer on
+// top of quantity stock. Nothing here is ever read by stock, invoice or cash
+// math; Product.currentStock stays the single source of truth for quantity.
+// CHECK constraints and the event immutability trigger live in the migration
+// SQL (Prisma doesn't model them).
+// ---------------------------------------------------------------------------
+
+enum ProductUnitStatus {
+  IN_STOCK
+  ALLOCATED
+  SOLD
+  RETURNED_TO_SUPPLIER
+  WRITTEN_OFF
+}
+
+enum ProductUnitSource {
+  PURCHASE
+  REPLACEMENT
+  OPENING_STOCK
+}
+
+enum ProductUnitCondition {
+  GOOD
+  DEFECTIVE
+}
+
+enum ProductUnitEventType {
+  REGISTERED
+  SERIAL_CORRECTED
+  ASSIGNED_TO_ORDER
+  UNASSIGNED_FROM_ORDER
+  MARKED_SOLD
+  RETURNED_BY_DEALER
+  DEALER_RETURN_REVERSED
+  RETURNED_TO_SUPPLIER
+  SUPPLIER_RETURN_REVERSED
+  SUPPLIER_RETURN_RELINKED
+  MARKED_DEFECTIVE
+  MARKED_GOOD
+  WARRANTY_SWAP_OUT
+  WARRANTY_SWAP_IN
+  WRITTEN_OFF
+  WRITE_OFF_REVERSED
+  WARRANTY_UPDATED
+  RELEASED_BY_DATA_CLEAR
+}
+
+model ProductUnit {
+  id           String               @id @default(uuid())
+  productId    String
+  product      Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  // As scanned (trimmed) — shown to people and printed on the invoice.
+  serialNumber String
+  // Normalized (uppercase, no whitespace) — uniqueness and lookup.
+  serialKey    String
+  status       ProductUnitStatus    @default(IN_STOCK)
+  condition    ProductUnitCondition @default(GOOD)
+  source       ProductUnitSource
+
+  // Warranty chain: the unit this one replaced (warranty swap, or a supplier
+  // replacement for a returned unit).
+  replacesUnitId String?      @unique
+  replacesUnit   ProductUnit? @relation("UnitReplacement", fields: [replacesUnitId], references: [id], onDelete: Restrict)
+  replacedBy     ProductUnit? @relation("UnitReplacement")
+
+  purchaseId    String?
+  purchase      Purchase?                  @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  replacementId String?
+  replacement   PurchaseReturnReplacement? @relation(fields: [replacementId], references: [id], onDelete: Restrict)
+  receivedAt    DateTime
+
+  // Current order. ALLOCATED while the order is APPROVED/PACKED, SOLD once it
+  // is DELIVERED/COMPLETED. Cleared when unassigned or returned.
+  orderId           String?
+  order             Order?    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  allocatedAt       DateTime?
+  soldAt            DateTime?
+  warrantyStartsAt  DateTime?
+  warrantyExpiresAt DateTime?
+  // Set once an admin edits a warranty date — automatic stamping never
+  // touches the unit afterwards.
+  warrantyManual    Boolean   @default(false)
+
+  purchaseReturnId String?
+  purchaseReturn   PurchaseReturn? @relation(fields: [purchaseReturnId], references: [id], onDelete: Restrict)
+
+  notes            String?
+  createdByAdminId String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  events ProductUnitEvent[]
+
+  @@unique([productId, serialKey])
+  @@index([serialKey])
+  @@index([productId, status])
+  @@index([orderId])
+  @@index([purchaseId])
+  @@index([purchaseReturnId])
+}
+
+// Append-only life history of a unit. Deliberately no FK to documents (like
+// PaymentRevision): numbers, party and reason are copied as text so the
+// timeline still reads correctly after a document is edited or deleted.
+model ProductUnitEvent {
+  id             String               @id @default(uuid())
+  unitId         String
+  unit           ProductUnit          @relation(fields: [unitId], references: [id], onDelete: Restrict)
+  type           ProductUnitEventType
+  documentId     String?
+  documentRef    String?
+  partyName      String?
+  reason         String?
+  faultNote      String?
+  statusAfter    ProductUnitStatus
+  conditionAfter ProductUnitCondition
+  eventDate      DateTime
+  // Display only — never summed into any balance.
+  amount         Decimal?
+  details        String?
+  adminId        String
+  createdAt      DateTime             @default(now())
+
+  @@index([unitId, createdAt])
+  @@index([documentId])
+}
+
+// Idempotency for serial requests: inserted as the last statement of the same
+// transaction as the work, so a key exists only if the work committed.
+model SerialRequest {
+  id             String   @id @default(uuid())
+  idempotencyKey String   @unique
+  adminId        String
+  operation      String
+  requestHash    String
+  response       Json
+  createdAt      DateTime @default(now())
+
+  @@index([adminId, createdAt])
 }

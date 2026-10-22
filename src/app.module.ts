@@ -40,6 +40,7 @@ import { ReportsModule } from './reports/reports.module';
 import { BalanceSheetModule } from './balance-sheet/balance-sheet.module';
 import { RefundsModule } from './refunds/refunds.module';
 import { CashAdjustmentsModule } from './cash-adjustments/cash-adjustments.module';
+import { ProductUnitsModule } from './product-units/product-units.module';
 
 @Module({
   imports: [
@@ -80,6 +81,7 @@ import { CashAdjustmentsModule } from './cash-adjustments/cash-adjustments.modul
     BalanceSheetModule,
     RefundsModule,
     CashAdjustmentsModule,
+    ProductUnitsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

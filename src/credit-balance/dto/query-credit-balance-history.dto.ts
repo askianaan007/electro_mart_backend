@@ -3,10 +3,7 @@ import { IsDateString, IsIn, IsOptional } from 'class-validator';
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
 
 export type CreditBalanceEntryType =
-  | 'PURCHASE'
-  | 'TRANSPORT_CHARGE'
-  | 'PURCHASE_RETURN'
-  | 'SETTLEMENT';
+  'PURCHASE' | 'TRANSPORT_CHARGE' | 'PURCHASE_RETURN' | 'SETTLEMENT';
 
 const ENTRY_TYPES: CreditBalanceEntryType[] = [
   'PURCHASE',

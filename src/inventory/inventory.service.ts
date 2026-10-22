@@ -3,7 +3,12 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { InventoryLog, InventoryLogType, Prisma } from '@prisma/client';
+import {
+  InventoryLog,
+  InventoryLogType,
+  Prisma,
+  ProductUnitSource,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { paginate } from '../common/utils/paginate';
@@ -12,6 +17,8 @@ import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { QueryInventoryDto } from './dto/query-inventory.dto';
 import { QueryLedgerDto } from './dto/query-ledger.dto';
 import { businessDateRange } from '../common/utils/business-date';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
+import { normalizeSerialList } from '../common/utils/serial';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -21,13 +28,15 @@ type TransactionClient = Prisma.TransactionClient;
 // string ('Opening stock', 'Reversed for edit of purchase INV-123', a
 // manual adjustment's admin-supplied reason). Only the UUID case needs a
 // lookup to become readable.
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class InventoryService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
+    private serials: SerialLifecycleService,
   ) {}
 
   async recordMovement(
@@ -309,7 +318,16 @@ export class InventoryService {
   }
 
   async adjustStock(dto: AdjustStockDto, adminId: string) {
+    const serials = normalizeSerialList(dto.serials ?? []);
+    if (serials.length > dto.quantity) {
+      throw new BadRequestException(
+        `${serials.length} serials given but the adjustment is for ${dto.quantity} unit(s)`,
+      );
+    }
     return this.prisma.$transaction(async (tx) => {
+      const shelfGuard = await this.serials.beginShelfGuard(tx, [
+        dto.productId,
+      ]);
       const product = await this.recordMovement(tx, {
         productId: dto.productId,
         type: InventoryLogType.ADJUSTMENT,
@@ -318,11 +336,35 @@ export class InventoryService {
         reference: dto.reason,
       });
 
+      if (dto.direction === 'OUT') {
+        await this.serials.writeOffUnits(
+          tx,
+          dto.productId,
+          serials,
+          dto.reason,
+          adminId,
+        );
+      } else {
+        await this.serials.registerUnits(tx, {
+          productId: dto.productId,
+          serials,
+          source: ProductUnitSource.OPENING_STOCK,
+          receivedAt: new Date(),
+          adminId,
+          reason: dto.reason,
+        });
+      }
+      await shelfGuard.assert();
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'ADJUSTED_INVENTORY',
         targetId: product.id,
-        details: `Stock ${dto.direction === 'IN' ? 'increased' : 'decreased'} by ${dto.quantity} for ${product.name}${dto.reason ? ` (${dto.reason})` : ''}`,
+        details:
+          `Stock ${dto.direction === 'IN' ? 'increased' : 'decreased'} by ${dto.quantity} for ${product.name}${dto.reason ? ` (${dto.reason})` : ''}` +
+          (serials.length > 0
+            ? `; serials ${dto.direction === 'IN' ? 'registered' : 'written off'}: ${serials.map((s) => s.serialNumber).join(', ')}`
+            : ''),
       });
 
       return product;

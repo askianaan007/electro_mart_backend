@@ -20,6 +20,8 @@ import {
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { businessDateRange } from '../common/utils/business-date';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
+import { NormalizedSerial, normalizeSerialList } from '../common/utils/serial';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -31,12 +33,69 @@ export class PurchaseReturnsService {
     private prisma: PrismaService,
     private inventoryService: InventoryService,
     private activityLogService: ActivityLogService,
+    private serials: SerialLifecycleService,
   ) {}
+
+  /** Normalized serial picks per product (one line per product per return). */
+  private serialPicks(items: { productId: string; serials?: string[] }[]) {
+    const picks = new Map<string, NormalizedSerial[]>();
+    for (const item of items) {
+      if (!item.serials?.length) continue;
+      picks.set(item.productId, [
+        ...(picks.get(item.productId) ?? []),
+        ...normalizeSerialList(item.serials),
+      ]);
+    }
+    for (const list of picks.values())
+      normalizeSerialList(list.map((s) => s.serialNumber));
+    return picks;
+  }
+
+  /** Moves the picked (or, for a cancellation, this purchase's) units to the supplier. */
+  private async applyUnits(
+    tx: TransactionClient,
+    purchaseReturn: {
+      id: string;
+      returnNumber: string;
+      reason: string;
+      returnDate: Date;
+      purchaseId: string | null;
+      supplier: { name: string };
+    },
+    itemsData: {
+      productId: string;
+      quantity: number;
+      unitCost: Prisma.Decimal;
+    }[],
+    picks: Map<string, NormalizedSerial[]>,
+    adminId: string,
+    autoPick = false,
+  ) {
+    return this.serials.applySupplierReturnUnits(tx, {
+      purchaseReturn,
+      supplierName: purchaseReturn.supplier.name,
+      items: itemsData.map((item) => ({
+        ...item,
+        serials: picks.get(item.productId),
+      })),
+      adminId,
+      autoPick,
+    });
+  }
 
   private readonly include = {
     supplier: true,
     purchase: true,
     items: { include: { product: true } },
+    units: {
+      select: {
+        id: true,
+        productId: true,
+        serialNumber: true,
+        condition: true,
+      },
+      orderBy: { serialKey: 'asc' },
+    },
   } satisfies Prisma.PurchaseReturnInclude;
 
   async create(dto: CreatePurchaseReturnDto, adminId: string) {
@@ -58,7 +117,18 @@ export class PurchaseReturnsService {
           `Purchase ${purchase.invoiceNumber} is cancelled — every unit has already been returned`,
         );
       }
-      return this.insertAgainstPurchase(tx, purchase, dto, adminId);
+      const shelfGuard = await this.serials.beginShelfGuard(
+        tx,
+        dto.items.map((item) => item.productId),
+      );
+      const created = await this.insertAgainstPurchase(
+        tx,
+        purchase,
+        dto,
+        adminId,
+      );
+      await shelfGuard.assert();
+      return created;
     }, TRANSACTION_OPTIONS);
   }
 
@@ -120,13 +190,23 @@ export class PurchaseReturnsService {
       });
     }
 
+    const serialCount = await this.applyUnits(
+      tx,
+      purchaseReturn,
+      itemsData,
+      this.serialPicks(dto.items),
+      adminId,
+      isCancellation,
+    );
+
     await this.activityLogService.log(tx, {
       adminId,
       action: 'RECORDED_PURCHASE_RETURN',
       targetId: purchaseReturn.id,
       details:
         `Purchase return ${returnNumber} of ${totalAmount.toString()} against purchase invoice ${purchase.invoiceNumber}` +
-        (isCancellation ? ' (order cancelled)' : ''),
+        (isCancellation ? ' (order cancelled)' : '') +
+        (serialCount > 0 ? `, ${serialCount} serial(s) sent back` : ''),
     });
 
     return purchaseReturn;
@@ -176,8 +256,13 @@ export class PurchaseReturnsService {
     if (!supplier) throw new NotFoundException('Supplier not found');
 
     const { itemsData, totalAmount } = this.computeStandaloneItems(dto.items);
+    const picks = this.serialPicks(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
+      const shelfGuard = await this.serials.beginShelfGuard(
+        tx,
+        itemsData.map((item) => item.productId),
+      );
       const returnNumber = await nextSequenceNumber(
         tx,
         'purchaseReturn',
@@ -205,11 +290,22 @@ export class PurchaseReturnsService {
         });
       }
 
+      const serialCount = await this.applyUnits(
+        tx,
+        purchaseReturn,
+        itemsData,
+        picks,
+        adminId,
+      );
+      await shelfGuard.assert();
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'RECORDED_PURCHASE_RETURN',
         targetId: purchaseReturn.id,
-        details: `Standalone purchase return ${returnNumber} of ${totalAmount.toString()} to ${supplier.name} (${dto.reason})`,
+        details:
+          `Standalone purchase return ${returnNumber} of ${totalAmount.toString()} to ${supplier.name} (${dto.reason})` +
+          (serialCount > 0 ? `, ${serialCount} serial(s) sent back` : ''),
       });
 
       return purchaseReturn;
@@ -381,8 +477,20 @@ export class PurchaseReturnsService {
 
     const oldItems = purchaseReturn.items;
     const oldTotalAmount = purchaseReturn.totalAmount;
+    const picks = this.serialPicks(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
+      const shelfGuard = await this.serials.beginShelfGuard(tx, [
+        ...oldItems.map((item) => item.productId),
+        ...dto.items.map((item) => item.productId),
+      ]);
+      // §6.4: the old serial set goes back on the shelf first (refused if
+      // any of those units moved on since), then the corrected set leaves.
+      await this.serials.reverseSupplierReturnUnits(
+        tx,
+        purchaseReturn,
+        adminId,
+      );
       let itemsData: {
         productId: string;
         quantity: number;
@@ -438,6 +546,9 @@ export class PurchaseReturnsService {
         },
         include: this.include,
       });
+
+      await this.applyUnits(tx, updated, itemsData, picks, adminId);
+      await shelfGuard.assert();
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -499,6 +610,8 @@ export class PurchaseReturnsService {
         `Return ${purchaseReturn.returnNumber} has replacement goods recorded against it and cannot be removed.`,
       );
     }
+
+    await this.serials.reverseSupplierReturnUnits(tx, purchaseReturn, adminId);
 
     for (const item of purchaseReturn.items) {
       await this.inventoryService.recordMovement(tx, {
@@ -576,6 +689,13 @@ export class PurchaseReturnsService {
         remaining.set(item.productId, left - item.quantity);
       }
 
+      await this.serials.relinkSupplierReturnUnits(
+        tx,
+        purchaseReturn,
+        purchase,
+        adminId,
+      );
+
       const updated = await tx.purchaseReturn.update({
         where: { id },
         data: { purchaseId: purchase.id },
@@ -606,6 +726,8 @@ export class PurchaseReturnsService {
     return this.prisma.$transaction(async (tx) => {
       const purchase = await this.lockPurchase(tx, purchaseId);
       this.assertPurchaseActive(purchase);
+      await this.serials.relinkSupplierReturnUnits(tx, existing, null, adminId);
+
       const updated = await tx.purchaseReturn.update({
         where: { id },
         data: { purchaseId: null },
