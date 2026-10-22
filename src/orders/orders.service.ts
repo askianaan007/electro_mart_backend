@@ -28,6 +28,9 @@ import {
   resetSequenceCounter,
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
+import { ProductUnitsService } from '../product-units/product-units.service';
+import { normalizeSerialList } from '../common/utils/serial';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 import { derivePaymentStatus } from '../common/utils/invoice-financials';
 import { businessDateRange } from '../common/utils/business-date';
@@ -87,6 +90,8 @@ export class OrdersService {
     private inventoryService: InventoryService,
     private activityLogService: ActivityLogService,
     private mailer: MailerService,
+    private serials: SerialLifecycleService,
+    private productUnitsService: ProductUnitsService,
   ) {}
 
   private readonly orderInclude = {
@@ -566,6 +571,12 @@ export class OrdersService {
         : 'This order exceeds your available credit limit';
 
     if (requester.role === Role.ADMIN) {
+      const serialLines = dto.items
+        .filter((item) => item.serials?.length)
+        .map((item) => ({
+          productId: item.productId,
+          serials: normalizeSerialList(item.serials ?? []),
+        }));
       const completionDate = dto.saleDate ? new Date(dto.saleDate) : undefined;
       // Backfilling a historical sale (migrating past data) should not be
       // stamped with today's date — createdAt follows the chosen sale date,
@@ -599,7 +610,7 @@ export class OrdersService {
           include: { items: true },
         });
 
-        return this.applyApproval(tx, order, requester.id, {
+        const approved = await this.applyApproval(tx, order, requester.id, {
           discountTotal,
           discountDescription,
           activityAction: 'ADMIN_CREATED_ORDER',
@@ -607,6 +618,20 @@ export class OrdersService {
           createdAt,
           skipItemDiscountAllocation: usesItemLevelDiscount,
         });
+
+        if (serialLines.length > 0) {
+          const context = await this.serials.loadOrderContext(tx, order.id);
+          for (const line of serialLines) {
+            await this.serials.setOrderLineUnits(
+              tx,
+              context,
+              line.productId,
+              line.serials,
+              requester.id,
+            );
+          }
+        }
+        return approved;
       }, TRANSACTION_OPTIONS);
 
       if (dealer.email) {
@@ -772,6 +797,10 @@ export class OrdersService {
       wasCompleted && dto.saleDate ? new Date(dto.saleDate) : undefined;
 
     return this.prisma.$transaction(async (tx) => {
+      const shelfGuard = await this.serials.beginShelfGuard(tx, [
+        ...order.items.map((item) => item.productId),
+        ...dto.items.map((item) => item.productId),
+      ]);
       // Reverse the original stock reservation (and dealer balance, if this
       // order had actually been completed).
       for (const item of order.items) {
@@ -882,6 +911,12 @@ export class OrdersService {
         include: this.orderInclude,
       });
 
+      // Serials reference the order, not its items, so they survive the
+      // rebuild — but every line that has them must still be big enough.
+      await this.serials.assertOrderUnitsFit(tx, id);
+      if (saleDate) await this.serials.restampOrderWarranty(tx, id, saleDate);
+      await shelfGuard.assert();
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'ADMIN_EDITED_ORDER',
@@ -960,7 +995,11 @@ export class OrdersService {
     if (requester.role === 'DEALER' && order.dealerId !== requester.id) {
       throw new ForbiddenException('You do not have access to this order');
     }
-    return order;
+    const [serialAnnex, serialProgress] = await Promise.all([
+      this.productUnitsService.serialAnnexForOrder(id),
+      this.productUnitsService.serialProgressForOrder(id),
+    ]);
+    return { ...order, serialAnnex, serialProgress };
   }
 
   async approve(id: string, adminId: string, dto?: ApproveOrderDto) {
@@ -1093,6 +1132,7 @@ export class OrdersService {
 
     const updated = await this.prisma.$transaction(async (tx) => {
       const timestampField = TIMESTAMP_FIELD[nextStatus];
+      const stamp = new Date();
 
       if (nextStatus === 'COMPLETED' && order.invoice) {
         await tx.dealer.update({
@@ -1105,10 +1145,21 @@ export class OrdersService {
         where: { id },
         data: {
           status: nextStatus,
-          [timestampField]: new Date(),
+          [timestampField]: stamp,
         },
         include: this.orderInclude,
       });
+
+      // Goods leave the building at delivery: allocated serials become sold
+      // and their warranty starts (Bar_code_plan.md §5.2).
+      if (nextStatus === 'DELIVERED' || nextStatus === 'COMPLETED') {
+        await this.serials.markOrderUnitsSold(
+          tx,
+          id,
+          saved.deliveredAt ?? stamp,
+          adminId,
+        );
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -1186,6 +1237,13 @@ export class OrdersService {
         },
         include: this.orderInclude,
       });
+
+      await this.serials.markOrderUnitsSold(
+        tx,
+        id,
+        order.deliveredAt ?? now,
+        adminId,
+      );
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -1288,6 +1346,8 @@ export class OrdersService {
           );
         }
 
+        // Serials on the order go back on the shelf (stock was released above).
+        await this.serials.releaseOrderUnits(tx, id, adminId);
         await tx.orderItem.deleteMany({ where: { orderId: id } });
         await tx.order.delete({ where: { id } });
 

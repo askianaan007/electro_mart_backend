@@ -7,7 +7,12 @@ import { LiquidCashModule } from '../liquid-cash/liquid-cash.module';
 import { CreditBalanceModule } from '../credit-balance/credit-balance.module';
 
 @Module({
-  imports: [CreditsModule, SalesAnalysisModule, LiquidCashModule, CreditBalanceModule],
+  imports: [
+    CreditsModule,
+    SalesAnalysisModule,
+    LiquidCashModule,
+    CreditBalanceModule,
+  ],
   providers: [DashboardService],
   controllers: [DashboardController],
 })

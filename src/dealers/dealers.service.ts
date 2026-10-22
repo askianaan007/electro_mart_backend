@@ -9,6 +9,7 @@ import {
   InventoryLogType,
   OrderStatus,
   Prisma,
+  ProductUnitEventType,
   Role,
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
@@ -16,6 +17,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
 import { MailerService } from '../mailer/mailer.service';
 import { InventoryService } from '../inventory/inventory.service';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
 import { CreateDealerDto } from './dto/create-dealer.dto';
 import { UpdateDealerDto } from './dto/update-dealer.dto';
 import { QueryDealerDto } from './dto/query-dealer.dto';
@@ -33,6 +35,7 @@ export class DealersService {
     private activityLogService: ActivityLogService,
     private mailer: MailerService,
     private inventoryService: InventoryService,
+    private serials: SerialLifecycleService,
   ) {}
 
   async create(dto: CreateDealerDto, adminId: string) {
@@ -356,6 +359,15 @@ export class DealersService {
             await tx.invoice.delete({ where: { id: order.invoice.id } });
           }
 
+          // Serials on the order go back on the shelf; units that came back
+          // through its sales returns are already there and stay as they are.
+          await this.serials.releaseOrderUnits(
+            tx,
+            order.id,
+            adminId,
+            ProductUnitEventType.RELEASED_BY_DATA_CLEAR,
+            `Dealer data cleared (${dealer.businessName})`,
+          );
           await tx.orderItem.deleteMany({ where: { orderId: order.id } });
           await tx.order.delete({ where: { id: order.id } });
         }

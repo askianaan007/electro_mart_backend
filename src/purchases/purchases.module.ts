@@ -4,9 +4,15 @@ import { PurchasesController } from './purchases.controller';
 import { InventoryModule } from '../inventory/inventory.module';
 import { ActivityLogModule } from '../activity-log/activity-log.module';
 import { PurchaseReturnsModule } from '../purchase-returns/purchase-returns.module';
+import { ProductUnitsModule } from '../product-units/product-units.module';
 
 @Module({
-  imports: [InventoryModule, ActivityLogModule, PurchaseReturnsModule],
+  imports: [
+    InventoryModule,
+    ActivityLogModule,
+    PurchaseReturnsModule,
+    ProductUnitsModule,
+  ],
   providers: [PurchasesService],
   controllers: [PurchasesController],
   exports: [PurchasesService],

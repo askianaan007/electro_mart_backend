@@ -1,12 +1,14 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsIn,
   IsInt,
   IsNotEmpty,
+  IsOptional,
   IsString,
   IsUUID,
   Min,
 } from 'class-validator';
+import { SerialList } from '../../product-units/dto/product-units.dto';
 
 export class AdjustStockDto {
   @ApiProperty()
@@ -29,4 +31,13 @@ export class AdjustStockDto {
   @IsString()
   @IsNotEmpty()
   reason: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Optional serials (at most `quantity`): OUT writes these in-stock units off; IN registers them as existing stock.',
+  })
+  @IsOptional()
+  @SerialList()
+  serials?: string[];
 }

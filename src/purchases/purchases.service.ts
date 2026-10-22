@@ -19,6 +19,8 @@ import {
 } from '../common/utils/business-date';
 import { PurchaseReturnsService } from '../purchase-returns/purchase-returns.service';
 import { CancelPurchaseDto } from './dto/cancel-purchase.dto';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
+import { normalizeSerialList } from '../common/utils/serial';
 
 @Injectable()
 export class PurchasesService {
@@ -27,7 +29,40 @@ export class PurchasesService {
     private inventoryService: InventoryService,
     private activityLogService: ActivityLogService,
     private purchaseReturnsService: PurchaseReturnsService,
+    private serials: SerialLifecycleService,
   ) {}
+
+  /** Serials scanned per purchase line, normalized; one product's lines merged. */
+  private serialLines(items: { productId: string; serials?: string[] }[]) {
+    const merged = new Map<string, string[]>();
+    for (const item of items) {
+      if (!item.serials?.length) continue;
+      merged.set(item.productId, [
+        ...(merged.get(item.productId) ?? []),
+        ...item.serials,
+      ]);
+    }
+    return [...merged].map(([productId, raw]) => ({
+      productId,
+      serials: normalizeSerialList(raw),
+    }));
+  }
+
+  private quantityByProduct(items: { productId: string; quantity: number }[]) {
+    const qty = new Map<string, number>();
+    for (const item of items) {
+      qty.set(item.productId, (qty.get(item.productId) ?? 0) + item.quantity);
+    }
+    return qty;
+  }
+
+  private costByProduct(
+    items: { productId: string; unitCost: Prisma.Decimal | number }[],
+  ) {
+    return new Map(
+      items.map((item) => [item.productId, new Prisma.Decimal(item.unitCost)]),
+    );
+  }
 
   private async assertSupplierAndProductsExist(
     supplierId: string,
@@ -52,6 +87,7 @@ export class PurchasesService {
 
   async create(dto: CreatePurchaseDto, adminId: string) {
     await this.assertSupplierAndProductsExist(dto.supplierId, dto.items);
+    const serialLines = this.serialLines(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
       let totalValue = new Prisma.Decimal(0);
@@ -89,6 +125,15 @@ export class PurchasesService {
         });
       }
 
+      const serialCount = await this.serials.registerForPurchase(
+        tx,
+        purchase,
+        serialLines,
+        this.quantityByProduct(purchase.items),
+        this.costByProduct(purchase.items),
+        adminId,
+      );
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'RECORDED_PURCHASE',
@@ -97,7 +142,8 @@ export class PurchasesService {
           `Purchase ${purchase.invoiceNumber} from ${purchase.supplier.name} for ${totalValue.toString()} (${purchase.items.length} item(s))` +
           (transportCharges > 0
             ? `, transport charges ${transportCharges} deducted from supplier credit`
-            : ''),
+            : '') +
+          (serialCount > 0 ? `, ${serialCount} serial(s) registered` : ''),
       });
 
       return purchase;
@@ -144,6 +190,16 @@ export class PurchasesService {
         items: { include: { product: true } },
         admin: { omit: { password: true } },
         purchaseReturns: { select: { totalAmount: true } },
+        units: {
+          select: {
+            id: true,
+            productId: true,
+            serialNumber: true,
+            status: true,
+            condition: true,
+          },
+          orderBy: { serialKey: 'asc' },
+        },
       },
     });
     if (!purchase) throw new NotFoundException('Purchase not found');
@@ -176,6 +232,7 @@ export class PurchasesService {
     }
 
     await this.assertSupplierAndProductsExist(dto.supplierId, dto.items);
+    const serialLines = this.serialLines(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
       await this.lockSuppliers(tx, [purchase.supplierId, dto.supplierId]);
@@ -183,6 +240,15 @@ export class PurchasesService {
         tx,
         purchase.supplierId,
       );
+      await this.serials.assertPurchaseEditable(
+        tx,
+        id,
+        this.quantityByProduct(dto.items),
+      );
+      const shelfGuard = await this.serials.beginShelfGuard(tx, [
+        ...purchase.items.map((item) => item.productId),
+        ...dto.items.map((item) => item.productId),
+      ]);
 
       for (const item of purchase.items) {
         await this.inventoryService.recordMovement(tx, {
@@ -228,6 +294,16 @@ export class PurchasesService {
           reference: purchase.id,
         });
       }
+
+      await this.serials.registerForPurchase(
+        tx,
+        { ...updated, purchaseDate: updated.purchaseDate },
+        serialLines,
+        this.quantityByProduct(updated.items),
+        this.costByProduct(updated.items),
+        adminId,
+      );
+      await shelfGuard.assert();
 
       // Lowering the value, raising transport, or moving the purchase to
       // another supplier reduces what the original supplier is owed — not
@@ -288,6 +364,10 @@ export class PurchasesService {
         tx,
         purchase.supplierId,
       );
+      const shelfGuard = await this.serials.beginShelfGuard(
+        tx,
+        purchase.items.map((item) => item.productId),
+      );
 
       for (const item of purchase.items) {
         await this.inventoryService.recordMovement(tx, {
@@ -298,8 +378,15 @@ export class PurchasesService {
         });
       }
 
+      await this.serials.deletePurchaseUnits(
+        tx,
+        id,
+        purchase.invoiceNumber,
+        adminId,
+      );
       await tx.purchaseItem.deleteMany({ where: { purchaseId: id } });
       await tx.purchase.delete({ where: { id } });
+      await shelfGuard.assert();
 
       await this.assertSupplierNotOverpaid(
         tx,
@@ -348,6 +435,10 @@ export class PurchasesService {
       const items = [...remaining]
         .filter(([, quantity]) => quantity > 0)
         .map(([productId, quantity]) => ({ productId, quantity }));
+      const shelfGuard = await this.serials.beginShelfGuard(
+        tx,
+        items.map((item) => item.productId),
+      );
 
       let cancellationReturn: { returnNumber: string } | null = null;
       if (items.length > 0) {
@@ -376,6 +467,8 @@ export class PurchasesService {
           throw error;
         }
       }
+
+      await shelfGuard.assert();
 
       const updated = await tx.purchase.update({
         where: { id },

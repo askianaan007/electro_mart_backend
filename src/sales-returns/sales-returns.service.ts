@@ -20,6 +20,8 @@ import {
 } from '../common/utils/sequence';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { recomputeInvoicePaymentStatus } from '../common/utils/invoice-financials';
+import { SerialLifecycleService } from '../product-units/serial-lifecycle.service';
+import { normalizeSerial } from '../common/utils/serial';
 
 type TransactionClient = Prisma.TransactionClient;
 
@@ -31,7 +33,27 @@ export class SalesReturnsService {
     private prisma: PrismaService,
     private inventoryService: InventoryService,
     private activityLogService: ActivityLogService,
+    private serials: SerialLifecycleService,
   ) {}
+
+  /** Serial picks per returned line, normalized and de-duplicated. */
+  private serialPicks(items: SalesReturnItemDto[]) {
+    const seen = new Set<string>();
+    return items.map((item) => ({
+      productId: item.productId,
+      quantity: item.quantity,
+      serials: (item.serials ?? []).map((pick) => {
+        const serial = normalizeSerial(pick.serial);
+        if (seen.has(serial.serialKey)) {
+          throw new BadRequestException(
+            `Serial ${serial.serialNumber} is listed more than once`,
+          );
+        }
+        seen.add(serial.serialKey);
+        return { serial, condition: pick.condition, faultNote: pick.faultNote };
+      }),
+    }));
+  }
 
   private readonly include = {
     dealer: { omit: { password: true } as const },
@@ -51,6 +73,7 @@ export class SalesReturnsService {
       );
     }
     this.assertNoDuplicateProducts(dto.items);
+    const picks = this.serialPicks(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
       // Lock the order row so a second concurrent return against the same
@@ -105,11 +128,20 @@ export class SalesReturnsService {
         await recomputeInvoicePaymentStatus(tx, order.invoice.id);
       }
 
+      const serialCount = await this.serials.applySalesReturnUnits(tx, {
+        order: await this.serials.loadOrderContext(tx, order.id),
+        salesReturn,
+        items: picks,
+        adminId,
+      });
+
       await this.activityLogService.log(tx, {
         adminId,
         action: 'RECORDED_SALES_RETURN',
         targetId: salesReturn.id,
-        details: `Sales return ${returnNumber} of ${totalAmount.toString()} against order ${order.orderNumber}`,
+        details:
+          `Sales return ${returnNumber} of ${totalAmount.toString()} against order ${order.orderNumber}` +
+          (serialCount > 0 ? `, ${serialCount} serial(s) back in stock` : ''),
       });
 
       return salesReturn;
@@ -143,10 +175,18 @@ export class SalesReturnsService {
 
     const oldItems = salesReturn.items;
     const oldTotalAmount = salesReturn.totalAmount;
+    const picks = this.serialPicks(dto.items);
 
     return this.prisma.$transaction(async (tx) => {
       // Same row-lock pattern as create() — see comment there.
       await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${order.id} FOR UPDATE`;
+      const shelfGuard = await this.serials.beginShelfGuard(tx, [
+        ...oldItems.map((item) => item.productId),
+        ...dto.items.map((item) => item.productId),
+      ]);
+      // §6.4: the previous serial set goes back to the buyer first (refused
+      // if any of those units moved on since), then the corrected set returns.
+      await this.serials.reverseSalesReturnUnits(tx, salesReturn, adminId);
 
       const { itemsData, totalAmount } = await this.computeItemsData(
         tx,
@@ -192,6 +232,14 @@ export class SalesReturnsService {
         },
       });
 
+      await this.serials.applySalesReturnUnits(tx, {
+        order: await this.serials.loadOrderContext(tx, order.id),
+        salesReturn: updated,
+        items: picks,
+        adminId,
+      });
+      await shelfGuard.assert();
+
       if (order.invoice) {
         await recomputeInvoicePaymentStatus(tx, order.invoice.id);
       }
@@ -226,6 +274,12 @@ export class SalesReturnsService {
     const order = salesReturn.order;
 
     return this.prisma.$transaction(async (tx) => {
+      const shelfGuard = await this.serials.beginShelfGuard(
+        tx,
+        salesReturn.items.map((item) => item.productId),
+      );
+      await this.serials.reverseSalesReturnUnits(tx, salesReturn, adminId);
+
       for (const item of salesReturn.items) {
         await this.inventoryService.recordMovement(tx, {
           productId: item.productId,
@@ -246,6 +300,8 @@ export class SalesReturnsService {
       if (order.invoice) {
         await recomputeInvoicePaymentStatus(tx, order.invoice.id);
       }
+
+      await shelfGuard.assert();
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -281,11 +337,19 @@ export class SalesReturnsService {
   }
 
   async findAllForOrder(orderId: string) {
-    return this.prisma.salesReturn.findMany({
+    const salesReturns = await this.prisma.salesReturn.findMany({
       where: { orderId },
       include: this.include,
       orderBy: { createdAt: 'desc' },
     });
+    const serials = await this.serials.serialsForSalesReturns(
+      this.prisma,
+      salesReturns.map((r) => r.id),
+    );
+    return salesReturns.map((r) => ({
+      ...r,
+      serials: serials.get(r.id) ?? [],
+    }));
   }
 
   async findOne(id: string) {
@@ -294,7 +358,10 @@ export class SalesReturnsService {
       include: this.include,
     });
     if (!salesReturn) throw new NotFoundException('Sales return not found');
-    return salesReturn;
+    const serials = await this.serials.serialsForSalesReturns(this.prisma, [
+      id,
+    ]);
+    return { ...salesReturn, serials: serials.get(id) ?? [] };
   }
 
   /**

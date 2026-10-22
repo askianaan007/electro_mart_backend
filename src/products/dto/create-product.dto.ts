@@ -8,7 +8,9 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Max,
   Min,
+  ValidateIf,
 } from 'class-validator';
 
 export class CreateProductDto {
@@ -106,6 +108,27 @@ export class CreateProductDto {
   @IsOptional()
   @IsString()
   warranty?: string;
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Track each unit by its serial/barcode (scanned at purchase and when packing orders). Optional per product.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  trackSerials?: boolean;
+
+  @ApiPropertyOptional({
+    nullable: true,
+    description:
+      'Warranty length in months, used to stamp each sold unit’s warranty expiry. Empty = no expiry date.',
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  @Min(0)
+  @Max(240)
+  warrantyMonths?: number | null;
 
   @ApiPropertyOptional({ enum: AccountStatus, default: AccountStatus.ACTIVE })
   @IsOptional()

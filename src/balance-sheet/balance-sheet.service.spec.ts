@@ -33,16 +33,51 @@ const D = (v: number | string) => new Prisma.Decimal(v);
 // property probes (`then`, `catch`, symbols, etc. — triggered by Nest's DI container and
 // Jest's own promise/thenable duck-typing) are left alone and don't false-positive.
 const OTHER_PRISMA_MODELS = [
-  'admin', 'category', 'product', 'productImage', 'supplier', 'purchase', 'purchaseReturn',
-  'purchaseReturnItem', 'purchaseItem', 'inventoryLog', 'order', 'orderItem', 'invoice',
-  'payment', 'supplierPayment', 'investor', 'expense', 'salesReturn', 'salesReturnItem',
-  'activityLog', 'counter', 'refreshToken', 'representative', 'representativeLoginHistory',
-  'representativeActivityLog', 'customerProfile', 'customerNote', 'productAssignment',
-  'bannerAssignment', 'productAvailabilityOverride', 'commissionRule',
-  'representativeSettlement', 'collectionSubmission', 'collectionReminderLog', 'brand',
-  'banner', 'repOrderDraft', 'repOrderDraftItem',
+  'admin',
+  'category',
+  'product',
+  'productImage',
+  'supplier',
+  'purchase',
+  'purchaseReturn',
+  'purchaseReturnItem',
+  'purchaseItem',
+  'inventoryLog',
+  'order',
+  'orderItem',
+  'invoice',
+  'payment',
+  'supplierPayment',
+  'investor',
+  'expense',
+  'salesReturn',
+  'salesReturnItem',
+  'activityLog',
+  'counter',
+  'refreshToken',
+  'representative',
+  'representativeLoginHistory',
+  'representativeActivityLog',
+  'customerProfile',
+  'customerNote',
+  'productAssignment',
+  'bannerAssignment',
+  'productAvailabilityOverride',
+  'commissionRule',
+  'representativeSettlement',
+  'collectionSubmission',
+  'collectionReminderLog',
+  'brand',
+  'banner',
+  'repOrderDraft',
+  'repOrderDraftItem',
 ];
-const WRITE_OR_TRANSACTION_METHODS = ['$transaction', '$executeRaw', '$connect', '$disconnect'];
+const WRITE_OR_TRANSACTION_METHODS = [
+  '$transaction',
+  '$executeRaw',
+  '$connect',
+  '$disconnect',
+];
 
 function makeReadOnlyPrisma() {
   const dealerAggregate = jest.fn();
@@ -103,7 +138,12 @@ function makeReadOnlyPrisma() {
 
   return {
     prisma: root as unknown as PrismaService,
-    mocks: { dealerAggregate, investmentAggregate, commissionLedgerEntryAggregate, queryRaw },
+    mocks: {
+      dealerAggregate,
+      investmentAggregate,
+      commissionLedgerEntryAggregate,
+      queryRaw,
+    },
   };
 }
 
@@ -149,7 +189,9 @@ describe('BalanceSheetService', () => {
         percentageTotal: D(100),
       },
     });
-    mocks.dealerAggregate.mockResolvedValue({ _sum: { outstandingBalance: D(90_000) } });
+    mocks.dealerAggregate.mockResolvedValue({
+      _sum: { outstandingBalance: D(90_000) },
+    });
     mocks.investmentAggregate
       .mockResolvedValueOnce({ _sum: { amount: D(400_000) } }) // contributions
       .mockResolvedValueOnce({ _sum: { amount: null } }); // withdrawals — none
@@ -228,7 +270,9 @@ describe('BalanceSheetService', () => {
         openingBalance: 0,
         totalAdjustments: 0,
       });
-      mocks.dealerAggregate.mockResolvedValue({ _sum: { outstandingBalance: D(0) } });
+      mocks.dealerAggregate.mockResolvedValue({
+        _sum: { outstandingBalance: D(0) },
+      });
       mocks.queryRaw
         .mockReset()
         .mockResolvedValueOnce([{ value: D(0) }])
@@ -282,11 +326,15 @@ describe('BalanceSheetService', () => {
       });
 
       const result = await service.getSummary();
-      expect(result.liabilities.current.totalCurrentLiabilities).toBe('120000.00');
+      expect(result.liabilities.current.totalCurrentLiabilities).toBe(
+        '120000.00',
+      );
       expect(result.liabilities.totalLiabilities).toBe('120000.00');
       expect(result.memorandum.commissionPayable.value).toBe('250000.00');
       expect(result.memorandum.commissionPayable.includedInTotals).toBe(false);
-      expect(result.memorandum.commissionPayable.pendingOrApprovedLineCount).toBe(7);
+      expect(
+        result.memorandum.commissionPayable.pendingOrApprovedLineCount,
+      ).toBe(7);
       expect(result.reconciliation.status).toBe('BALANCED');
     });
 
@@ -312,9 +360,14 @@ describe('BalanceSheetService', () => {
 
     it('includes the exclusion rationale in accountingWarnings whenever commission is outstanding', async () => {
       wireCleanFixture();
-      mocks.commissionLedgerEntryAggregate.mockResolvedValue({ _sum: { amount: D(1) }, _count: 1 });
+      mocks.commissionLedgerEntryAggregate.mockResolvedValue({
+        _sum: { amount: D(1) },
+        _count: 1,
+      });
       const result = await service.getSummary();
-      expect(result.accountingWarnings.some((w) => w.includes('commissionPayable'))).toBe(true);
+      expect(
+        result.accountingWarnings.some((w) => w.includes('commissionPayable')),
+      ).toBe(true);
     });
   });
 
@@ -371,17 +424,24 @@ describe('BalanceSheetService', () => {
         .mockReset()
         .mockResolvedValueOnce([{ value: D(30_000) }]) // inventory
         .mockResolvedValueOnce([{ value: D(18_500), count: BigInt(1) }]); // in-flight order
-      mocks.commissionLedgerEntryAggregate.mockResolvedValue({ _sum: { amount: D(0) }, _count: 0 });
+      mocks.commissionLedgerEntryAggregate.mockResolvedValue({
+        _sum: { amount: D(0) },
+        _count: 0,
+      });
     }
 
     it('classifies a fixture with exactly one known-explained gap as BALANCED_WITH_KNOWN_TIMING_DIFFERENCE', async () => {
       wireTimingFixture();
       const result = await service.getSummary();
       expect(result.summary.rawDifference).toBe('-18500.00');
-      expect(result.reconciliation.knownOrderTimingDifference).toBe('-18500.00');
+      expect(result.reconciliation.knownOrderTimingDifference).toBe(
+        '-18500.00',
+      );
       expect(result.reconciliation.inFlightOrderCount).toBe(1);
       expect(result.reconciliation.unexplainedDifference).toBe('0.00');
-      expect(result.reconciliation.status).toBe('BALANCED_WITH_KNOWN_TIMING_DIFFERENCE');
+      expect(result.reconciliation.status).toBe(
+        'BALANCED_WITH_KNOWN_TIMING_DIFFERENCE',
+      );
     });
 
     it('reports UNBALANCED with a nonzero unexplainedDifference when an extra, unrelated discrepancy exists', async () => {
@@ -414,16 +474,24 @@ describe('BalanceSheetService', () => {
       });
       const result = await service.getSummary();
       // accumulatedEarningsGross (30,000) - (totalEquity - totalInvestment = 18,000) = 12,000
-      expect(result.reconciliation.knownUnallocatedEquityDifference).toBe('12000.00');
+      expect(result.reconciliation.knownUnallocatedEquityDifference).toBe(
+        '12000.00',
+      );
       expect(result.reconciliation.investorPercentageTotal).toBe('60');
-      expect(result.accountingWarnings.some((w) => w.includes('profit-share'))).toBe(true);
+      expect(
+        result.accountingWarnings.some((w) => w.includes('profit-share')),
+      ).toBe(true);
     });
 
     it('does not add the unallocated-equity warning when percentageTotal is exactly 100', async () => {
       wireCleanFixture();
       const result = await service.getSummary();
-      expect(result.reconciliation.knownUnallocatedEquityDifference).toBe('0.00');
-      expect(result.accountingWarnings.some((w) => w.includes('profit-share'))).toBe(false);
+      expect(result.reconciliation.knownUnallocatedEquityDifference).toBe(
+        '0.00',
+      );
+      expect(
+        result.accountingWarnings.some((w) => w.includes('profit-share')),
+      ).toBe(false);
     });
   });
 
@@ -432,7 +500,9 @@ describe('BalanceSheetService', () => {
       wireCleanFixture();
       // Deliberately unbalanced fixture — nothing here should cause totalEquity
       // to be silently recomputed as totalAssets - totalLiabilities.
-      mocks.dealerAggregate.mockResolvedValue({ _sum: { outstandingBalance: D(999_999) } });
+      mocks.dealerAggregate.mockResolvedValue({
+        _sum: { outstandingBalance: D(999_999) },
+      });
       const result = await service.getSummary();
       expect(result.reconciliation.status).toBe('UNBALANCED');
       expect(result.equity.totalEquity).toBe(D(430_000).toFixed(2));
@@ -478,7 +548,9 @@ describe('BalanceSheetService', () => {
       });
       const result = await service.getSummary();
       expect(result.liabilities.current.supplierChequesIssued).toBe('15000.00');
-      expect(result.liabilities.current.totalCurrentLiabilities).toBe('135000.00');
+      expect(result.liabilities.current.totalCurrentLiabilities).toBe(
+        '135000.00',
+      );
     });
   });
 

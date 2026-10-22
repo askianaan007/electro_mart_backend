@@ -10,9 +10,7 @@
  */
 
 export type ReconciliationStatus =
-  | 'BALANCED'
-  | 'BALANCED_WITH_KNOWN_TIMING_DIFFERENCE'
-  | 'UNBALANCED';
+  'BALANCED' | 'BALANCED_WITH_KNOWN_TIMING_DIFFERENCE' | 'UNBALANCED';
 
 export interface BalanceSheetResponse {
   asOf: string;

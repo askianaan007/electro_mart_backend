@@ -13,6 +13,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+import { SerialList } from '../../product-units/dto/product-units.dto';
 
 export class PurchaseItemDto {
   @ApiProperty()
@@ -28,6 +29,15 @@ export class PurchaseItemDto {
   @IsNumber()
   @Min(0)
   unitCost: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Optional serial numbers scanned for this line (at most `quantity`). More can be added later.',
+  })
+  @IsOptional()
+  @SerialList()
+  serials?: string[];
 }
 
 export class CreatePurchaseDto {
