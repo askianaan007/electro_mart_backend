@@ -101,7 +101,16 @@ export class BalanceSheetService {
     const refundChequesReceivable = new Prisma.Decimal(
       liquidCash.pendingRefundChequesIn,
     );
-    const accountsReceivable = arAgg._sum.outstandingBalance ?? ZERO;
+    // Customer wallet money (extra paid, kept for their next invoice) is
+    // owed back to them — a liability, Customer Advances. outstandingBalance
+    // already nets it off what dealers owe, so it's added back here to keep
+    // receivables gross; the equation is unchanged (same amount both sides).
+    const customerAdvances = new Prisma.Decimal(
+      creditBalance.customerWallets ?? 0,
+    );
+    const accountsReceivable = (arAgg._sum.outstandingBalance ?? ZERO).add(
+      customerAdvances,
+    );
     const inventory = inventoryRows[0]?.value ?? ZERO;
     const totalCurrentAssets = cashAndBank
       .add(accountsReceivable)
@@ -123,7 +132,8 @@ export class BalanceSheetService {
     );
     const totalCurrentLiabilities = accountsPayable
       .add(supplierChequesIssued)
-      .add(refundChequesIssued);
+      .add(refundChequesIssued)
+      .add(customerAdvances);
     const totalNonCurrentLiabilities = ZERO; // §14 — Business Loans unsupported
     const totalLiabilities = totalCurrentLiabilities.add(
       totalNonCurrentLiabilities,
@@ -249,7 +259,7 @@ export class BalanceSheetService {
           refundChequesIssued: money(refundChequesIssued),
           taxPayable: null,
           accruedExpenses: null,
-          customerAdvances: null,
+          customerAdvances: money(customerAdvances),
           totalCurrentLiabilities: money(totalCurrentLiabilities),
         },
         nonCurrent: {
@@ -301,7 +311,6 @@ export class BalanceSheetService {
         'assets.nonCurrent.accumulatedDepreciation',
         'liabilities.current.taxPayable',
         'liabilities.current.accruedExpenses',
-        'liabilities.current.customerAdvances',
         'liabilities.nonCurrent.loans',
       ],
     };

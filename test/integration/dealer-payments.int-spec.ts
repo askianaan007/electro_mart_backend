@@ -199,9 +199,60 @@ describe('Dealer payments → Liquid Cash', () => {
         paymentDate: today(),
       })
       .expect(201);
-    await ctx
+    const refused = await ctx
       .patch(`/payments/${chq.body.id}/cheque-status`, { status: 'CLEARED' })
       .expect(400);
+    expect(refused.body.error).toBe('EXCEEDS_INVOICE_BALANCE');
+    await assertCashInvariants(ctx);
+
+    // The bank really cleared it: the admin confirms, the extra goes to the wallet.
+    await ctx
+      .patch(`/payments/${chq.body.id}/cheque-status`, {
+        status: 'CLEARED',
+        excessToWallet: true,
+      })
+      .expect(200);
+    const summary = await assertCashInvariants(ctx);
+    expect(summary.balance).toBe(9000);
+    const wallet = await ctx
+      .get(`/dealers/${invoice.dealerId}/wallet`)
+      .expect(200);
+    expect(wallet.body.balance).toBe(4000);
+  });
+
+  it('undo restores a deleted overpayment, but not once the invoice was paid another way', async () => {
+    const { invoice } = await setup(1220);
+    const pay = await ctx
+      .post('/payments', {
+        invoiceId: invoice.id,
+        amount: 1400,
+        mode: 'CASH',
+        paymentDate: today(),
+        excessToWallet: true,
+      })
+      .expect(201);
+    await ctx.del(`/payments/${pay.body.id}`).expect(200);
+    await ctx.post(`/payments/${pay.body.id}/undo`, {}).expect(201);
+    let wallet = await ctx
+      .get(`/dealers/${invoice.dealerId}/wallet`)
+      .expect(200);
+    expect(wallet.body.balance).toBe(180);
+
+    await ctx.del(`/payments/${pay.body.id}`).expect(200);
+    await ctx
+      .post('/payments', {
+        invoiceId: invoice.id,
+        amount: 1220,
+        mode: 'CASH',
+        paymentDate: today(),
+      })
+      .expect(201);
+    const refused = await ctx
+      .post(`/payments/${pay.body.id}/undo`, {})
+      .expect(400);
+    expect(refused.body.error).toBe('EXCEEDS_INVOICE_BALANCE');
+    wallet = await ctx.get(`/dealers/${invoice.dealerId}/wallet`).expect(200);
+    expect(wallet.body.balance).toBe(0);
     await assertCashInvariants(ctx);
   });
 

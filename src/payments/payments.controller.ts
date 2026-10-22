@@ -124,6 +124,7 @@ export class PaymentsController {
       id,
       dto.status,
       adminId,
+      !!dto.excessToWallet,
     );
 
     if (dto.status === 'RETURNED') {

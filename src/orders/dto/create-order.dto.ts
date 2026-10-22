@@ -16,6 +16,7 @@ import {
 } from 'class-validator';
 import { SerialList } from '../../product-units/dto/product-units.dto';
 
+import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 export class OrderItemDto {
   @ApiProperty()
   @IsUUID()
@@ -105,6 +106,14 @@ export class CreateOrderDto {
   @IsOptional()
   @IsDateString()
   saleDate?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Admin-only: pay this much of the new invoice from the dealer's wallet (credit from earlier overpayments or returns). Ignored for dealer/representative callers.",
+  })
+  @IsOptional()
+  @IsMoneyAmount()
+  walletCredit?: number;
 
   @ApiPropertyOptional({
     description:

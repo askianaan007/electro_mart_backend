@@ -70,4 +70,12 @@ export class CreatePaymentDto {
   @IsOptional()
   @IsBoolean()
   confirmDuplicate?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      "Accept an amount above what's due on the invoice: the excess goes to the dealer's wallet for later purchases",
+  })
+  @IsOptional()
+  @IsBoolean()
+  excessToWallet?: boolean;
 }

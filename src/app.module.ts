@@ -39,6 +39,7 @@ import { CollectionsModule } from './collections/collections.module';
 import { ReportsModule } from './reports/reports.module';
 import { BalanceSheetModule } from './balance-sheet/balance-sheet.module';
 import { RefundsModule } from './refunds/refunds.module';
+import { DealerWalletModule } from './dealer-wallet/dealer-wallet.module';
 import { CashAdjustmentsModule } from './cash-adjustments/cash-adjustments.module';
 import { ProductUnitsModule } from './product-units/product-units.module';
 
@@ -80,6 +81,7 @@ import { ProductUnitsModule } from './product-units/product-units.module';
     ReportsModule,
     BalanceSheetModule,
     RefundsModule,
+    DealerWalletModule,
     CashAdjustmentsModule,
     ProductUnitsModule,
   ],

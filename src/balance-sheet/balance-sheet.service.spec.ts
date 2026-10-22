@@ -622,6 +622,38 @@ describe('BalanceSheetService', () => {
     });
   });
 
+  describe('customer advances (wallets)', () => {
+    it('moves wallet money out of receivables into liabilities without changing the difference', async () => {
+      wireCleanFixture();
+      const before = await service.getSummary();
+      creditBalanceService.getSummary.mockResolvedValue({
+        balance: 120_000,
+        totalPurchases: 200_000,
+        totalTransportCharges: 0,
+        totalReturns: 10_000,
+        totalSettled: 60,
+        pendingChequeSettlements: 0,
+        customerWallets: 20_000.2,
+      });
+      mocks.investmentAggregate
+        .mockResolvedValueOnce({ _sum: { amount: D(400_000) } })
+        .mockResolvedValueOnce({ _sum: { amount: null } });
+      mocks.queryRaw
+        .mockResolvedValueOnce([{ value: D(40_000) }])
+        .mockResolvedValueOnce([{ value: D(0), count: BigInt(0) }]);
+      const after = await service.getSummary();
+      expect(after.liabilities.current.customerAdvances).toBe('20000.20');
+      expect(
+        Number(after.assets.current.accountsReceivable) -
+          Number(before.assets.current.accountsReceivable),
+      ).toBeCloseTo(20_000.2, 2);
+      expect(after.summary.rawDifference).toBe(before.summary.rawDifference);
+      expect(after.unsupported).not.toContain(
+        'liabilities.current.customerAdvances',
+      );
+    });
+  });
+
   describe('unsupported categories', () => {
     it('reports every unsupported category as null, never as a summed 0', async () => {
       wireCleanFixture();
@@ -632,7 +664,6 @@ describe('BalanceSheetService', () => {
       expect(result.assets.nonCurrent.accumulatedDepreciation).toBeNull();
       expect(result.liabilities.current.taxPayable).toBeNull();
       expect(result.liabilities.current.accruedExpenses).toBeNull();
-      expect(result.liabilities.current.customerAdvances).toBeNull();
       expect(result.liabilities.nonCurrent.loans).toBeNull();
       expect(result.unsupported).toEqual(
         expect.arrayContaining([

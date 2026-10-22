@@ -26,6 +26,17 @@ import { generateTempPassword } from '../common/utils/generate-password';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
 import { isForeignKeyViolation } from '../common/utils/prisma-errors';
 
+// Invoiced but not yet completed. outstandingBalance only picks an invoice up
+// at COMPLETED, while payments count the moment they're recorded — so a
+// dealer who pays before completion would otherwise look like they hold the
+// whole payment as credit. These are added back for the balance shown.
+const BILLED_NOT_COMPLETED: OrderStatus[] = [
+  OrderStatus.APPROVED,
+  OrderStatus.PACKED,
+  OrderStatus.DELIVERED,
+];
+const ZERO = new Prisma.Decimal(0);
+
 const PASSWORD_SALT_ROUNDS = 10;
 
 @Injectable()
@@ -125,7 +136,48 @@ export class DealersService {
       this.prisma.dealer.count({ where }),
     ]);
 
-    return paginate(data, total, page, limit);
+    const pending = await this.pendingInvoiceTotals(data.map((d) => d.id));
+    const rows = data.map((dealer) => {
+      const pendingInvoices = pending.get(dealer.id) ?? ZERO;
+      return {
+        ...dealer,
+        pendingInvoices,
+        balance: dealer.outstandingBalance.add(pendingInvoices),
+      };
+    });
+    return {
+      ...paginate(rows, total, page, limit),
+      totals: await this.balanceTotals(),
+    };
+  }
+
+  /** Per dealer: invoice totals of orders billed but not yet completed. */
+  private async pendingInvoiceTotals(dealerIds: string[]) {
+    if (dealerIds.length === 0) return new Map<string, Prisma.Decimal>();
+    const sums = await this.prisma.order.groupBy({
+      by: ['dealerId'],
+      where: {
+        dealerId: { in: dealerIds },
+        status: { in: BILLED_NOT_COMPLETED },
+      },
+      _sum: { totalAmount: true },
+    });
+    return new Map(sums.map((s) => [s.dealerId, s._sum.totalAmount ?? ZERO]));
+  }
+
+  /** Across every dealer: what is owed to us, and what we hold as their credit. */
+  private async balanceTotals() {
+    const [row] = await this.prisma.$queryRaw<
+      { owed: Prisma.Decimal | null; credit: Prisma.Decimal | null }[]
+    >`
+      SELECT SUM(GREATEST(b, 0)) AS owed, SUM(GREATEST(-b, 0)) AS credit FROM (
+        SELECT d."outstandingBalance" + COALESCE((
+          SELECT SUM(o."totalAmount") FROM "Order" o
+          WHERE o."dealerId" = d.id AND o.status::text = ANY(${BILLED_NOT_COMPLETED}::text[])
+        ), 0) AS b
+        FROM "Dealer" d
+      ) t`;
+    return { owed: row?.owed ?? ZERO, credit: row?.credit ?? ZERO };
   }
 
   async findOne(id: string) {
@@ -145,8 +197,12 @@ export class DealersService {
         this.prisma.invoice.count({ where: { dealerId: id } }),
       ]);
 
+    const pendingInvoices =
+      (await this.pendingInvoiceTotals([id])).get(id) ?? ZERO;
     return {
       ...dealer,
+      pendingInvoices,
+      balance: dealer.outstandingBalance.add(pendingInvoices),
       summary: {
         totalOrders,
         totalInvoices,
@@ -340,6 +396,9 @@ export class DealersService {
 
           if (order.invoice) {
             await tx.payment.deleteMany({
+              where: { invoiceId: order.invoice.id },
+            });
+            await tx.dealerCreditUse.deleteMany({
               where: { invoiceId: order.invoice.id },
             });
             // Their undo history would only point at an invoice that's gone.

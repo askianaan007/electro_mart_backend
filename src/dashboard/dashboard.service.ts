@@ -12,6 +12,7 @@ import {
   startOfBusinessMonth,
 } from '../common/utils/business-date';
 import { sqlUtc } from '../common/utils/sql-time';
+import { invoiceDuesByDealer } from '../common/utils/dealer-wallet';
 
 // Cash figures (collections, cash flow) come from LiquidCashService's one
 // ledger: a cheque counts on the day it cleared, not the day it was written,
@@ -230,8 +231,8 @@ export class DashboardService {
       todaysOrders,
       pendingApprovals,
       outOfStockItems,
-      outstandingAgg,
-      outstandingByDealer,
+      duesByDealer,
+      dealerRows,
       recentOrders,
       monthlyRevenue,
       topProductsGrouped,
@@ -259,12 +260,12 @@ export class DashboardService {
         where: { status: OrderStatus.PENDING_APPROVAL },
       }),
       this.prisma.product.count({ where: { currentStock: { lte: 0 } } }),
-      this.prisma.dealer.aggregate({ _sum: { outstandingBalance: true } }),
+      // What dealers still owe on invoices — wallet credit isn't netted off
+      // and not-yet-completed invoices count (see invoiceDuesByDealer).
+      invoiceDuesByDealer(this.prisma),
       // Per-dealer breakdown backing the "Outstanding Payments" drill-down —
       // who actually owes money, not just the aggregate total.
       this.prisma.dealer.findMany({
-        where: { outstandingBalance: { gt: 0 } },
-        orderBy: { outstandingBalance: 'desc' },
         select: {
           id: true,
           businessName: true,
@@ -330,6 +331,19 @@ export class DashboardService {
       quantitySold: row.quantitySold,
     }));
 
+    // Same shape as before (outstandingBalance = what's owed), now from invoice dues.
+    const outstandingByDealer = dealerRows
+      .filter((dealer) => duesByDealer.has(dealer.id))
+      .map((dealer) => ({
+        ...dealer,
+        outstandingBalance: duesByDealer.get(dealer.id) as Prisma.Decimal,
+      }))
+      .sort((a, b) => b.outstandingBalance.comparedTo(a.outstandingBalance));
+    const totalOwed = [...duesByDealer.values()].reduce(
+      (sum, owed) => sum.add(owed),
+      new Prisma.Decimal(0),
+    );
+
     const todaysSales =
       Number(todaysSalesAgg._sum.totalAmount ?? 0) -
       Number(todaysReturnsAgg._sum.totalAmount ?? 0);
@@ -339,13 +353,13 @@ export class DashboardService {
       todaysOrders,
       pendingApprovals,
       outOfStockItems,
-      outstandingPayments: outstandingAgg._sum.outstandingBalance ?? 0,
+      outstandingPayments: totalOwed,
       outstandingByDealer,
       recentOrders,
       monthlyRevenue,
       topProducts,
       ...monthlyKpis,
-      invoiceDue: outstandingAgg._sum.outstandingBalance ?? 0,
+      invoiceDue: totalOwed,
       liquidCash: liquidCashSummary.balance,
       // All-time cleared dealer collections (cash/bank-transfer immediately,
       // cheque only once CLEARED) — same formula LiquidCashService already
