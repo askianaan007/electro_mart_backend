@@ -259,6 +259,25 @@ export class SerialLifecycleService {
     };
   }
 
+  /** shelfState().gap for every tracked product in one query; only those still missing serials. */
+  async missingCounts(
+    tx: Tx,
+  ): Promise<{ productId: string; missing: number }[]> {
+    return tx.$queryRaw<{ productId: string; missing: number }[]>`
+      SELECT id AS "productId", missing FROM (
+        SELECT p.id,
+          (p."currentStock"
+            + COALESCE((SELECT SUM(oi.quantity) FROM "OrderItem" oi
+                        JOIN "Order" o ON o.id = oi."orderId"
+                        WHERE oi."productId" = p.id
+                          AND o.status::text = ANY(${UNDELIVERED}::text[])), 0)
+            - (SELECT COUNT(*) FROM "ProductUnit" u
+               WHERE u."productId" = p.id
+                 AND u.status::text = ANY(${ON_SHELF}::text[])))::int AS missing
+        FROM "Product" p WHERE p."trackSerials" = true
+      ) t WHERE missing > 0`;
+  }
+
   /**
    * Wraps an existing stock-moving operation. Only products that are tracked
    * or already have units take part — for everything else this is a no-op
@@ -431,6 +450,13 @@ export class SerialLifecycleService {
         },
       })),
     );
+
+    // Registering a serial turns tracking on for the product (orders then ask
+    // for serials and coverage counts it). Never turns it off.
+    await tx.product.updateMany({
+      where: { id: params.productId, trackSerials: false },
+      data: { trackSerials: true },
+    });
 
     if (!params.skipShelfCheck)
       await this.assertShelfRoom(tx, params.productId);

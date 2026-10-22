@@ -69,6 +69,23 @@ export class ProductUnitsController {
     return this.productUnitsService.coverage(productId);
   }
 
+  @Get('product-units/missing')
+  @ApiOperation({
+    summary: 'Tracked products with pieces still without a serial (read only)',
+  })
+  missingCounts() {
+    return this.productUnitsService.missingCounts();
+  }
+
+  @Get('product-units/unlabelled/:productId')
+  @ApiOperation({
+    summary:
+      'Pieces of one product still without a serial, and the purchases they came from (read only)',
+  })
+  unlabelled(@Param('productId', ParseUUIDPipe) productId: string) {
+    return this.productUnitsService.unlabelled(productId);
+  }
+
   @Get('product-units/scan/:code')
   @Throttle({ default: { limit: 240, ttl: 60_000 } })
   @ApiOperation({
