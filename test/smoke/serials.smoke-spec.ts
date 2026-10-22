@@ -419,4 +419,217 @@ describe('serial tracking smoke (test copy)', () => {
       `smoke ${RUN}: ${after.size - before.size} new business rows, 0 pre-existing rows changed`,
     );
   });
+
+  it('buys two new products with unit barcodes, then sells one by its barcode', async () => {
+    const ok = async (t: request.Test, label: string) => {
+      const started = Date.now();
+      const res = await t;
+      console.log(`${label}: ${res.status} in ${Date.now() - started}ms`);
+      if (res.status >= 300) {
+        throw new Error(`${label} → ${res.status} ${JSON.stringify(res.body)}`);
+      }
+      return res.body;
+    };
+    const productRow = (id: string) =>
+      prisma.product.findUniqueOrThrow({ where: { id } });
+
+    const supplier = await ok(
+      call('post', '/suppliers', { name: `SMOKE Supplier B ${RUN}` }),
+      'supplier',
+    );
+    const dealer = await prisma.dealer.update({
+      where: { id: (await createDealer(prisma, `SMOKE Dealer B ${RUN}`)).id },
+      data: { unlimitedCredit: true },
+    });
+    // Created the plain way — tracking off, no barcode on the product itself.
+    const tv32 = await ok(
+      call('post', '/products', {
+        productCode: `SMOKE-32-${RUN}`,
+        name: `SMOKE Smart TV 32 ${RUN}`,
+        costPrice: 100,
+        wholesalePrice: 130,
+      }),
+      'product 32"',
+    );
+    const tv40 = await ok(
+      call('post', '/products', {
+        productCode: `SMOKE-40-${RUN}`,
+        name: `SMOKE Smart TV 40 ${RUN}`,
+        costPrice: 200,
+        wholesalePrice: 260,
+      }),
+      'product 40"',
+    );
+    expect(tv32.trackSerials).toBe(false);
+
+    const serials32 = Array.from({ length: 10 }, (_, i) => S(`T32-${i}`));
+    const serials40 = Array.from({ length: 5 }, (_, i) => S(`T40-${i}`));
+    await ok(
+      call('post', '/purchases', {
+        supplierId: supplier.id,
+        invoiceNumber: `SMOKE-PI-B-${RUN}`,
+        purchaseDate: new Date().toISOString(),
+        items: [
+          {
+            productId: tv32.id,
+            quantity: 10,
+            unitCost: 100,
+            serials: serials32,
+          },
+          {
+            productId: tv40.id,
+            quantity: 5,
+            unitCost: 200,
+            serials: serials40,
+          },
+        ],
+      }),
+      'purchase 10 + 5 with barcodes',
+    );
+
+    // Products and inventory reflect the purchase; registering turned tracking on.
+    for (const [product, qty] of [
+      [tv32, 10],
+      [tv40, 5],
+    ] as const) {
+      const row = await productRow(product.id);
+      expect(row.currentStock).toBe(qty);
+      expect(row.trackSerials).toBe(true);
+      expect(
+        await prisma.productUnit.count({
+          where: { productId: product.id, status: 'IN_STOCK' },
+        }),
+      ).toBe(qty);
+    }
+    const inventory = await ok(
+      call(
+        'get',
+        `/inventory?search=${encodeURIComponent(`SMOKE Smart TV 32 ${RUN}`)}`,
+      ),
+      'inventory',
+    );
+    expect(JSON.stringify(inventory)).toContain(tv32.id);
+
+    // The order screen resolves a scanned barcode to its unit and product …
+    const scanned = await ok(
+      call('get', `/product-units/scan/${encodeURIComponent(serials32[3])}`),
+      'scan',
+    );
+    expect(scanned.kind).toBe('UNIT');
+    expect(scanned.units[0].product.id).toBe(tv32.id);
+    expect(scanned.units[0].status).toBe('IN_STOCK');
+
+    // … and creates the order with that serial on the line.
+    const order = await ok(
+      call('post', '/orders', {
+        dealerId: dealer.id,
+        items: [{ productId: tv32.id, quantity: 1, serials: [serials32[3]] }],
+      }),
+      'order with scanned barcode',
+    );
+    const unit = await prisma.productUnit.findFirstOrThrow({
+      where: { serialKey: serials32[3].toUpperCase() },
+    });
+    expect(unit.status).toBe('ALLOCATED');
+    expect(unit.orderId).toBe(order.id);
+
+    const after = await rowHashes(prisma);
+    expect([...before].filter(([k, h]) => after.get(k) !== h)).toEqual([]);
+    console.log(
+      `smoke B ${RUN}: purchase → stock → scan → order OK, 0 pre-existing rows changed`,
+    );
+  });
+
+  it('buys without barcodes, then registers them later from the products page', async () => {
+    const ok = async (t: request.Test, label: string) => {
+      const res = await t;
+      console.log(`${label}: ${res.status}`);
+      if (res.status >= 300) {
+        throw new Error(`${label} → ${res.status} ${JSON.stringify(res.body)}`);
+      }
+      return res.body;
+    };
+    const refused = async (t: request.Test, label: string) => {
+      const res = await t;
+      console.log(`${label}: ${res.status} ${res.body?.message}`);
+      if (res.status < 400) throw new Error(`${label} should be refused`);
+    };
+    const supplier = await ok(
+      call('post', '/suppliers', { name: `SMOKE Supplier C ${RUN}` }),
+      'supplier',
+    );
+    const tv = await ok(
+      call('post', '/products', {
+        productCode: `SMOKE-50-${RUN}`,
+        name: `SMOKE Smart TV 50 ${RUN}`,
+        costPrice: 300,
+        wholesalePrice: 390,
+        trackSerials: true,
+      }),
+      'product 50" (tracked)',
+    );
+    const purchase = await ok(
+      call('post', '/purchases', {
+        supplierId: supplier.id,
+        invoiceNumber: `SMOKE-PI-C-${RUN}`,
+        purchaseDate: new Date().toISOString(),
+        items: [{ productId: tv.id, quantity: 4, unitCost: 300 }],
+      }),
+      'purchase 4 without barcodes',
+    );
+
+    const missing = await ok(call('get', '/product-units/missing'), 'missing');
+    expect(missing).toContainEqual({ productId: tv.id, missing: 4 });
+
+    const pending = await ok(
+      call('get', `/product-units/unlabelled/${tv.id}`),
+      'unlabelled',
+    );
+    expect(pending.missing).toBe(4);
+    expect(pending.purchases).toHaveLength(1);
+    expect(pending.purchases[0]).toMatchObject({
+      id: purchase.id,
+      room: 4,
+      supplierName: supplier.name,
+    });
+
+    // More than the room is refused and changes nothing.
+    await refused(
+      call('post', '/product-units', {
+        productId: tv.id,
+        purchaseId: purchase.id,
+        serials: [S('T50-a'), S('T50-b'), S('T50-c'), S('T50-d'), S('T50-e')],
+        idempotencyKey: randomUUID(),
+      }),
+      'register 5 into room for 4',
+    );
+    await ok(
+      call('post', '/product-units', {
+        productId: tv.id,
+        purchaseId: purchase.id,
+        serials: [S('T50-a'), S('T50-b'), S('T50-c')],
+        idempotencyKey: randomUUID(),
+      }),
+      'register 3 later',
+    );
+    const after3 = await ok(
+      call('get', `/product-units/unlabelled/${tv.id}`),
+      'unlabelled after 3',
+    );
+    expect(after3.missing).toBe(1);
+    expect(after3.purchases[0].room).toBe(1);
+    expect(
+      (await prisma.product.findUniqueOrThrow({ where: { id: tv.id } }))
+        .currentStock,
+    ).toBe(4);
+    expect(
+      await prisma.productUnit.count({
+        where: { productId: tv.id, purchaseId: purchase.id },
+      }),
+    ).toBe(3);
+
+    const after = await rowHashes(prisma);
+    expect([...before].filter(([k, h]) => after.get(k) !== h)).toEqual([]);
+    console.log(`smoke C ${RUN}: buy → missing badge → register later OK`);
+  });
 });

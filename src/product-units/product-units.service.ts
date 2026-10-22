@@ -1064,6 +1064,94 @@ export class ProductUnitsService {
     return rows;
   }
 
+  /** Tracked products with pieces still lacking a serial — for the products list badge. */
+  missingCounts() {
+    return this.lifecycle.missingCounts(this.prisma);
+  }
+
+  /**
+   * Pieces on the shelf without a serial, and which purchases still have room
+   * for one — so a barcode registered later keeps its supplier for warranty.
+   * Same room rule as register(); reports only.
+   */
+  async unlabelled(productId: string) {
+    const state = await this.lifecycle.shelfState(this.prisma, productId);
+    const items = await this.prisma.purchaseItem.findMany({
+      where: { productId, purchase: { cancelledAt: null } },
+      select: {
+        quantity: true,
+        purchase: {
+          select: {
+            id: true,
+            invoiceNumber: true,
+            purchaseDate: true,
+            supplier: { select: { name: true } },
+          },
+        },
+      },
+    });
+    const purchaseIds = [...new Set(items.map((i) => i.purchase.id))];
+    const [units, returned] = await Promise.all([
+      this.prisma.productUnit.groupBy({
+        by: ['purchaseId', 'status'],
+        where: { productId, purchaseId: { in: purchaseIds } },
+        _count: { _all: true },
+      }),
+      this.prisma.purchaseReturnItem.findMany({
+        where: {
+          productId,
+          purchaseReturn: { purchaseId: { in: purchaseIds } },
+        },
+        select: {
+          quantity: true,
+          purchaseReturn: { select: { purchaseId: true } },
+        },
+      }),
+    ]);
+
+    const purchases = purchaseIds.map((id) => {
+      const lines = items.filter((i) => i.purchase.id === id);
+      const quantity = lines.reduce((sum, i) => sum + i.quantity, 0);
+      const registered = units
+        .filter((u) => u.purchaseId === id)
+        .reduce((sum, u) => sum + u._count._all, 0);
+      const returnedWithSerial = units
+        .filter(
+          (u) =>
+            u.purchaseId === id &&
+            u.status === ProductUnitStatus.RETURNED_TO_SUPPLIER,
+        )
+        .reduce((sum, u) => sum + u._count._all, 0);
+      const returnedQty = returned
+        .filter((r) => r.purchaseReturn.purchaseId === id)
+        .reduce((sum, r) => sum + r.quantity, 0);
+      const { purchase } = lines[0];
+      return {
+        id,
+        invoiceNumber: purchase.invoiceNumber,
+        purchaseDate: purchase.purchaseDate,
+        supplierName: purchase.supplier.name,
+        quantity,
+        registered,
+        room: Math.max(
+          0,
+          quantity - registered - Math.max(0, returnedQty - returnedWithSerial),
+        ),
+      };
+    });
+
+    return {
+      productId,
+      name: state.name,
+      currentStock: state.currentStock,
+      /** Pieces held (shelf + undelivered orders) that still need a serial. */
+      missing: Math.max(0, state.gap),
+      purchases: purchases
+        .filter((p) => p.room > 0)
+        .sort((a, b) => +b.purchaseDate - +a.purchaseDate),
+    };
+  }
+
   // ---------------------------------------------------------------------
   // Unit corrections
   // ---------------------------------------------------------------------
