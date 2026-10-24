@@ -83,6 +83,7 @@ function withCurrentTime(date: Date): Date {
   return combined;
 }
 
+import { DealerWalletService } from '../dealer-wallet/dealer-wallet.service';
 @Injectable()
 export class OrdersService {
   constructor(
@@ -92,6 +93,7 @@ export class OrdersService {
     private mailer: MailerService,
     private serials: SerialLifecycleService,
     private productUnitsService: ProductUnitsService,
+    private wallet: DealerWalletService,
   ) {}
 
   private readonly orderInclude = {
@@ -631,6 +633,17 @@ export class OrdersService {
             );
           }
         }
+
+        if (dto.walletCredit && approved.savedOrder.invoice) {
+          await this.wallet.useCreditInTransaction(
+            tx,
+            approved.savedOrder.invoice.id,
+            dto.walletCredit,
+            requester.id,
+            `Used when order ${approved.savedOrder.orderNumber} was created`,
+            true,
+          );
+        }
         return approved;
       }, TRANSACTION_OPTIONS);
 
@@ -761,7 +774,7 @@ export class OrdersService {
       where: { id },
       include: {
         items: true,
-        invoice: { include: { payments: true } },
+        invoice: { include: { payments: true, creditUses: true } },
         salesReturns: true,
       },
     });
@@ -779,6 +792,11 @@ export class OrdersService {
     if (order.invoice.payments.length > 0) {
       throw new BadRequestException(
         "This order's invoice already has payments recorded and cannot be edited",
+      );
+    }
+    if (order.invoice.creditUses.length > 0) {
+      throw new BadRequestException(
+        "This order's invoice was paid with wallet credit — remove that credit from the invoice first",
       );
     }
 
@@ -1293,12 +1311,20 @@ export class OrdersService {
   async remove(id: string, adminId: string) {
     const order = await this.prisma.order.findUnique({
       where: { id },
-      include: { items: true, invoice: { include: { payments: true } } },
+      include: {
+        items: true,
+        invoice: { include: { payments: true, creditUses: true } },
+      },
     });
     if (!order) throw new NotFoundException('Order not found');
     if (order.invoice && order.invoice.payments.length > 0) {
       throw new BadRequestException(
         'This order has payments recorded against its invoice and cannot be deleted',
+      );
+    }
+    if (order.invoice && order.invoice.creditUses.length > 0) {
+      throw new BadRequestException(
+        'This order was paid with wallet credit — remove that credit from the invoice first',
       );
     }
 

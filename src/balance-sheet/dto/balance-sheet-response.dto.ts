@@ -44,7 +44,8 @@ export interface BalanceSheetResponse {
       refundChequesIssued: string;
       taxPayable: null;
       accruedExpenses: null;
-      customerAdvances: null;
+      /** Customer wallet money — extra paid, owed back until used or refunded. */
+      customerAdvances: string;
       totalCurrentLiabilities: string;
     };
     nonCurrent: {

@@ -28,6 +28,10 @@ import {
 } from '../common/utils/invoice-financials';
 import { assertChequeTransition } from '../common/utils/cheque-transitions';
 import {
+  assertWalletNotOverdrawn,
+  computeCreditUsed,
+} from '../common/utils/dealer-wallet';
+import {
   assertNotFutureBusinessDate,
   startOfBusinessDay,
   startOfNextBusinessDay,
@@ -217,10 +221,15 @@ export class PaymentsService {
       }
     }
 
-    const alreadyEffectivePaid = computeEffectivePaid(invoice.payments);
+    const alreadyEffectivePaid = computeEffectivePaid(invoice.payments).add(
+      await computeCreditUsed(tx, invoice.id),
+    );
     const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
     const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
-    if (alreadyEffectivePaid.add(amount).greaterThan(netGrandTotal)) {
+    // Money above what's due goes to the dealer's wallet — only when the
+    // admin said so, so a typo can't silently become credit.
+    const excess = alreadyEffectivePaid.add(amount).sub(netGrandTotal);
+    if (excess.greaterThan(0) && !dto.excessToWallet) {
       throw new BadRequestException(
         'Payment amount exceeds the outstanding invoice balance',
       );
@@ -266,9 +275,12 @@ export class PaymentsService {
       action: 'RECORDED_PAYMENT',
       targetId: payment.id,
       details:
-        dto.mode === 'CHEQUE'
+        (dto.mode === 'CHEQUE'
           ? `Cheque payment of ${amount.toString()} against invoice ${invoice.invoiceNumber} (${dto.bankName}, #${dto.chequeNumber})`
-          : `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`,
+          : `Payment of ${amount.toString()} against invoice ${invoice.invoiceNumber}`) +
+        (excess.greaterThan(0)
+          ? ` — ${excess.toString()} over the balance, added to the dealer's wallet`
+          : ''),
     });
 
     return payment;
@@ -308,11 +320,13 @@ export class PaymentsService {
           : ChequeStatus.PENDING
         : null;
 
-      await this.assertFitsInvoice(tx, payment.invoice, id, {
-        amount,
-        mode: dto.mode,
-        chequeStatus,
-      });
+      await this.assertFitsInvoice(
+        tx,
+        payment.invoice,
+        id,
+        { amount, mode: dto.mode, chequeStatus },
+        !!dto.excessToWallet,
+      );
 
       const revision = await this.recordRevision(
         tx,
@@ -348,6 +362,7 @@ export class PaymentsService {
         before: payment,
         after: updated,
       });
+      await assertWalletNotOverdrawn(tx, payment.dealerId);
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -393,6 +408,7 @@ export class PaymentsService {
         before: payment,
         after: null,
       });
+      await assertWalletNotOverdrawn(tx, payment.dealerId);
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -422,6 +438,7 @@ export class PaymentsService {
     paymentId: string,
     status: 'CLEARED' | 'RETURNED' | 'PENDING',
     adminId: string,
+    excessToWallet = false,
   ) {
     const existing = await this.prisma.payment.findUnique({
       where: { id: paymentId },
@@ -449,12 +466,17 @@ export class PaymentsService {
         payment.chequeStatusUpdatedAt,
       );
 
+      // A re-presented cheque that would now overpay (the invoice was paid
+      // some other way meanwhile) is refused unless the admin confirms the
+      // extra goes to the dealer's wallet — never moved there silently.
       if (!isEffectivePayment(payment)) {
-        await this.assertFitsInvoice(tx, payment.invoice, paymentId, {
-          amount: payment.amount,
-          mode: payment.mode,
-          chequeStatus: status,
-        });
+        await this.assertFitsInvoice(
+          tx,
+          payment.invoice,
+          paymentId,
+          { amount: payment.amount, mode: payment.mode, chequeStatus: status },
+          excessToWallet,
+        );
       }
 
       const revision = await this.recordRevision(
@@ -473,6 +495,11 @@ export class PaymentsService {
         before: payment,
         after: updated,
       });
+      // A bounce is what the bank did — record it even if the wallet credit
+      // it funded was already spent (the wallet then shows as overdrawn).
+      if (status !== 'RETURNED') {
+        await assertWalletNotOverdrawn(tx, payment.dealerId);
+      }
 
       await this.activityLogService.log(tx, {
         adminId,
@@ -549,7 +576,23 @@ export class PaymentsService {
         );
       }
 
-      await this.assertFitsInvoice(tx, invoice, paymentId, restored);
+      // Undo puts back a state that was already accepted — including an
+      // overpayment the admin sent to the wallet — so it may exceed the
+      // balance only if nothing else on the invoice changed since. Otherwise
+      // (paid another way meanwhile) it's checked like a new payment.
+      const untouchedSince = await this.invoiceUnchangedSince(
+        tx,
+        invoice,
+        paymentId,
+        revision.createdAt,
+      );
+      await this.assertFitsInvoice(
+        tx,
+        invoice,
+        paymentId,
+        restored,
+        untouchedSince,
+      );
 
       // The undo is itself a dated change: keep the state it replaces, so
       // Liquid Cash history shows the undo on the day it happened instead of
@@ -605,6 +648,7 @@ export class PaymentsService {
         before: current,
         after: result,
       });
+      await assertWalletNotOverdrawn(tx, restored.dealerId);
 
       await tx.paymentRevision.update({
         where: { id: revision.id },
@@ -677,6 +721,39 @@ export class PaymentsService {
     return paginate(data, total, page, limit);
   }
 
+  /** No other payment, payment change, wallet credit or return on the invoice after `since`. */
+  private async invoiceUnchangedSince(
+    tx: Prisma.TransactionClient,
+    invoice: Invoice,
+    paymentId: string,
+    since: Date,
+  ) {
+    const after = { gt: since };
+    const [payments, revisions, credits, returns] = await Promise.all([
+      tx.payment.count({
+        where: {
+          invoiceId: invoice.id,
+          id: { not: paymentId },
+          createdAt: after,
+        },
+      }),
+      tx.paymentRevision.count({
+        where: {
+          invoiceId: invoice.id,
+          paymentId: { not: paymentId },
+          createdAt: after,
+        },
+      }),
+      tx.dealerCreditUse.count({
+        where: { invoiceId: invoice.id, createdAt: after },
+      }),
+      tx.salesReturn.count({
+        where: { orderId: invoice.orderId, createdAt: after },
+      }),
+    ]);
+    return payments + revisions + credits + returns === 0;
+  }
+
   /**
    * Rejects a payment state that, if it counts towards the invoice, would
    * take the invoice's effective paid total past its net (post-returns)
@@ -687,19 +764,27 @@ export class PaymentsService {
     invoice: Invoice,
     paymentId: string,
     state: PaymentEffect,
+    /** The excess goes to the dealer's wallet instead of being refused. */
+    allowExcess = false,
   ) {
-    if (!isEffectivePayment(state)) return;
+    if (allowExcess || !isEffectivePayment(state)) return;
     const others = await tx.payment.findMany({
       where: { invoiceId: invoice.id, id: { not: paymentId } },
     });
     const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
     const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
+    const credit = await computeCreditUsed(tx, invoice.id);
     if (
-      computeEffectivePaid(others).add(state.amount).greaterThan(netGrandTotal)
+      computeEffectivePaid(others)
+        .add(credit)
+        .add(state.amount)
+        .greaterThan(netGrandTotal)
     ) {
-      throw new BadRequestException(
-        'Payment amount exceeds the outstanding invoice balance',
-      );
+      // `error` lets the client offer "add the extra to the wallet" and resend.
+      throw new BadRequestException({
+        error: 'EXCEEDS_INVOICE_BALANCE',
+        message: 'Payment amount exceeds the outstanding invoice balance',
+      });
     }
   }
 
@@ -792,7 +877,7 @@ export class PaymentsService {
       this.prisma.payment.findMany({
         where,
         include: {
-          invoice: { include: { payments: true } },
+          invoice: { include: { payments: true, creditUses: true } },
           dealer: { omit: { password: true } },
         },
         // 'chequeDate' surfaces the soonest-to-deposit cheque first (upcoming
@@ -845,7 +930,7 @@ export class PaymentsService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.payment.findMany({
         where,
-        include: { invoice: { include: { payments: true } } },
+        include: { invoice: { include: { payments: true, creditUses: true } } },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -860,7 +945,7 @@ export class PaymentsService {
     const payment = await this.prisma.payment.findUnique({
       where: { id },
       include: {
-        invoice: { include: { payments: true } },
+        invoice: { include: { payments: true, creditUses: true } },
         dealer: { omit: { password: true } },
       },
     });

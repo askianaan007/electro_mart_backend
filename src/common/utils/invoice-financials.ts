@@ -69,7 +69,14 @@ export async function recomputeInvoicePaymentStatus(
     where: { id: invoiceId },
   });
   const payments = await tx.payment.findMany({ where: { invoiceId } });
-  const effectivePaid = computeEffectivePaid(payments);
+  // Wallet credit spent on this invoice pays it just like money does.
+  const credit = await tx.dealerCreditUse.aggregate({
+    where: { invoiceId },
+    _sum: { amount: true },
+  });
+  const effectivePaid = computeEffectivePaid(payments).add(
+    credit._sum.amount ?? ZERO,
+  );
   const returnedAmount = await computeReturnedAmount(tx, invoice.orderId);
   const netGrandTotal = invoice.grandTotal.sub(returnedAmount);
 

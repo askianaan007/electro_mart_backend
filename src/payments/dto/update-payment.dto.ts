@@ -1,6 +1,12 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { PaymentMode } from '@prisma/client';
-import { IsDateString, IsEnum, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsDateString,
+  IsEnum,
+  IsOptional,
+  IsString,
+} from 'class-validator';
 import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 
 export class UpdatePaymentDto {
@@ -51,4 +57,12 @@ export class UpdatePaymentDto {
   @IsOptional()
   @IsString()
   remarks?: string;
+
+  @ApiPropertyOptional({
+    description:
+      "Accept an amount above what's due on the invoice: the excess goes to the dealer's wallet for later purchases",
+  })
+  @IsOptional()
+  @IsBoolean()
+  excessToWallet?: boolean;
 }

@@ -162,6 +162,7 @@ model Admin {
   purchaseReturnReplacements PurchaseReturnReplacement[]
   cashAdjustments            CashAdjustment[]
   refunds                    Refund[]
+  dealerCreditUses           DealerCreditUse[]
 }
 
 model Dealer {
@@ -195,6 +196,7 @@ model Dealer {
   payments              Payment[]
   salesReturns          SalesReturn[]
   refunds               Refund[]
+  creditUses            DealerCreditUse[]
   customerProfile       CustomerProfile?
   notes                 CustomerNote[]
   drafts                RepOrderDraft[]
@@ -531,6 +533,7 @@ model Invoice {
 
   payments              Payment[]
   collectionSubmissions CollectionSubmission[]
+  creditUses            DealerCreditUse[]
 
   @@index([dealerId])
   @@index([paymentStatus])
@@ -572,6 +575,28 @@ model Payment {
   @@index([dealerId])
   @@index([paymentDate])
   @@index([chequeStatusUpdatedAt])
+}
+
+// Wallet credit a dealer spent on an invoice. The wallet itself isn't stored:
+// it is what the dealer paid above their invoices (overpayments, returns on
+// paid invoices) minus these uses and refunds — see dealer-wallet.ts. A use
+// counts toward the invoice like a payment but is not money received, so it
+// never touches Liquid Cash or outstandingBalance (the overpayment already
+// lowered that when the money came in).
+model DealerCreditUse {
+  id        String   @id @default(uuid())
+  dealerId  String
+  dealer    Dealer   @relation(fields: [dealerId], references: [id], onDelete: Restrict)
+  invoiceId String
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  amount    Decimal
+  note      String?
+  adminId   String
+  admin     Admin    @relation(fields: [adminId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  @@index([dealerId])
+  @@index([invoiceId])
 }
 
 // Undo history for admin corrections on the Payments screen. Every edit,

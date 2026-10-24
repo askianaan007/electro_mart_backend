@@ -63,6 +63,7 @@ function requireChequeDetails(dto: {
   }
 }
 
+import { computeDealerWallet } from '../common/utils/dealer-wallet';
 /**
  * Money returned to a party that holds a credit (LC-12):
  *
@@ -537,7 +538,13 @@ export class RefundsService {
   ): Promise<Prisma.Decimal> {
     const dealer = await client.dealer.findUnique({ where: { id: dealerId } });
     if (!dealer) throw new NotFoundException('Dealer not found');
-    return Prisma.Decimal.max(0, dealer.outstandingBalance.neg());
+    // Also capped by the wallet, so credit already spent on an invoice (or
+    // paid by a cheque that hasn't cleared) can't be paid out a second time.
+    const wallet = await computeDealerWallet(client, dealerId);
+    return Prisma.Decimal.min(
+      Prisma.Decimal.max(0, dealer.outstandingBalance.neg()),
+      wallet.available,
+    );
   }
 
   private async supplierCredit(

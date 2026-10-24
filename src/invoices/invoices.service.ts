@@ -21,12 +21,14 @@ export class InvoicesService {
   private readonly invoiceListInclude = {
     dealer: { omit: { password: true } },
     payments: true,
+    creditUses: { orderBy: { createdAt: 'asc' } },
   } satisfies Prisma.InvoiceInclude;
 
   private readonly invoiceDetailInclude = {
     order: { include: { items: { include: { product: true } } } },
     dealer: { omit: { password: true } },
     payments: true,
+    creditUses: { orderBy: { createdAt: 'asc' } },
   } satisfies Prisma.InvoiceInclude;
 
   constructor(

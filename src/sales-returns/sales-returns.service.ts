@@ -27,6 +27,7 @@ type TransactionClient = Prisma.TransactionClient;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+import { assertWalletNotOverdrawn } from '../common/utils/dealer-wallet';
 @Injectable()
 export class SalesReturnsService {
   constructor(
@@ -231,6 +232,8 @@ export class SalesReturnsService {
           },
         },
       });
+      // A smaller return can take back wallet credit the dealer already spent.
+      await assertWalletNotOverdrawn(tx, order.dealerId);
 
       await this.serials.applySalesReturnUnits(tx, {
         order: await this.serials.loadOrderContext(tx, order.id),
@@ -300,6 +303,7 @@ export class SalesReturnsService {
       if (order.invoice) {
         await recomputeInvoicePaymentStatus(tx, order.invoice.id);
       }
+      await assertWalletNotOverdrawn(tx, order.dealerId);
 
       await shelfGuard.assert();
 

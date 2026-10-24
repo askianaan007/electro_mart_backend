@@ -1,5 +1,5 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsIn } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsBoolean, IsIn, IsOptional } from 'class-validator';
 
 export class UpdatePaymentChequeStatusDto {
   @ApiProperty({
@@ -8,4 +8,12 @@ export class UpdatePaymentChequeStatusDto {
   })
   @IsIn(['CLEARED', 'RETURNED', 'PENDING'])
   status: 'CLEARED' | 'RETURNED' | 'PENDING';
+
+  @ApiPropertyOptional({
+    description:
+      'Re-presenting a returned cheque that now pays more than is due: put the extra in the dealer wallet instead of refusing.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  excessToWallet?: boolean;
 }
