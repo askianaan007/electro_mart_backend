@@ -423,3 +423,5 @@ If designing in stages, build in this order — it matches how a dealer's first 
 npx prisma migrate reset  
 npx prisma                                
 npx prisma studio  
+npx prisma migrate status
+npx prisma migrate deploy
