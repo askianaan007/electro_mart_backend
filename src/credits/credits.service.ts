@@ -346,6 +346,7 @@ export class CreditsService {
             dto.mode === 'CHEQUE' && dto.chequeDepositDate
               ? new Date(dto.chequeDepositDate)
               : undefined,
+          bankName: dto.mode === 'CHEQUE' ? dto.bankName?.trim() || null : null,
           remarks: dto.remarks,
         },
       });

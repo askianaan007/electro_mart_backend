@@ -633,6 +633,8 @@ model SupplierPayment {
   chequeStatusUpdatedAt DateTime?
   chequeDepositDate     DateTime?
   chequeReminderSentAt  DateTime?
+  // Cheque settlements only; null on rows recorded before it existed.
+  bankName              String?
   remarks               String?
   createdAt             DateTime      @default(now())
 

@@ -62,7 +62,7 @@ export const CHEQUE_TRANSITIONS: Record<
 };
 
 /** Kinds whose revert to PENDING is only a short mistake-correction window. */
-const REVERT_WINDOW_MS: Partial<Record<ChequeKind, number>> = {
+export const REVERT_WINDOW_MS: Partial<Record<ChequeKind, number>> = {
   SUPPLIER: 24 * 60 * 60 * 1000,
   INVESTMENT: 24 * 60 * 60 * 1000,
   REFUND_PAID: 24 * 60 * 60 * 1000,
