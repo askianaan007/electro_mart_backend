@@ -43,6 +43,7 @@ import { DealerWalletModule } from './dealer-wallet/dealer-wallet.module';
 import { CashAdjustmentsModule } from './cash-adjustments/cash-adjustments.module';
 import { ProductUnitsModule } from './product-units/product-units.module';
 
+import { ChequeFlowModule } from './cheque-flow/cheque-flow.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, validate }),
@@ -84,6 +85,7 @@ import { ProductUnitsModule } from './product-units/product-units.module';
     DealerWalletModule,
     CashAdjustmentsModule,
     ProductUnitsModule,
+    ChequeFlowModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
