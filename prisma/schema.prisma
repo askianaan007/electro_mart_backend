@@ -1356,3 +1356,70 @@ model SerialRequest {
 
   @@index([adminId, createdAt])
 }
+
+// ---------------------------------------------------------------------------
+// Cheque Flow — a planning register of customer cheques to receive and
+// supplier cheques to pay. Standalone on purpose: nothing here touches
+// payments, balances, Liquid Cash or the balance sheet, and no existing table
+// references these (admin ids are plain strings, not foreign keys).
+// ---------------------------------------------------------------------------
+
+enum ChequeFlowDirection {
+  RECEIVABLE // customer cheque to receive
+  PAYABLE // supplier cheque to pay
+}
+
+enum ChequeFlowStatus {
+  PENDING
+  CLEARED
+  BOUNCED
+  CANCELLED
+}
+
+model ChequeFlowEntry {
+  id            String              @id @default(uuid())
+  direction     ChequeFlowDirection
+  /// Text, so leading zeros survive ("000718").
+  chequeNumber  String?
+  /// Duplicate key: letters/digits only, upper-case, leading zeros dropped; "" when there is no number.
+  chequeKey     String              @default("")
+  bankName      String
+  bankKey       String
+  chequeDate    DateTime            @db.Date
+  partyName     String
+  partyKey      String
+  invoiceRef    String?
+  amount        Decimal             @db.Decimal(14, 2)
+  status        ChequeFlowStatus    @default(PENDING)
+  clearedDate   DateTime?           @db.Date
+  remarks       String?
+  importBatchId String?
+  importBatch   ChequeFlowImport?   @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+  createdById   String
+  updatedById   String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  /// Soft delete — a deleted cheque can be restored.
+  deletedAt     DateTime?
+  deletedById   String?
+
+  @@index([chequeDate])
+  @@index([direction, status, chequeDate])
+  @@index([direction, bankKey, chequeKey])
+  @@index([partyKey])
+  @@index([importBatchId])
+}
+
+model ChequeFlowImport {
+  id        String            @id @default(uuid())
+  /// Sent by the client once per import, so a double submit can't import twice.
+  importKey String            @unique
+  fileName  String
+  adminId   String
+  mapping   Json
+  inserted  Int
+  skipped   Int
+  undoneAt  DateTime?
+  createdAt DateTime          @default(now())
+  entries   ChequeFlowEntry[]
+}
