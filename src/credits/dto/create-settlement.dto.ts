@@ -6,6 +6,7 @@ import {
   IsEnum,
   IsOptional,
   IsString,
+  MaxLength,
 } from 'class-validator';
 import { IsMoneyAmount } from '../../common/decorators/is-money-amount.decorator';
 
@@ -34,6 +35,14 @@ export class CreateSettlementDto {
   @IsOptional()
   @IsDateString()
   chequeDepositDate?: string;
+
+  @ApiPropertyOptional({
+    description: 'Cheque settlements: the bank the cheque is drawn on',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  bankName?: string;
 
   @ApiPropertyOptional()
   @IsOptional()

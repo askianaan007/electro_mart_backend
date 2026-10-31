@@ -4,6 +4,7 @@ import { Transform } from 'class-transformer';
 import {
   IsArray,
   IsEnum,
+  IsIn,
   IsOptional,
   IsString,
   Matches,
@@ -23,7 +24,23 @@ const toList = ({ value }: { value: unknown }) =>
     .map((v) => String(v).trim())
     .filter(Boolean);
 
+export const CHEQUE_FLOW_SOURCES = [
+  'MANUAL',
+  'PAYMENT',
+  'SETTLEMENT',
+  'REFUND',
+] as const;
+
 export class ChequeFlowFiltersDto {
+  @ApiPropertyOptional({
+    enum: CHEQUE_FLOW_SOURCES,
+    description:
+      'Where the cheque was recorded: MANUAL (this page), PAYMENT (Payments), SETTLEMENT (Credits), REFUND (Refunds)',
+  })
+  @IsOptional()
+  @IsIn(CHEQUE_FLOW_SOURCES)
+  source?: (typeof CHEQUE_FLOW_SOURCES)[number];
+
   @ApiPropertyOptional({ enum: ChequeFlowDirection })
   @IsOptional()
   @IsEnum(ChequeFlowDirection)

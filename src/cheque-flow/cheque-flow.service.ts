@@ -42,6 +42,26 @@ import {
   toDateOnly,
   today,
 } from './cheque-flow.utils';
+import {
+  ChequeFlowSource,
+  DayRange,
+  FlowRow,
+  LinkedKey,
+  SOURCE_LABEL,
+  findLinked,
+  fromEntry,
+  loadLinked,
+  loadLinkedKeys,
+} from './cheque-flow.sources';
+
+/** One row as a groupBy-shaped value for summarise() / buildTimeline(). */
+const asGroup = (r: FlowRow) => ({
+  direction: r.direction,
+  status: r.status,
+  chequeDate: r.chequeDate,
+  _sum: { amount: r.amount },
+  _count: { _all: 1 },
+});
 
 /** Every register write takes this lock, so two saves can't both pass the duplicate check. */
 const WRITE_LOCK = 7_342_001;
@@ -59,6 +79,18 @@ export type DueState = 'overdue' | 'today' | 'soon' | null;
 
 export interface ChequeFlowItem {
   id: string;
+  source: ChequeFlowSource;
+  /** The id in the source's own table (the entry id for MANUAL). */
+  sourceId: string;
+  sourceLabel: string;
+  /** e.g. "Refund to customer", "Advance payment". */
+  kindLabel: string | null;
+  /** Page where a linked cheque is edited or deleted. */
+  link: string | null;
+  /** Statuses it may move to now, by its source's rules. */
+  allowedStatuses: ChequeFlowStatus[];
+  /** Manual row that is also recorded in Payments/Credits/Refunds — not counted. */
+  duplicateOf: { source: ChequeFlowSource; id: string; label: string } | null;
   direction: ChequeFlowDirection;
   chequeNumber: string | null;
   bankName: string;
@@ -102,10 +134,17 @@ export interface ImportRowResult {
   errors: string[];
   warnings: string[];
   /** Where the duplicate already is. */
-  duplicateOf?: 'register' | 'file';
+  duplicateOf?: 'register' | 'file' | 'linked';
   entry?: Omit<
     ChequeFlowItem,
     | 'id'
+    | 'source'
+    | 'sourceId'
+    | 'sourceLabel'
+    | 'kindLabel'
+    | 'link'
+    | 'allowedStatuses'
+    | 'duplicateOf'
     | 'importBatchId'
     | 'createdAt'
     | 'updatedAt'
@@ -156,58 +195,85 @@ export class ChequeFlowService {
   // Reads
   // ---------------------------------------------------------------------
 
+  /**
+   * Every cheque with a date in `range`, from the register and from
+   * Payments / Credits / Refunds, filtered and sorted by date. A manual row
+   * that duplicates an ERP cheque is flagged (duplicateOf) and must be left
+   * out of totals by the caller.
+   */
+  private async collect(
+    range: DayRange,
+    filters: ChequeFlowFiltersDto,
+  ): Promise<FlowRow[]> {
+    const db: Prisma.TransactionClient = this.prisma;
+    const now = today();
+    const wantManual = !filters.source || filters.source === 'MANUAL';
+    const [entries, linked, keys] = await Promise.all([
+      wantManual
+        ? db.chequeFlowEntry.findMany({
+            where: {
+              deletedAt: null,
+              ...((range.gte || range.lt) && { chequeDate: range }),
+            },
+          })
+        : Promise.resolve<ChequeFlowEntry[]>([]),
+      filters.source === 'MANUAL'
+        ? Promise.resolve<FlowRow[]>([])
+        : loadLinked(db, range, now),
+      wantManual ? loadLinkedKeys(db) : Promise.resolve<LinkedKey[]>([]),
+    ]);
+    const manual = entries.map((entry) => {
+      const row = fromEntry(entry);
+      const twin = findLinked(keys, row);
+      return twin
+        ? { ...row, duplicateOf: { source: twin.source, id: twin.id } }
+        : row;
+    });
+    return [...manual, ...linked]
+      .filter((row) => this.matches(row, filters))
+      .sort(
+        (a, b) =>
+          a.chequeDate.getTime() - b.chequeDate.getTime() ||
+          a.createdAt.getTime() - b.createdAt.getTime(),
+      );
+  }
+
   /** Entries for a month (or all months) with their summary and, for a month, the date-wise timeline. */
   async list(query: QueryChequeFlowDto) {
-    const where = this.where(query, query.month);
-    const [rows, groups, pendingByDay] = await Promise.all([
-      this.prisma.chequeFlowEntry.findMany({
-        where,
-        orderBy: [{ chequeDate: 'asc' }, { createdAt: 'asc' }],
-        take: MAX_LIST_ROWS + 1,
-      }),
-      this.prisma.chequeFlowEntry.groupBy({
-        by: ['direction', 'status'],
-        where,
-        _sum: { amount: true },
-        _count: { _all: true },
-      }),
-      query.month
-        ? this.prisma.chequeFlowEntry.groupBy({
-            by: ['direction', 'chequeDate'],
-            where: { AND: [where, { status: 'PENDING' }] },
-            _sum: { amount: true },
-          })
-        : Promise.resolve([]),
-    ]);
+    const rows = await this.collect(
+      query.month ? monthRange(query.month) : {},
+      query,
+    );
+    const counted = rows.filter((r) => !r.duplicateOf);
     const now = today();
     return {
       month: query.month ?? null,
       today: dayOf(now),
       filtered: this.isFiltered(query),
       truncated: rows.length > MAX_LIST_ROWS,
+      duplicates: rows.length - counted.length,
       entries: rows.slice(0, MAX_LIST_ROWS).map((row) => this.toItem(row, now)),
-      summary: summarise(groups),
-      timeline: buildTimeline(pendingByDay),
+      summary: summarise(counted.map(asGroup)),
+      timeline: query.month
+        ? buildTimeline(
+            counted.filter((r) => r.status === 'PENDING').map(asGroup),
+          )
+        : [],
     };
   }
 
   /**
    * Pending cheques that are overdue, due today or due within 7 days — across
-   * every month and ignoring filters, so nothing late is hidden by the month
-   * being looked at.
+   * every month and every source, ignoring filters, so nothing late is hidden
+   * by the month being looked at.
    */
   async alerts() {
     const now = today();
-    const rows = await this.prisma.chequeFlowEntry.findMany({
-      where: {
-        deletedAt: null,
-        status: 'PENDING',
-        chequeDate: { lte: addDays(now, SOON_DAYS) },
-      },
-      orderBy: [{ chequeDate: 'asc' }, { createdAt: 'asc' }],
-      take: 1000,
-    });
-    const items = rows.map((row) => this.toItem(row, now));
+    const rows = await this.collect({ lt: addDays(now, SOON_DAYS + 1) }, {});
+    const items = rows
+      .filter((r) => r.status === 'PENDING' && !r.duplicateOf)
+      .slice(0, 1000)
+      .map((row) => this.toItem(row, now));
     const total = (state: DueState, direction: ChequeFlowDirection) =>
       items
         .filter((i) => i.dueState === state && i.direction === direction)
@@ -246,20 +312,10 @@ export class ChequeFlowService {
         `Pick at most ${MAX_CHART_MONTHS} months for the chart`,
       );
     }
-    const where: Prisma.ChequeFlowEntryWhereInput = {
-      AND: [
-        this.where(query),
-        {
-          chequeDate: { gte: monthRange(from).gte, lt: monthRange(to).lt },
-          status: { in: ['PENDING', 'CLEARED'] },
-        },
-      ],
-    };
-    const groups = await this.prisma.chequeFlowEntry.groupBy({
-      by: ['direction', 'status', 'chequeDate'],
-      where,
-      _sum: { amount: true },
-    });
+    const rows = await this.collect(
+      { gte: monthRange(from).gte, lt: monthRange(to).lt },
+      query,
+    );
     const zero = () => new Prisma.Decimal(0);
     const byMonth = new Map(
       months.map((m) => [
@@ -272,19 +328,20 @@ export class ChequeFlowService {
         },
       ]),
     );
-    for (const g of groups) {
-      const bucket = byMonth.get(monthOf(g.chequeDate));
+    for (const row of rows) {
+      if (row.duplicateOf) continue;
+      if (row.status !== 'PENDING' && row.status !== 'CLEARED') continue;
+      const bucket = byMonth.get(monthOf(row.chequeDate));
       if (!bucket) continue;
-      const amount = g._sum.amount ?? zero();
       const key =
-        g.direction === 'RECEIVABLE'
-          ? g.status === 'CLEARED'
+        row.direction === 'RECEIVABLE'
+          ? row.status === 'CLEARED'
             ? 'receiptsCleared'
             : 'receiptsPending'
-          : g.status === 'CLEARED'
+          : row.status === 'CLEARED'
             ? 'paymentsCleared'
             : 'paymentsPending';
-      bucket[key] = bucket[key].add(amount);
+      bucket[key] = bucket[key].add(row.amount);
     }
     return {
       from,
@@ -309,19 +366,10 @@ export class ChequeFlowService {
     };
   }
 
-  /** Values for the filter and autocomplete lists. Reads dealer/supplier names only. */
+  /** Values for the filter and autocomplete lists, from every source. */
   async options() {
-    const [banks, parties, dealers, suppliers] = await Promise.all([
-      this.prisma.chequeFlowEntry.groupBy({
-        by: ['bankKey', 'bankName'],
-        where: { deletedAt: null },
-        _count: { _all: true },
-      }),
-      this.prisma.chequeFlowEntry.groupBy({
-        by: ['direction', 'partyKey', 'partyName'],
-        where: { deletedAt: null },
-        _count: { _all: true },
-      }),
+    const [rows, dealers, suppliers] = await Promise.all([
+      this.collect({}, {}),
       this.prisma.dealer.findMany({
         select: { businessName: true },
         orderBy: { businessName: 'asc' },
@@ -334,45 +382,41 @@ export class ChequeFlowService {
       }),
     ]);
     // One spelling per key — the one used most.
-    const pick = <T extends { _count: { _all: number } }>(
-      rows: T[],
-      keyOf: (r: T) => string,
-      nameOf: (r: T) => string,
-    ) => {
-      const best = new Map<string, T>();
-      for (const row of rows) {
-        const current = best.get(keyOf(row));
-        if (!current || row._count._all > current._count._all) {
-          best.set(keyOf(row), row);
-        }
+    const pick = (values: { key: string; name: string }[]) => {
+      const counts = new Map<string, Map<string, number>>();
+      for (const { key, name } of values) {
+        if (!key) continue;
+        const names = counts.get(key) ?? new Map<string, number>();
+        names.set(name, (names.get(name) ?? 0) + 1);
+        counts.set(key, names);
       }
-      return [...best.values()].map(nameOf).sort((a, b) => a.localeCompare(b));
+      return [...counts.values()]
+        .map((names) => [...names.entries()].sort((a, b) => b[1] - a[1])[0][0])
+        .sort((a, b) => a.localeCompare(b));
     };
     const side = (direction: ChequeFlowDirection) =>
       pick(
-        parties.filter((p) => p.direction === direction),
-        (p) => p.partyKey,
-        (p) => p.partyName,
+        rows
+          .filter((r) => r.direction === direction)
+          .map((r) => ({ key: r.partyKey, name: r.partyName })),
       );
     const merge = (used: string[], known: string[]) => {
       const keys = new Set(used.map(nameKey));
       return [...used, ...known.filter((n) => !keys.has(nameKey(n)))];
     };
+    const customers = side('RECEIVABLE');
+    const payees = side('PAYABLE');
     return {
-      banks: pick(
-        banks,
-        (b) => b.bankKey,
-        (b) => b.bankName,
-      ),
-      customers: side('RECEIVABLE'),
-      suppliers: side('PAYABLE'),
+      banks: pick(rows.map((r) => ({ key: r.bankKey, name: r.bankName }))),
+      customers,
+      suppliers: payees,
       // For autocomplete only: names already used come first.
       customerSuggestions: merge(
-        side('RECEIVABLE'),
+        customers,
         dealers.map((d) => d.businessName),
       ),
       supplierSuggestions: merge(
-        side('PAYABLE'),
+        payees,
         suppliers.map((s) => s.name),
       ),
     };
@@ -383,7 +427,7 @@ export class ChequeFlowService {
       where: { id, deletedAt: null },
     });
     if (!row) throw new NotFoundException('Cheque not found');
-    return this.toItem(row, today());
+    return this.toItem(fromEntry(row), today());
   }
 
   // ---------------------------------------------------------------------
@@ -399,7 +443,7 @@ export class ChequeFlowService {
         data: { ...clean, createdById: adminId },
       });
       await this.log(tx, adminId, 'CREATED_CHEQUE_FLOW', row, 'Added');
-      return this.toItem(row, today());
+      return this.toItem(fromEntry(row), today());
     }, TRANSACTION_OPTIONS);
   }
 
@@ -447,7 +491,7 @@ export class ChequeFlowService {
         data: { ...clean, updatedById: adminId },
       });
       await this.log(tx, adminId, 'UPDATED_CHEQUE_FLOW', row, 'Edited');
-      return this.toItem(row, today());
+      return this.toItem(fromEntry(row), today());
     }, TRANSACTION_OPTIONS);
   }
 
@@ -479,7 +523,7 @@ export class ChequeFlowService {
         row,
         `Status ${existing.status} → ${dto.status}`,
       );
-      return this.toItem(row, today());
+      return this.toItem(fromEntry(row), today());
     }, TRANSACTION_OPTIONS);
   }
 
@@ -511,7 +555,7 @@ export class ChequeFlowService {
         data: { deletedAt: null, deletedById: null, updatedById: adminId },
       });
       await this.log(tx, adminId, 'RESTORED_CHEQUE_FLOW', row, 'Restored');
-      return this.toItem(row, today());
+      return this.toItem(fromEntry(row), today());
     }, TRANSACTION_OPTIONS);
   }
 
@@ -699,53 +743,42 @@ export class ChequeFlowService {
     return row;
   }
 
-  private where(
-    filters: ChequeFlowFiltersDto,
-    month?: string,
-  ): Prisma.ChequeFlowEntryWhereInput {
-    const and: Prisma.ChequeFlowEntryWhereInput[] = [{ deletedAt: null }];
-    if (month) and.push({ chequeDate: monthRange(month) });
-    if (filters.status?.length) and.push({ status: { in: filters.status } });
-    if (filters.bank?.trim()) and.push({ bankKey: nameKey(filters.bank) });
-    const search = filters.search?.trim();
-    if (search) {
-      const contains = { contains: search, mode: 'insensitive' as const };
-      const key = chequeKeyOf(search);
-      and.push({
-        OR: [
-          { chequeNumber: contains },
-          ...(key ? [{ chequeKey: { contains: key } }] : []),
-          { partyName: contains },
-          { bankName: contains },
-          { invoiceRef: contains },
-          { remarks: contains },
-        ],
-      });
+  /** The filters, applied the same way to every source. */
+  private matches(row: FlowRow, filters: ChequeFlowFiltersDto): boolean {
+    if (filters.source && row.source !== filters.source) return false;
+    if (filters.status?.length && !filters.status.includes(row.status)) {
+      return false;
+    }
+    if (filters.direction && row.direction !== filters.direction) return false;
+    if (filters.bank?.trim() && row.bankKey !== nameKey(filters.bank)) {
+      return false;
     }
     // Customer/supplier filters each narrow only their own side.
-    const sides: Prisma.ChequeFlowEntryWhereInput[] = [];
-    if (filters.direction !== 'PAYABLE') {
-      sides.push({
-        direction: 'RECEIVABLE',
-        ...(filters.customer?.trim() && {
-          partyKey: nameKey(filters.customer),
-        }),
-      });
+    const party =
+      row.direction === 'RECEIVABLE' ? filters.customer : filters.supplier;
+    if (party?.trim() && row.partyKey !== nameKey(party)) return false;
+    const search = filters.search?.trim().toLowerCase();
+    if (search) {
+      const key = chequeKeyOf(search);
+      const haystack = [
+        row.chequeNumber,
+        row.partyName,
+        row.bankName,
+        row.invoiceRef,
+        row.remarks,
+        row.kindLabel,
+      ];
+      const hit =
+        haystack.some((v) => v?.toLowerCase().includes(search)) ||
+        (!!key && row.chequeKey.includes(key));
+      if (!hit) return false;
     }
-    if (filters.direction !== 'RECEIVABLE') {
-      sides.push({
-        direction: 'PAYABLE',
-        ...(filters.supplier?.trim() && {
-          partyKey: nameKey(filters.supplier),
-        }),
-      });
-    }
-    and.push({ OR: sides });
-    return { AND: and };
+    return true;
   }
 
   private isFiltered(filters: ChequeFlowFiltersDto) {
     return !!(
+      filters.source ||
       filters.direction ||
       filters.status?.length ||
       filters.bank?.trim() ||
@@ -844,6 +877,12 @@ export class ChequeFlowService {
             }),
       },
     });
+    const twin = findLinked(await loadLinkedKeys(tx), e);
+    if (twin) {
+      throw new ConflictException(
+        `Cheque ${twin.chequeKey} is already recorded in ${SOURCE_LABEL[twin.source]} (${twin.partyName}, dated ${dayOf(twin.chequeDate)}) — it shows here automatically, no need to add it again`,
+      );
+    }
     if (existing) {
       throw new ConflictException(
         e.chequeKey
@@ -881,6 +920,7 @@ export class ChequeFlowService {
       },
     });
     const inRegister = new Set(existing.map((e) => this.dupKey(e)));
+    const linked = await loadLinkedKeys(client);
     const inFile = new Set<string>();
     return rows.map((raw, index) => {
       const res: ImportRowResult = {
@@ -905,7 +945,14 @@ export class ChequeFlowService {
         remarks: clean.remarks,
       };
       const key = this.dupKey(clean);
-      if (inRegister.has(key)) {
+      const twin = findLinked(linked, clean);
+      if (twin) {
+        res.result = 'duplicate';
+        res.duplicateOf = 'linked';
+        res.warnings.push(
+          `Already recorded in ${SOURCE_LABEL[twin.source]} — it shows automatically`,
+        );
+      } else if (inRegister.has(key)) {
         res.result = 'duplicate';
         res.duplicateOf = 'register';
       } else if (inFile.has(key)) {
@@ -1041,7 +1088,7 @@ export class ChequeFlowService {
     };
   }
 
-  private toItem(row: ChequeFlowEntry, now: Date): ChequeFlowItem {
+  private toItem(row: FlowRow, now: Date): ChequeFlowItem {
     let dueState: DueState = null;
     let daysOverdue = 0;
     if (row.status === 'PENDING') {
@@ -1056,6 +1103,15 @@ export class ChequeFlowService {
     }
     return {
       id: row.id,
+      source: row.source,
+      sourceId: row.sourceId,
+      sourceLabel: SOURCE_LABEL[row.source],
+      kindLabel: row.kindLabel,
+      link: row.link,
+      allowedStatuses: row.allowedStatuses,
+      duplicateOf: row.duplicateOf
+        ? { ...row.duplicateOf, label: SOURCE_LABEL[row.duplicateOf.source] }
+        : null,
       direction: row.direction,
       chequeNumber: row.chequeNumber,
       bankName: row.bankName,
@@ -1069,8 +1125,9 @@ export class ChequeFlowService {
       importBatchId: row.importBatchId,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
-      dueState,
-      daysOverdue,
+      // Only PENDING cheques counted in totals get due alerts.
+      dueState: row.duplicateOf ? null : dueState,
+      daysOverdue: row.duplicateOf ? 0 : daysOverdue,
     };
   }
 
