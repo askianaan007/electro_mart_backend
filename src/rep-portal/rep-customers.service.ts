@@ -18,8 +18,15 @@ import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { paginate } from '../common/utils/paginate';
 import { generateTempPassword } from '../common/utils/generate-password';
 import { TRANSACTION_OPTIONS } from '../common/constants/prisma';
+import { REP_SAFE_DEALER_SELECT } from './rep-safe-dealer.select';
 
 const PASSWORD_SALT_ROUNDS = 10;
+
+// Explicit allow-list — never password/resetToken/username/credit internals.
+const CUSTOMER_SELECT = {
+  ...REP_SAFE_DEALER_SELECT,
+  customerProfile: true,
+} satisfies Prisma.DealerSelect;
 
 /**
  * Rep Portal — Customer Management (Rep_Portal_DOCUMENTATION.md §11-§13).
@@ -35,15 +42,8 @@ export class RepCustomersService {
     private repActivityLogService: RepActivityLogService,
   ) {}
 
-  private readonly customerInclude = {
-    customerProfile: true,
-  } satisfies Prisma.DealerInclude;
-
   private toCustomerShape(
-    dealer: Prisma.DealerGetPayload<{
-      include: { customerProfile: true };
-      omit: { password: true };
-    }>,
+    dealer: Prisma.DealerGetPayload<{ select: typeof CUSTOMER_SELECT }>,
   ) {
     const { customerProfile, ...rest } = dealer;
     return {
@@ -93,8 +93,7 @@ export class RepCustomersService {
     const [data, total] = await this.prisma.$transaction([
       this.prisma.dealer.findMany({
         where,
-        include: this.customerInclude,
-        omit: { password: true },
+        select: CUSTOMER_SELECT,
         orderBy: { updatedAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -167,8 +166,7 @@ export class RepCustomersService {
             },
           },
         },
-        include: this.customerInclude,
-        omit: { password: true },
+        select: CUSTOMER_SELECT,
       });
 
       await this.repActivityLogService.log(tx, {
@@ -187,8 +185,7 @@ export class RepCustomersService {
   async findOne(id: string) {
     const dealer = await this.prisma.dealer.findFirst({
       where: { id, source: DealerSource.REP_PORTAL },
-      include: this.customerInclude,
-      omit: { password: true },
+      select: CUSTOMER_SELECT,
     });
     if (!dealer) throw new NotFoundException('Customer not found');
 
@@ -258,8 +255,7 @@ export class RepCustomersService {
 
       const updated = await tx.dealer.findUniqueOrThrow({
         where: { id },
-        include: this.customerInclude,
-        omit: { password: true },
+        select: CUSTOMER_SELECT,
       });
       return this.toCustomerShape(updated);
     }, TRANSACTION_OPTIONS);

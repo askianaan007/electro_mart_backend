@@ -1,15 +1,17 @@
 import {
+  BadRequestException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, Role } from '@prisma/client';
+import { DealerSource, Prisma, Role } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OrdersService } from '../orders/orders.service';
 import { CreateOrderDto } from '../orders/dto/create-order.dto';
 import { QueryRepOrderDto } from './dto/query-rep-order.dto';
 import { RepCatalogVisibilityService } from '../rep-catalog-visibility/rep-catalog-visibility.service';
 import { paginate } from '../common/utils/paginate';
+import { REP_SAFE_DEALER_SELECT } from './rep-safe-dealer.select';
 
 /**
  * Thin wrapper over the existing, unmodified-except-for-one-branch
@@ -21,7 +23,7 @@ import { paginate } from '../common/utils/paginate';
 export class RepOrdersService {
   private readonly orderInclude = {
     items: { include: { product: true } },
-    dealer: { omit: { password: true } },
+    dealer: { select: REP_SAFE_DEALER_SELECT },
     invoice: true,
   } satisfies Prisma.OrderInclude;
 
@@ -44,11 +46,37 @@ export class RepOrdersService {
     return { ...order, items };
   }
 
-  create(repId: string, dto: CreateOrderDto) {
-    return this.ordersService.create(
+  async create(repId: string, dto: CreateOrderDto) {
+    // Rep-only guards, kept here so OrdersService's admin/dealer paths are
+    // untouched: a rep may only order for a Rep Portal customer (shared pool,
+    // so not restricted to createdByRepId) and only products in their scope.
+    if (!dto.dealerId) {
+      throw new BadRequestException(
+        'dealerId is required when a representative creates an order',
+      );
+    }
+    const dealer = await this.prisma.dealer.findUnique({
+      where: { id: dto.dealerId },
+      select: { source: true },
+    });
+    if (!dealer) throw new NotFoundException('Customer not found');
+    if (dealer.source !== DealerSource.REP_PORTAL) {
+      throw new ForbiddenException(
+        'Representatives can only place orders for Rep Portal customers',
+      );
+    }
+    await this.repCatalogVisibility.assertProductsInRepScope(
+      repId,
+      dto.items.map((item) => item.productId),
+    );
+
+    const order = await this.ordersService.create(
       { role: Role.REPRESENTATIVE, id: repId },
       dto,
     );
+    // Re-read through the rep-safe include/serializer — OrdersService's own
+    // include carries the full Dealer row and raw product costPrice/stock.
+    return this.findOne(order.id, repId);
   }
 
   async list(repId: string, query: QueryRepOrderDto) {

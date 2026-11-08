@@ -1,9 +1,10 @@
 import {
+  BadRequestException,
   ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { AccountStatus, DealerSource, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RepCatalogVisibilityService } from '../rep-catalog-visibility/rep-catalog-visibility.service';
 import { UpsertDraftDto } from './dto/upsert-draft.dto';
@@ -78,8 +79,44 @@ export class RepDraftsService {
     return this.sanitize(draft);
   }
 
+  /** Validate referenced rows up front so bad input is a 4xx, not an FK-violation 500. */
+  private async assertDraftReferences(repId: string, dto: UpsertDraftDto) {
+    if (dto.dealerId) {
+      const dealer = await this.prisma.dealer.findUnique({
+        where: { id: dto.dealerId },
+        select: { source: true },
+      });
+      if (!dealer) throw new NotFoundException('Customer not found');
+      if (dealer.source !== DealerSource.REP_PORTAL) {
+        throw new BadRequestException(
+          'Drafts can only be created for Rep Portal customers',
+        );
+      }
+    }
+
+    if (dto.items && dto.items.length > 0) {
+      const productIds = dto.items.map((item) => item.productId);
+      if (new Set(productIds).size !== productIds.length) {
+        throw new BadRequestException(
+          'A product appears more than once in this draft — combine it into a single line',
+        );
+      }
+      const products = await this.repCatalogVisibility.assertProductsInRepScope(
+        repId,
+        productIds,
+      );
+      const inactive = products.find((p) => p.status !== AccountStatus.ACTIVE);
+      if (inactive) {
+        throw new BadRequestException(
+          `Product "${inactive.name}" is not available`,
+        );
+      }
+    }
+  }
+
   async update(id: string, repId: string, dto: UpsertDraftDto) {
     await this.findOne(id, repId);
+    await this.assertDraftReferences(repId, dto);
 
     const updated = await this.prisma.$transaction(async (tx) => {
       if (dto.items) {

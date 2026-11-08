@@ -7,7 +7,7 @@ import {
 import { ChequeStatus, PaymentMode, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ActivityLogService } from '../activity-log/activity-log.service';
-import { EquityService } from '../equity/equity.service';
+import { LiquidCashService } from '../liquid-cash/liquid-cash.service';
 import { CreateInvestmentDto } from './dto/create-investment.dto';
 import { UpdateInvestmentDto } from './dto/update-investment.dto';
 import { QueryInvestmentDto } from './dto/query-investment.dto';
@@ -19,7 +19,10 @@ import {
 } from '../common/utils/business-date';
 import { assertChequeTransition } from '../common/utils/cheque-transitions';
 import { recordLedgerRevision } from '../common/utils/ledger-revision';
-import { EFFECTIVE_INVESTMENT_FILTER } from '../common/utils/investment-filters';
+
+// Serializes withdrawals across all investors: they draw on one shared
+// Liquid Cash pool, so two concurrent ones must not both pass the check.
+const WITHDRAWAL_LOCK = 482_017_016;
 
 type ChequeFields = {
   mode?: PaymentMode;
@@ -33,7 +36,7 @@ export class InvestmentsService {
   constructor(
     private prisma: PrismaService,
     private activityLogService: ActivityLogService,
-    private equityService: EquityService,
+    private liquidCashService: LiquidCashService,
   ) {}
 
   private assertChequeFields(dto: ChequeFields) {
@@ -46,55 +49,68 @@ export class InvestmentsService {
   }
 
   /**
-   * A withdrawal can't take out more than the investor's current equity
-   * (effective contributions + profit share − expense share, EquityService)
-   * less withdrawal cheques already written but not yet cleared — LC-16.
-   * `excludingId` leaves out the entry being edited.
-   *
-   * Call inside the write's transaction after lockInvestor(): the lock
-   * serializes concurrent withdrawals for one investor, and EquityService
-   * reads on its own connection, so it sees every withdrawal committed
-   * before the lock was granted.
+   * Cash an entry takes out of the business (positive) or puts in
+   * (negative) while it stands: a cleared/non-cheque entry has moved its
+   * amount, and a PENDING withdrawal cheque has the money committed. A
+   * pending deposit cheque or a returned cheque moves nothing yet.
    */
-  private async assertWithdrawalWithinEquity(
-    tx: Prisma.TransactionClient,
-    investorId: string,
-    amount: Prisma.Decimal,
-    excludingId?: string,
+  private cashOutOf(entry: {
+    amount: Prisma.Decimal;
+    mode: PaymentMode;
+    chequeStatus: ChequeStatus | null;
+  }): Prisma.Decimal {
+    const effective =
+      entry.mode !== 'CHEQUE' ||
+      entry.chequeStatus === null ||
+      entry.chequeStatus === ChequeStatus.CLEARED;
+    const committed =
+      entry.chequeStatus === ChequeStatus.PENDING && entry.amount.isNegative();
+    return effective || committed ? entry.amount.neg() : new Prisma.Decimal(0);
+  }
+
+  /**
+   * A withdrawal is paid out of the business's Liquid Cash, so it can't take
+   * more than is spendable now: the Liquid Cash balance less outgoing cheques
+   * already written (LiquidCashService.getSpendableCash). The investor's own
+   * equity doesn't limit it — an investor may withdraw past their share and
+   * go negative. `previous` is the entry being edited: only the extra cash
+   * the edit takes out is checked, so correcting a reason or date never fails.
+   *
+   * Call inside the write's transaction after lockWithdrawals(): the lock
+   * serializes every withdrawal, and LiquidCashService reads on its own
+   * connection, so it sees every write committed before the lock was granted.
+   */
+  private async assertWithdrawalWithinLiquidCash(
+    next: {
+      amount: Prisma.Decimal;
+      mode: PaymentMode;
+      chequeStatus: ChequeStatus | null;
+    },
+    previous?: {
+      amount: Prisma.Decimal;
+      mode: PaymentMode;
+      chequeStatus: ChequeStatus | null;
+    },
   ) {
-    if (!amount.isNegative()) return;
-    const [{ entries }, pending] = await Promise.all([
-      this.equityService.getSummary(),
-      tx.investment.aggregate({
-        where: {
-          investorId,
-          mode: 'CHEQUE',
-          chequeStatus: ChequeStatus.PENDING,
-          amount: { lt: 0 },
-          ...(excludingId && { id: { not: excludingId } }),
-        },
-        _sum: { amount: true },
-      }),
-    ]);
-    const entry = entries.find((e) => e.investorId === investorId);
-    let equity = (entry?.equity ?? new Prisma.Decimal(0)).add(
-      pending._sum.amount ?? 0,
+    if (!next.amount.isNegative()) return;
+    const extraOut = this.cashOutOf(next).sub(
+      previous ? this.cashOutOf(previous) : 0,
     );
-    if (excludingId) {
-      const existing = await tx.investment.findFirst({
-        where: { id: excludingId, investorId, ...EFFECTIVE_INVESTMENT_FILTER },
-      });
-      if (existing) equity = equity.sub(existing.amount);
-    }
-    if (amount.abs().greaterThan(equity)) {
+    if (!extraOut.greaterThan(0)) return;
+    const { balance, pendingOut, spendable } =
+      await this.liquidCashService.getSpendableCash();
+    if (extraOut.greaterThan(spendable)) {
+      const committed = pendingOut.greaterThan(0)
+        ? ` (Liquid Cash ${balance.toFixed(2)} less ${pendingOut.toFixed(2)} in uncleared outgoing cheques)`
+        : '';
       throw new BadRequestException(
-        `Withdrawal of ${amount.abs().toString()} exceeds this investor's available equity of ${equity.toFixed(2)}`,
+        `Withdrawal of ${extraOut.toFixed(2)} exceeds the available Liquid Cash of ${spendable.toFixed(2)}${committed}`,
       );
     }
   }
 
-  private async lockInvestor(tx: Prisma.TransactionClient, investorId: string) {
-    await tx.$queryRaw`SELECT id FROM "Investor" WHERE id = ${investorId} FOR UPDATE`;
+  private async lockWithdrawals(tx: Prisma.TransactionClient) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WITHDRAWAL_LOCK})`;
   }
 
   async create(dto: CreateInvestmentDto, adminId: string) {
@@ -109,8 +125,14 @@ export class InvestmentsService {
     const isCheque = dto.mode === 'CHEQUE';
 
     return this.prisma.$transaction(async (tx) => {
-      await this.lockInvestor(tx, dto.investorId);
-      await this.assertWithdrawalWithinEquity(tx, dto.investorId, amount);
+      if (amount.isNegative()) {
+        await this.lockWithdrawals(tx);
+        await this.assertWithdrawalWithinLiquidCash({
+          amount,
+          mode: dto.mode,
+          chequeStatus: isCheque ? ChequeStatus.PENDING : null,
+        });
+      }
       const investment = await tx.investment.create({
         data: {
           investorId: dto.investorId,
@@ -216,11 +238,26 @@ export class InvestmentsService {
       dto.amount !== undefined
         ? new Prisma.Decimal(dto.amount)
         : existing.amount;
-    const investorId = dto.investorId ?? existing.investorId;
-
     return this.prisma.$transaction(async (tx) => {
-      await this.lockInvestor(tx, investorId);
-      await this.assertWithdrawalWithinEquity(tx, investorId, amount, id);
+      if (amount.isNegative()) {
+        await this.lockWithdrawals(tx);
+        // Re-read under the lock: the entry may have changed since findOne.
+        const current = await tx.investment.findUnique({ where: { id } });
+        if (!current) throw new NotFoundException('Investment not found');
+        const stillCheque = isCheque && current.mode === 'CHEQUE';
+        await this.assertWithdrawalWithinLiquidCash(
+          {
+            amount,
+            mode,
+            chequeStatus: stillCheque
+              ? current.chequeStatus
+              : isCheque
+                ? ChequeStatus.PENDING
+                : null,
+          },
+          current,
+        );
+      }
       await recordLedgerRevision(
         tx,
         'INVESTMENT',

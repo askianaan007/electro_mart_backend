@@ -275,9 +275,12 @@ export class AuthService {
       if (!rep || rep.status !== RepresentativeStatus.ACTIVE) {
         throw new UnauthorizedException('Account no longer active');
       }
-      return this.issueTokens(Role.REPRESENTATIVE, rep.id, {
+      const tokens = await this.issueTokens(Role.REPRESENTATIVE, rep.id, {
         username: rep.username,
       });
+      // Surfaced on every refresh (not just login) so the client can keep
+      // forcing the change-password screen until it's actually done.
+      return { ...tokens, mustChangePassword: rep.mustChangePassword };
     }
 
     const dealer = await this.prisma.dealer.findUnique({

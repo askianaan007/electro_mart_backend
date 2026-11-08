@@ -1,4 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { AccountStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -63,6 +67,48 @@ export class RepCatalogVisibilityService {
     }
 
     return { OR: or };
+  }
+
+  /**
+   * Write-path counterpart of buildAssignedProductWhereClause — rejects any
+   * productId that doesn't exist (404) or falls outside the representative's
+   * assigned catalog (403), so a rep can't order/draft products they can't
+   * see. Returns the matched products (deduplicated by id) for any further
+   * caller-specific checks.
+   */
+  async assertProductsInRepScope(
+    representativeId: string,
+    productIds: string[],
+  ): Promise<{ id: string; name: string; status: AccountStatus }[]> {
+    const uniqueIds = [...new Set(productIds)];
+    if (uniqueIds.length === 0) return [];
+
+    const scopeWhere =
+      await this.buildAssignedProductWhereClause(representativeId);
+    const [existing, inScope] = await Promise.all([
+      this.prisma.product.findMany({
+        where: { id: { in: uniqueIds } },
+        select: { id: true, name: true, status: true },
+      }),
+      this.prisma.product.findMany({
+        where: { AND: [{ id: { in: uniqueIds } }, scopeWhere] },
+        select: { id: true },
+      }),
+    ]);
+
+    const existingIds = new Set(existing.map((p) => p.id));
+    const missing = uniqueIds.find((id) => !existingIds.has(id));
+    if (missing) throw new NotFoundException(`Product ${missing} not found`);
+
+    const inScopeIds = new Set(inScope.map((p) => p.id));
+    const outOfScope = existing.find((p) => !inScopeIds.has(p.id));
+    if (outOfScope) {
+      throw new ForbiddenException(
+        `Product "${outOfScope.name}" is not in your assigned catalog`,
+      );
+    }
+
+    return existing;
   }
 
   /**

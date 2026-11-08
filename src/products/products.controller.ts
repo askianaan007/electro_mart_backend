@@ -19,7 +19,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
-import { Role } from '@prisma/client';
+import { AccountStatus, Prisma, Role } from '@prisma/client';
 import {
   MAX_IMAGE_SIZE_BYTES,
   MAX_PRODUCT_IMAGES,
@@ -66,6 +66,15 @@ export class ProductsController {
     private repCatalogVisibility: RepCatalogVisibilityService,
   ) {}
 
+  /** A representative only ever sees ACTIVE products within their assigned scope, whatever `status` filter they pass. */
+  private async repScopeWhere(
+    userId: string,
+  ): Promise<Prisma.ProductWhereInput> {
+    const scope =
+      await this.repCatalogVisibility.buildAssignedProductWhereClause(userId);
+    return { AND: [scope, { status: AccountStatus.ACTIVE }] };
+  }
+
   @Post()
   @Roles(Role.ADMIN)
   @ApiOperation({ summary: 'Create a product' })
@@ -85,8 +94,7 @@ export class ProductsController {
     @CurrentUser('sub') userId: string,
   ) {
     if (role === Role.REPRESENTATIVE) {
-      const scope =
-        await this.repCatalogVisibility.buildAssignedProductWhereClause(userId);
+      const scope = await this.repScopeWhere(userId);
       const result = await this.productsService.findAll(query, scope);
       return {
         ...result,
@@ -110,8 +118,7 @@ export class ProductsController {
     @CurrentUser('sub') userId: string,
   ) {
     if (role === Role.REPRESENTATIVE) {
-      const scope =
-        await this.repCatalogVisibility.buildAssignedProductWhereClause(userId);
+      const scope = await this.repScopeWhere(userId);
       const product = await this.productsService.findOne(id, scope);
       return this.repCatalogVisibility.serializeForRep(product);
     }

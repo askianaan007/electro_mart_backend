@@ -102,28 +102,49 @@ describe('Investments, refunds and cash adjustments → Liquid Cash', () => {
       expect(await ctx.prisma.investment.count()).toBe(0);
     });
 
-    it('LC-16: withdrawals are bounded by equity, including pending withdrawal cheques and concurrency', async () => {
-      const investor = await createInvestor(ctx.prisma);
-      await invest(investor.id, 1000).expect(201);
-      await invest(investor.id, -1000.01).expect(400);
-      await invest(investor.id, -600, {
+    it('LC-16: withdrawals are bounded by Liquid Cash (not equity), including pending outgoing cheques and concurrency', async () => {
+      const funder = await createInvestor(ctx.prisma, 50);
+      const borrower = await createInvestor(ctx.prisma, 50);
+      await invest(funder.id, 1000).expect(201);
+      // An investor with no capital of their own may withdraw — equity goes
+      // negative — as long as the business has the cash.
+      const loan = await invest(borrower.id, -400).expect(201);
+      await invest(borrower.id, -600.01).expect(400);
+      await invest(funder.id, -300, {
         ...chequeFields,
         chequeNumber: 'W-1',
       }).expect(201);
-      // 600 is already committed to a pending cheque.
-      await invest(investor.id, -500).expect(400);
+      // 300 of the remaining 600 is already committed to a pending cheque.
+      await invest(borrower.id, -300.01).expect(400);
+      // Withdrawals share one pool: concurrent ones can't both spend it.
       const results = await Promise.all([
-        invest(investor.id, -300),
-        invest(investor.id, -300),
+        invest(borrower.id, -200),
+        invest(funder.id, -200),
       ]);
       expect(results.map((r) => r.status).sort()).toEqual([201, 400]);
+      // Editing a withdrawal without taking more cash never fails, even
+      // when less is spendable than the entry's amount.
+      await ctx
+        .patch(`/investments/${loan.body.id}`, { reason: 'hospital' })
+        .expect(200);
+      await ctx
+        .patch(`/investments/${loan.body.id}`, { amount: -500 })
+        .expect(200);
+      await ctx
+        .patch(`/investments/${loan.body.id}`, { amount: -500.01 })
+        .expect(400);
       const summary = await assertCashInvariants(ctx);
       expect(summary).toMatchObject({
-        balance: 700,
-        totalWithdrawals: 300,
-        pendingWithdrawalCheques: 600,
-        pendingOut: 600,
+        balance: 300,
+        totalWithdrawals: 700,
+        pendingWithdrawalCheques: 300,
+        pendingOut: 300,
       });
+      const { entries } = (await ctx.get('/equity').expect(200)).body as {
+        entries: { investorId: string; equity: string }[];
+      };
+      const borrowerEquity = entries.find((e) => e.investorId === borrower.id);
+      expect(Number(borrowerEquity?.equity)).toBeLessThan(0);
     });
 
     it('editing or deleting an investment is a dated correction', async () => {

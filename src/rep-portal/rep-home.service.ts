@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { AccountStatus, OrderStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RepCatalogVisibilityService } from '../rep-catalog-visibility/rep-catalog-visibility.service';
+import { REP_SAFE_DEALER_SELECT } from './rep-safe-dealer.select';
 
 const FULFILLMENT_STATUSES: OrderStatus[] = [
   OrderStatus.APPROVED,
@@ -127,15 +128,21 @@ export class RepHomeService {
     const products = await this.prisma.product.findMany({
       where: {
         status: AccountStatus.ACTIVE,
-        ...scopeWhere,
-        OR: [
-          { name: { contains: query, mode: 'insensitive' } },
-          { sku: { contains: query, mode: 'insensitive' } },
-          { barcode: { contains: query, mode: 'insensitive' } },
-          { productCode: { contains: query, mode: 'insensitive' } },
-          { brand: { contains: query, mode: 'insensitive' } },
-          { category: { contains: query, mode: 'insensitive' } },
-          { model: { contains: query, mode: 'insensitive' } },
+        // AND, not spread — scopeWhere is itself an OR, which a sibling OR
+        // key would silently overwrite (dropping the rep's catalog scope).
+        AND: [
+          scopeWhere,
+          {
+            OR: [
+              { name: { contains: query, mode: 'insensitive' } },
+              { sku: { contains: query, mode: 'insensitive' } },
+              { barcode: { contains: query, mode: 'insensitive' } },
+              { productCode: { contains: query, mode: 'insensitive' } },
+              { brand: { contains: query, mode: 'insensitive' } },
+              { category: { contains: query, mode: 'insensitive' } },
+              { model: { contains: query, mode: 'insensitive' } },
+            ],
+          },
         ],
       },
       include: this.productImagesInclude,
@@ -187,7 +194,7 @@ export class RepHomeService {
         orderBy: { createdAt: 'desc' },
         include: {
           items: { include: { product: true } },
-          dealer: { omit: { password: true } },
+          dealer: { select: REP_SAFE_DEALER_SELECT },
           invoice: true,
         },
       }),

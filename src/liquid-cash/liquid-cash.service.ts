@@ -107,6 +107,22 @@ export class LiquidCashService {
   }
 
   /**
+   * Cash the business can still pay out right now: the current Liquid Cash
+   * balance less every outgoing cheque already written but not yet cleared
+   * (supplier, withdrawal and refund cheques) — that money is spoken for.
+   * Pending incoming cheques are not counted until they clear.
+   */
+  async getSpendableCash() {
+    const [totals, pending] = await Promise.all([
+      this.computeTotals(),
+      this.computePending(),
+    ]);
+    const balance = new Prisma.Decimal(totals.balance ?? 0);
+    const pendingOut = new Prisma.Decimal(pending.pendingOut.toFixed(2));
+    return { balance, pendingOut, spendable: balance.sub(pendingOut) };
+  }
+
+  /**
    * Liquid Cash movement over [from, to), by source — the dashboard's
    * monthly cash flow. `netCashFlow` is the change in Liquid Cash itself
    * (everything); `operatingCashFlow` leaves out capital (investments,
