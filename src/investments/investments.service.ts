@@ -48,39 +48,54 @@ export class InvestmentsService {
     }
   }
 
+  /** Whether an entry's amount is in the Liquid Cash balance (LC-09). */
+  private isEffective(entry: {
+    mode: PaymentMode;
+    chequeStatus: ChequeStatus | null;
+  }): boolean {
+    return (
+      entry.mode !== 'CHEQUE' ||
+      entry.chequeStatus === null ||
+      entry.chequeStatus === ChequeStatus.CLEARED
+    );
+  }
+
   /**
-   * Cash an entry takes out of the business (positive) or puts in
-   * (negative) while it stands: a cleared/non-cheque entry has moved its
-   * amount, and a PENDING withdrawal cheque has the money committed. A
-   * pending deposit cheque or a returned cheque moves nothing yet.
+   * Cash a withdrawal entry takes out of the business: its amount when it
+   * has moved cash or is a cheque still waiting to be presented (PENDING);
+   * nothing for a RETURNED cheque or for a deposit.
    */
-  private cashOutOf(entry: {
+  private withdrawalOutOf(entry: {
     amount: Prisma.Decimal;
     mode: PaymentMode;
     chequeStatus: ChequeStatus | null;
   }): Prisma.Decimal {
-    const effective =
-      entry.mode !== 'CHEQUE' ||
-      entry.chequeStatus === null ||
-      entry.chequeStatus === ChequeStatus.CLEARED;
-    const committed =
-      entry.chequeStatus === ChequeStatus.PENDING && entry.amount.isNegative();
-    return effective || committed ? entry.amount.neg() : new Prisma.Decimal(0);
+    if (!entry.amount.isNegative()) return new Prisma.Decimal(0);
+    const takesCash =
+      this.isEffective(entry) || entry.chequeStatus === ChequeStatus.PENDING;
+    return takesCash ? entry.amount.neg() : new Prisma.Decimal(0);
   }
 
   /**
-   * A withdrawal is paid out of the business's Liquid Cash, so it can't take
-   * more than is spendable now: the Liquid Cash balance less outgoing cheques
-   * already written (LiquidCashService.getSpendableCash). The investor's own
-   * equity doesn't limit it — an investor may withdraw past their share and
-   * go negative. `previous` is the entry being edited: only the extra cash
-   * the edit takes out is checked, so correcting a reason or date never fails.
+   * A withdrawal is paid out of the business's Liquid Cash, so it can't be
+   * more than the current Liquid Cash balance — the figure on the Liquid
+   * Cash page (LiquidCashService.getBalance). Uncleared cheques, in or out,
+   * don't count until they clear, same as everywhere else in Liquid Cash.
+   * The investor's own equity doesn't limit it: an investor may withdraw
+   * past their share and go negative.
+   *
+   * `previous` is the entry being edited. An edit that doesn't take more cash
+   * out (a new reason or date, a smaller amount) is never checked; otherwise
+   * the cash the entry already took out is available to it again.
    *
    * Call inside the write's transaction after lockWithdrawals(): the lock
-   * serializes every withdrawal, and LiquidCashService reads on its own
-   * connection, so it sees every write committed before the lock was granted.
+   * serializes every withdrawal, and the balance is read on the same
+   * transaction (READ COMMITTED: each statement sees every write committed
+   * before it started, so every withdrawal committed before the lock was
+   * granted).
    */
   private async assertWithdrawalWithinLiquidCash(
+    tx: Prisma.TransactionClient,
     next: {
       amount: Prisma.Decimal;
       mode: PaymentMode;
@@ -92,19 +107,24 @@ export class InvestmentsService {
       chequeStatus: ChequeStatus | null;
     },
   ) {
-    if (!next.amount.isNegative()) return;
-    const extraOut = this.cashOutOf(next).sub(
-      previous ? this.cashOutOf(previous) : 0,
+    const nextOut = this.withdrawalOutOf(next);
+    const previousOut = previous
+      ? this.withdrawalOutOf(previous)
+      : new Prisma.Decimal(0);
+    if (!nextOut.greaterThan(previousOut)) return;
+
+    // The previous version's amount is in the balance only if it moved cash
+    // (a deposit adds to it, a withdrawal takes from it); undo that first.
+    const alreadyInBalance =
+      previous && this.isEffective(previous)
+        ? previous.amount
+        : new Prisma.Decimal(0);
+    const available = (await this.liquidCashService.getBalance(tx)).sub(
+      alreadyInBalance,
     );
-    if (!extraOut.greaterThan(0)) return;
-    const { balance, pendingOut, spendable } =
-      await this.liquidCashService.getSpendableCash();
-    if (extraOut.greaterThan(spendable)) {
-      const committed = pendingOut.greaterThan(0)
-        ? ` (Liquid Cash ${balance.toFixed(2)} less ${pendingOut.toFixed(2)} in uncleared outgoing cheques)`
-        : '';
+    if (nextOut.greaterThan(available)) {
       throw new BadRequestException(
-        `Withdrawal of ${extraOut.toFixed(2)} exceeds the available Liquid Cash of ${spendable.toFixed(2)}${committed}`,
+        `Withdrawal of ${nextOut.toFixed(2)} exceeds the available Liquid Cash balance of ${available.toFixed(2)}`,
       );
     }
   }
@@ -127,7 +147,7 @@ export class InvestmentsService {
     return this.prisma.$transaction(async (tx) => {
       if (amount.isNegative()) {
         await this.lockWithdrawals(tx);
-        await this.assertWithdrawalWithinLiquidCash({
+        await this.assertWithdrawalWithinLiquidCash(tx, {
           amount,
           mode: dto.mode,
           chequeStatus: isCheque ? ChequeStatus.PENDING : null,
@@ -246,6 +266,7 @@ export class InvestmentsService {
         if (!current) throw new NotFoundException('Investment not found');
         const stillCheque = isCheque && current.mode === 'CHEQUE';
         await this.assertWithdrawalWithinLiquidCash(
+          tx,
           {
             amount,
             mode,

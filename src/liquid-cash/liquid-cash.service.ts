@@ -76,9 +76,12 @@ export class LiquidCashService {
    * balance sheet can't drift apart. Rows dated after `asOf` are excluded
    * from the balance and reported as `scheduled`.
    */
-  private async computeTotals(asOf: Date = new Date()) {
+  private async computeTotals(
+    asOf: Date = new Date(),
+    client: Pick<Prisma.TransactionClient, '$queryRaw'> = this.prisma,
+  ) {
     const at = sqlUtc(asOf);
-    const [row] = await this.prisma.$queryRaw<Totals[]>`
+    const [row] = await client.$queryRaw<Totals[]>`
       ${CASH_LEDGER_CTE}
       SELECT
         SUM(amount) FILTER (WHERE date <= ${at}) AS balance,
@@ -107,19 +110,16 @@ export class LiquidCashService {
   }
 
   /**
-   * Cash the business can still pay out right now: the current Liquid Cash
-   * balance less every outgoing cheque already written but not yet cleared
-   * (supplier, withdrawal and refund cheques) — that money is spoken for.
-   * Pending incoming cheques are not counted until they clear.
+   * The current Liquid Cash balance as an exact Decimal — the same figure as
+   * getSummary().balance, for checks that must not round through a number.
+   * Pass the caller's transaction to read on its connection (so a check
+   * made under a lock needs no second pooled connection).
    */
-  async getSpendableCash() {
-    const [totals, pending] = await Promise.all([
-      this.computeTotals(),
-      this.computePending(),
-    ]);
-    const balance = new Prisma.Decimal(totals.balance ?? 0);
-    const pendingOut = new Prisma.Decimal(pending.pendingOut.toFixed(2));
-    return { balance, pendingOut, spendable: balance.sub(pendingOut) };
+  async getBalance(
+    client?: Pick<Prisma.TransactionClient, '$queryRaw'>,
+  ): Promise<Prisma.Decimal> {
+    const totals = await this.computeTotals(new Date(), client);
+    return new Prisma.Decimal(totals.balance ?? 0);
   }
 
   /**

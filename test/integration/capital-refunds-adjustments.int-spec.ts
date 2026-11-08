@@ -102,7 +102,7 @@ describe('Investments, refunds and cash adjustments → Liquid Cash', () => {
       expect(await ctx.prisma.investment.count()).toBe(0);
     });
 
-    it('LC-16: withdrawals are bounded by Liquid Cash (not equity), including pending outgoing cheques and concurrency', async () => {
+    it('LC-16: withdrawals are bounded by the Liquid Cash balance (not equity or uncleared cheques), with concurrency', async () => {
       const funder = await createInvestor(ctx.prisma, 50);
       const borrower = await createInvestor(ctx.prisma, 50);
       await invest(funder.id, 1000).expect(201);
@@ -110,36 +110,48 @@ describe('Investments, refunds and cash adjustments → Liquid Cash', () => {
       // negative — as long as the business has the cash.
       const loan = await invest(borrower.id, -400).expect(201);
       await invest(borrower.id, -600.01).expect(400);
+      // A withdrawal cheque is bounded by the balance too…
+      await invest(funder.id, -600.01, {
+        ...chequeFields,
+        chequeNumber: 'W-0',
+      }).expect(400);
       await invest(funder.id, -300, {
         ...chequeFields,
         chequeNumber: 'W-1',
       }).expect(201);
-      // 300 of the remaining 600 is already committed to a pending cheque.
-      await invest(borrower.id, -300.01).expect(400);
+      // …but an uncleared outgoing cheque doesn't reduce what's available:
+      // the balance (600) is what the Liquid Cash page shows.
+      let summary = await assertCashInvariants(ctx);
+      expect(summary).toMatchObject({ balance: 600, pendingOut: 300 });
       // Withdrawals share one pool: concurrent ones can't both spend it.
       const results = await Promise.all([
-        invest(borrower.id, -200),
-        invest(funder.id, -200),
+        invest(borrower.id, -400),
+        invest(funder.id, -400),
       ]);
       expect(results.map((r) => r.status).sort()).toEqual([201, 400]);
       // Editing a withdrawal without taking more cash never fails, even
-      // when less is spendable than the entry's amount.
+      // when the balance is below the entry's amount (200 < 400).
       await ctx
         .patch(`/investments/${loan.body.id}`, { reason: 'hospital' })
         .expect(200);
+      // Its own 400 is available to it again: 200 + 400.
       await ctx
-        .patch(`/investments/${loan.body.id}`, { amount: -500 })
-        .expect(200);
-      await ctx
-        .patch(`/investments/${loan.body.id}`, { amount: -500.01 })
+        .patch(`/investments/${loan.body.id}`, { amount: -600.01 })
         .expect(400);
-      const summary = await assertCashInvariants(ctx);
+      await ctx
+        .patch(`/investments/${loan.body.id}`, { amount: -600 })
+        .expect(200);
+      summary = await assertCashInvariants(ctx);
       expect(summary).toMatchObject({
-        balance: 300,
-        totalWithdrawals: 700,
+        balance: 0,
+        totalWithdrawals: 1000,
         pendingWithdrawalCheques: 300,
         pendingOut: 300,
       });
+      // Reducing a withdrawal always works, even with no cash left.
+      await ctx
+        .patch(`/investments/${loan.body.id}`, { amount: -500 })
+        .expect(200);
       const { entries } = (await ctx.get('/equity').expect(200)).body as {
         entries: { investorId: string; equity: string }[];
       };
